@@ -31,14 +31,68 @@ intended_course:  "Computer Science"
 The system derives the country from the university name. Study level is hardcoded
 to undergraduate. Career goals are researched, not supplied by the user.
 
-**Four output files per run:**
+**Two output files per run:**
 
 | File | Content |
 |---|---|
-| `report.md` | Full structured report, all sections, confidence flags, inline sources |
-| `summary.md` | One-page executive summary — tier, top 3 positives, top 3 concerns, alternatives |
-| `sources.md` | Every URL + date + agent name — fully auditable |
+| `report.md` | Executive summary at the top, followed by all research sections with confidence flags and inline sources |
 | `score.json` | Machine-readable score breakdown — enables multi-university comparison |
+
+**`report.md` structure:**
+
+```
+# [University Name] — [Course] Research Report
+
+## Executive Summary
+Tier, overall score, top 3 positives, top 3 concerns, alternative universities
+
+---
+
+## 1. Career Landscape
+Career paths, salary ranges (country-scoped, local currency), live job snapshot,
+in-demand skills extracted from postings.
+
+## 2. University Background
+Founding, size, public/private status, research vs teaching orientation,
+course-specific accreditations, industry partnerships for the department.
+
+## 3. Subject Rankings
+Subject-specific rank (QS/THE/Guardian/Complete University Guide),
+graduate employability rank, overall rank (lowest weight, clearly labelled).
+
+## 4. Undergraduate Program
+Matching program titles, core modules yr1 and yr2, electives, duration,
+sandwich year / study abroad options, curriculum-to-career-skills mapping.
+
+## 5. Graduate Employability
+Employment rate, industries and named companies graduates enter,
+graduate salary specific to this university, department industry partnerships.
+
+## 6. Accommodation & Living
+On-campus cost (weekly, inclusions), off-campus rent (monthly, city-scoped),
+area safety (statistics, not opinions), transport routes and journey times.
+
+## 7. Recent News
+Institutional and department-level news from the past 2 years,
+each item sentiment-classified: positive / negative / neutral.
+
+## 8. Student Forum Findings
+Recurring positives (3+ independent sources required),
+recurring concerns (3+ independent sources required),
+department-specific teaching and course feedback.
+
+## 9. Score & Recommendation
+Weighted score (0–10), tier (Strong Consider / Consider / Proceed with Caution / Avoid),
+top 3 supporting reasons, top 3 concerns to investigate, per-dimension score breakdown.
+
+## 10. Alternative Universities
+2–3 alternatives that address the primary university's weakest dimensions,
+each with: subject ranking, program note, employability note, evidence for the gap claim.
+```
+
+Every section includes inline sources (URL + date) drawn from the agent output schemas.
+Sections where data was unavailable or low-confidence are marked explicitly — the report
+never silently omits a section.
 
 **What it will not do:**
 
@@ -76,22 +130,33 @@ to undergraduate. Career goals are researched, not supplied by the user.
 
 ## 3. Third-Party Tools and API Keys
 
-### Search Tools (MCP Servers)
+### Search Tools
 
 | Tool | Role | API Key Required |
 |---|---|---|
 | **Tavily** | Primary search — all agents. Key feature: `days=730` date filter | `TAVILY_API_KEY` |
 | **Fetch MCP** | Direct URL fetch for university catalog pages, rankings pages | None — open |
-| **Brave Search** | Fallback / forum discovery with freshness filtering | `BRAVE_API_KEY` |
-| **SerpAPI** | Google News fallback for NewsAgent | `SERPAPI_KEY` |
+| **Reddit API (PRAW)** | ForumAgent — subreddit search, post bodies, comment scores. Richer than `site:reddit.com` via Tavily | `REDDIT_CLIENT_ID` + `REDDIT_CLIENT_SECRET` |
+| **DuckDuckGo Search** | NewsAgent fallback when Tavily misses news. No key, no quota | None — no key needed |
+
+**Why these tools:**
+Tavily handles all general search including `site:thestudentroom.co.uk`, `site:quora.com`,
+and `site:reddit.com` queries. Reddit API is added for ForumAgent specifically because it
+returns full post bodies, comment threads, upvote scores, and subreddit context — signal
+quality that Tavily `site:` queries cannot match. DuckDuckGo replaces SerpAPI as a
+zero-cost news fallback with no monthly quota.
 
 ### LLM Provider
 
+All models are accessed via OpenRouter. Set `OPENROUTER_API_KEY` and point pydantic-ai
+at the OpenRouter base URL.
+
 | Setting | Environment Variable |
 |---|---|
-| Research agent model | `RESEARCH_MODEL` (e.g. `claude-sonnet-4-6`) |
+| Research agent model | `RESEARCH_MODEL` (e.g. `openrouter/google/gemini-2.5-pro`) |
 | Scoring/alternatives model | `SCORING_MODEL` |
 | Conversation agent model | `CONVERSATION_MODEL` |
+| OpenRouter base URL | `OPENROUTER_BASE_URL=https://openrouter.ai/api/v1` |
 
 ### Getting API Keys
 
@@ -99,28 +164,30 @@ to undergraduate. Career goals are researched, not supplied by the user.
 Sign up free. Free tier: 1,000 API credits/month. Paid from $35/month.
 A full pipeline run uses approximately 50–70 tool calls total across all agents.
 
-**Brave Search** — https://api.search.brave.com  
-Free tier: 2,000 queries/month. Used as fallback only — free tier is sufficient.
+**Reddit API** — https://www.reddit.com/prefs/apps  
+Create a "script" app. Free. Returns `client_id` and `client_secret`.
+Used by ForumAgent only — stays well within free tier limits.
 
-**SerpAPI** — https://serpapi.com  
-Free tier: 100 searches/month. Used by NewsAgent only when Tavily misses news.
-Free tier sufficient for development; paid plan if running many pipeline cycles.
+**DuckDuckGo Search** — no signup, no key, no quota.
+Install: `pip install duckduckgo-search`. Used by NewsAgent as fallback only.
 
-**Anthropic (Claude models)** — https://console.anthropic.com  
-Create API key from console. Set `ANTHROPIC_API_KEY`.
+**OpenRouter** — https://openrouter.ai  
+Create API key from dashboard. Set `OPENROUTER_API_KEY`.
+Choose models via `RESEARCH_MODEL`, `SCORING_MODEL`, `CONVERSATION_MODEL` env vars.
 
 ### Environment File
 
 ```bash
 # .env
-ANTHROPIC_API_KEY=sk-ant-...
 TAVILY_API_KEY=tvly-...
-BRAVE_API_KEY=BSA...
-SERPAPI_KEY=...
+REDDIT_CLIENT_ID=...
+REDDIT_CLIENT_SECRET=...
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
-RESEARCH_MODEL=claude-sonnet-4-6
-SCORING_MODEL=claude-sonnet-4-6
-CONVERSATION_MODEL=claude-haiku-4-5-20251001
+RESEARCH_MODEL=openrouter/google/gemini-2.5-pro
+SCORING_MODEL=openrouter/google/gemini-2.5-pro
+CONVERSATION_MODEL=openrouter/google/gemini-2.5-flash
 ```
 
 ### Python Dependencies
@@ -130,11 +197,13 @@ CONVERSATION_MODEL=claude-haiku-4-5-20251001
 pydantic-ai
 pydantic
 chainlit
-pyyaml           # SKILL.md frontmatter parsing
-tavily-python    # Tavily MCP client
-jinja2           # report generation
+pyyaml                # SKILL.md frontmatter parsing
+tavily-python         # Tavily search client
+praw                  # Reddit API client (ForumAgent)
+duckduckgo-search     # News fallback — no key needed (NewsAgent)
+jinja2                # report generation
 python-dotenv
-pytest           # testing
+pytest                # testing
 ```
 
 ---
@@ -219,8 +288,8 @@ User Input: university_name + intended_course
         ↓
 [ReportGenerator]          deterministic Python, no LLM
   reads:  full blackboard
-  writes: report.md, summary.md, sources.md, score.json
-  fires:  ReportReadyMessage
+  writes: report.md, score.json
+  fires:  ReportReadyMessage (file_paths: [report.md, score.json])
         ↓
 [Chainlit UI]              displays report, offers file downloads
 ```
@@ -598,7 +667,7 @@ class AlternativesCompletedMessage(BaseMessage):
 
 # schemas/messages/report_ready.py
 class ReportReadyMessage(BaseMessage):
-    file_paths: list[str]   # paths to the 4 generated output files
+    file_paths: list[str]   # paths to the 2 generated output files: report.md, score.json
 
 # schemas/messages/progress_update.py
 class ProgressUpdateMessage(BaseMessage):
@@ -1169,9 +1238,13 @@ tool_budget: 6
 section_name: news
 ---
 
-## What to research
+## Search tool order
 
-- Institutional news: strikes, leadership changes, funding announcements,
+1. Tavily — primary. Use `days=730` filter.
+2. DuckDuckGo (`ddg_tool`) — fallback if Tavily returns fewer than 3 news items.
+   Use only for news queries, not general search.
+
+## What to research
   controversies, award wins, ranking changes, closures
 - Department-specific news: events, research breakthroughs, grant wins,
   staff departures, course changes — higher weight than institutional news
@@ -1221,10 +1294,11 @@ Generic university experience threads are not acceptable output.
 
 ## Sources — search in this order
 
-1. `site:reddit.com` — r/UniUK, r/AskUK, university subreddits
-2. `site:thestudentroom.co.uk` — course-specific threads
-3. `site:thegradcafe.com` — applicant and student discussion
-4. `site:quora.com` — student experience questions
+1. **Reddit API** — search r/UniUK, r/AskUK, r/ApplyingToCollege, university-specific subreddits
+   directly via PRAW. Returns full post bodies and comment threads — higher signal than site: queries.
+2. `site:thestudentroom.co.uk` via Tavily — course-specific threads
+3. `site:thegradcafe.com` via Tavily — applicant and student discussion
+4. `site:quora.com` via Tavily — student experience questions
 
 ## Query construction
 
@@ -1484,8 +1558,8 @@ from previous requests would accumulate and fire again.
 
 User submits university + course. The pipeline fires. `ProgressUpdateMessage`
 events render live agent status in the Chainlit step display. On
-`ReportReadyMessage`, the summary renders inline and files are offered
-for download.
+`ReportReadyMessage`, the report renders inline and both files (`report.md`,
+`score.json`) are offered for download.
 
 ### Mode 2 — Conversational Follow-Up
 
@@ -1607,13 +1681,14 @@ university_research/
 │
 ├── tools/
 │   ├── search_tool.py              Tavily wrapper — days=730 enforced
-│   └── fetch_tool.py               Fetch MCP wrapper
+│   ├── fetch_tool.py               Fetch MCP wrapper
+│   ├── reddit_tool.py              PRAW wrapper — ForumAgent subreddit search
+│   └── ddg_tool.py                 DuckDuckGo wrapper — NewsAgent fallback
 │
 ├── report/
 │   ├── generator.py                deterministic Jinja2 renderer, no LLM
 │   └── templates/
-│       ├── report.md.j2
-│       └── summary.md.j2
+│       └── report.md.j2            single template — executive summary + all sections
 │
 ├── services/
 │   └── research_handler.py         loads skills, constructs agents, handles requests
@@ -1682,12 +1757,12 @@ verifiable. No stage is purely structural.
 |---|---|---|
 | 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
 | 1a | MessageHub, Blackboard, Deps, all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
-| 1b | Tavily + Fetch MCP tool wrappers | Real searches against university targets confirmed |
+| 1b | Tavily + Fetch MCP + Reddit API (PRAW) + DuckDuckGo tool wrappers | Real searches against university targets confirmed |
 | 1c | CareerAgent end-to-end | `board.career` populated from real data via CLI |
-| 2a | All 7 section agents + ScoringAgent + AlternativesAgent + ReportGenerator | 4 output files generated from CLI for real university |
+| 2a | All 7 section agents + ScoringAgent + AlternativesAgent + ReportGenerator | 2 output files generated from CLI for real university |
 | 2b | Chainlit UI — Mode 1 research trigger | Full pipeline firing from UI with live progress |
 | 2c | ConversationAgent + Chainlit Mode 2 | Follow-up questions answered from blackboard |
-| 3a | Report quality pass — templates, confidence flags, comparison script | Side-by-side score.json comparison working |
+| 3a | Report quality pass — template, confidence flags, comparison script | Side-by-side score.json comparison working |
 | 3b | Edge case hardening | All failure scenarios handled without crash |
 
 ---
