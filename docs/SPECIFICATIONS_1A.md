@@ -30,6 +30,8 @@ the hub is already tested. No guessing.
 
 The hub is a pure fan-out dispatcher. It has no domain knowledge. It maps
 message types to lists of async handler functions and calls them all concurrently.
+`AgentParam` is defined here — it bundles the message and deps into a single
+object that every handler receives.
 
 ```python
 # core/message_hub.py
@@ -37,9 +39,21 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from typing import Callable, Awaitable, Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from pydantic import BaseModel
+
+
+@dataclass
+class AgentParam:
+    """Single parameter received by every agent handler.
+
+    message: the event that triggered this handler — typed to the subscribed message type.
+    deps:    the per-request bundle (hub, board, context) — same instance across all handlers.
+    """
+    message: BaseModel
+    deps: Any
 
 
 class MessageHub:
@@ -51,18 +65,14 @@ class MessageHub:
 
     Usage:
         hub = MessageHub()
-        hub.subscribe(SomeMessage, async_handler_fn)
-        await hub.publish(SomeMessage(triggered_by="x", timestamp="..."))
+        hub.subscribe(SomeMessage, agent.handle)
+        await hub.publish(SomeMessage(triggered_by="x", timestamp="..."), deps)
     """
 
     def __init__(self) -> None:
-        self._subscribers: dict[type, list[Callable[..., Awaitable[Any]]]] = defaultdict(list)
+        self._subscribers: dict[type, list[Callable]] = defaultdict(list)
 
-    def subscribe(
-        self,
-        message_type: type,
-        handler: Callable[..., Awaitable[Any]],
-    ) -> None:
+    def subscribe(self, message_type: type, handler: Callable) -> None:
         """Register an async handler for a message type.
 
         Multiple handlers per type are allowed — all fire concurrently
@@ -70,22 +80,28 @@ class MessageHub:
         """
         self._subscribers[message_type].append(handler)
 
-    async def publish(self, message: BaseModel) -> None:
-        """Dispatch message to all registered handlers concurrently.
+    async def publish(self, message: BaseModel, deps: Any) -> None:
+        """Package message + deps into AgentParam, dispatch to all handlers concurrently.
 
         Uses asyncio.gather() — all handlers start simultaneously.
         If no handlers are registered for the message type, does nothing.
         Handler exceptions are not caught here — they propagate to the caller.
         """
         handlers = self._subscribers.get(type(message), [])
-        if handlers:
-            await asyncio.gather(*[h(message) for h in handlers])
+        if not handlers:
+            return
+        param = AgentParam(message=message, deps=deps)
+        await asyncio.gather(*[h(param) for h in handlers])
 
     def subscriber_count(self, message_type: type) -> int:
         """Return number of registered handlers for a message type.
         Used in tests to verify subscription state."""
         return len(self._subscribers.get(message_type, []))
 ```
+
+**Why `AgentParam` lives here:** it is defined at the hub level because
+it is the hub's output contract — the shape of what every handler receives.
+Placing it in `deps.py` or a separate file would scatter a tightly coupled pair.
 
 **Why `defaultdict(list)`:** accessing an unregistered message type returns
 an empty list rather than raising `KeyError`. This means publishing to a
@@ -820,6 +836,102 @@ it is synthesis, not a section.
 
 ---
 
+## 1a.7a `tool_budget` — What It Is and How It Gets Enforced
+
+### What it is
+`tool_budget` is the maximum number of external tool calls an agent is
+allowed to make in a single pipeline run. It is declared in each SKILL.md
+frontmatter, read by `SkillMeta` at startup, and passed to the agent
+constructor by `ResearchHandler`.
+
+It exists for three reasons:
+
+**Cost control.** Every Tavily call costs 1 API credit. Every Reddit API
+call counts against the rate limit. A hard cap makes worst-case API spend
+per pipeline run predictable. With the values in this spec, a full run
+across all agents costs at most 50–70 Tavily calls — within the free tier.
+
+**Query discipline.** An agent with an unlimited budget can afford to be
+lazy — fire broad queries and sift results. An agent with 5 calls must
+construct precise queries from the start. The budget forces the agent to
+prioritise signal over volume.
+
+**Pipeline stability.** An agent that loops or retries excessively blocks
+the concurrent phase. A hard cap prevents one misbehaving agent from
+stalling the others.
+
+### Why the values are what they are
+
+| Agent | `tool_budget` | Why |
+|---|---|---|
+| `forum` | 10 | Highest — Reddit API + multiple `site:` Tavily queries across 3 platforms |
+| `career` | 8 | Job postings snapshot + salary data requires multiple queries |
+| `employability` | 8 | Named companies require several targeted queries |
+| `alternatives` | 8 | 2–3 universities × multiple queries each |
+| `rankings` | 6 | Multiple ranking bodies — QS, THE, Guardian, Complete University Guide |
+| `accommodation` | 6 | On-campus + off-campus + safety + transport — four distinct searches |
+| `news` | 6 | Tavily primary + DuckDuckGo fallback both count against this budget |
+| `background` | 5 | Institutional facts — fewer queries needed |
+| `program` | 5 | Course catalog fetch + 1–2 search queries |
+| `scoring` | 0 | No tools — synthesises from blackboard only, never searches |
+| `conversation` | 0 | No tools — answers follow-up questions from blackboard only |
+
+`scoring` and `conversation` having `tool_budget: 0` is an explicit
+contract, not a default. It makes it immediately visible in the SKILL.md
+that these agents must never call search tools.
+
+### How it gets enforced — Stage 1c and 2a
+`tool_budget` is stored on `SkillMeta` and passed to each agent constructor
+at startup. The enforcement is implemented when agents are built in Stage 1c
+(`CareerAgent`) and Stage 2a (all remaining section agents).
+
+The pattern every agent follows:
+
+```python
+class CareerAgent(BaseAgent):
+    def __init__(self, instructions: str, tool_budget: int) -> None:
+        super().__init__(instructions=instructions)
+        self._tool_budget = tool_budget
+        self._calls_made  = 0        # reset per request in handle()
+
+    async def _search(self, deps, query: str, **kwargs):
+        """Gated search call. Skips and warns if budget exhausted."""
+        if self._calls_made >= self._tool_budget:
+            self._logger.warning(
+                "%s | tool budget exhausted (%d calls) — skipping: %r",
+                self.__class__.__name__, self._tool_budget, query,
+            )
+            return None
+        self._calls_made += 1
+        return await deps.tavily.search(query, **kwargs)
+```
+
+Every tool call goes through `_search()` or an equivalent gated wrapper
+for `deps.reddit` and `deps.ddg`. Direct calls to `deps.tavily.search()`
+that bypass the gate are a bug.
+
+`_calls_made` is reset at the start of each `handle()` call — not in
+`__init__()` — so the same agent instance handles multiple requests across
+sessions without carrying over a previous run's count.
+
+### What happens when the budget is exhausted
+The agent does not raise or fail. It logs a warning, skips remaining
+queries, and returns whatever it gathered so far. The output schema's
+`confidence` field is set to `"low"` if the agent could not complete all
+intended searches. `ScoringAgent` reads `confidence` and redistributes
+weight accordingly.
+
+A partial result with a low confidence flag is more useful than a
+pipeline failure.
+
+### Why `tool_budget` lives in SKILL.md and not in Python
+Budget values change as the system is tuned. `ForumAgent` might need 12
+calls for certain universities. `BackgroundAgent` might only ever need 3.
+Keeping the value in SKILL.md means adjusting the budget is a markdown
+edit and restart — no Python change, no redeploy.
+
+---
+
 ## 1a.8 `core/llm_factory.py`
 
 Creates pydantic-ai model instances from environment variables. Called once
@@ -912,7 +1024,7 @@ from pathlib import Path
 
 import pytest
 
-from core.message_hub import MessageHub
+from core.message_hub import MessageHub, AgentParam
 from core.blackboard import Blackboard
 from core.deps import Deps, ResearchContext
 
@@ -935,12 +1047,12 @@ TIMESTAMP = datetime.now().isoformat()
 # ── MessageHub ────────────────────────────────────────────────────────────────
 
 def test_hub_subscribe_and_publish() -> None:
-    """Hub dispatches to registered handler."""
+    """Hub dispatches to registered handler with AgentParam."""
     hub = MessageHub()
-    received: list[BaseMessage] = []
+    received: list = []
 
-    async def handler(msg: BaseMessage) -> None:
-        received.append(msg)
+    async def handler(param: AgentParam) -> None:
+        received.append(param.message)
 
     hub.subscribe(SectionCompletedMessage, handler)
     msg = SectionCompletedMessage(
@@ -948,7 +1060,10 @@ def test_hub_subscribe_and_publish() -> None:
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    asyncio.get_event_loop().run_until_complete(hub.publish(msg))
+    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
+        university_name="U", intended_course="CS", country="UK"
+    ))
+    asyncio.run(hub.publish(msg, deps))
     assert len(received) == 1
     assert received[0].section_name == "forum"
 
@@ -958,9 +1073,9 @@ def test_hub_multiple_handlers() -> None:
     hub = MessageHub()
     calls: list[str] = []
 
-    async def h1(msg): calls.append("h1")
-    async def h2(msg): calls.append("h2")
-    async def h3(msg): calls.append("h3")
+    async def h1(param: AgentParam): calls.append("h1")
+    async def h2(param: AgentParam): calls.append("h2")
+    async def h3(param: AgentParam): calls.append("h3")
 
     hub.subscribe(SectionCompletedMessage, h1)
     hub.subscribe(SectionCompletedMessage, h2)
@@ -971,15 +1086,21 @@ def test_hub_multiple_handlers() -> None:
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    asyncio.get_event_loop().run_until_complete(hub.publish(msg))
+    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
+        university_name="U", intended_course="CS", country="UK"
+    ))
+    asyncio.run(hub.publish(msg, deps))
     assert sorted(calls) == ["h1", "h2", "h3"]
 
 
 def test_hub_no_handlers_is_noop() -> None:
     """Publishing to a type with no subscribers does nothing."""
     hub = MessageHub()
+    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
+        university_name="U", intended_course="CS", country="UK"
+    ))
     msg = ScoringCompletedMessage(triggered_by="test", timestamp=TIMESTAMP)
-    asyncio.get_event_loop().run_until_complete(hub.publish(msg))  # must not raise
+    asyncio.run(hub.publish(msg, deps))  # must not raise
 
 
 def test_hub_type_isolation() -> None:
@@ -987,16 +1108,19 @@ def test_hub_type_isolation() -> None:
     hub = MessageHub()
     calls: list[str] = []
 
-    async def handler(msg): calls.append("fired")
+    async def handler(param: AgentParam): calls.append("fired")
 
     hub.subscribe(SectionCompletedMessage, handler)
+    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
+        university_name="U", intended_course="CS", country="UK"
+    ))
     msg = SectionFailedMessage(
         section_name="news",
         reason="timeout",
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    asyncio.get_event_loop().run_until_complete(hub.publish(msg))
+    asyncio.run(hub.publish(msg, deps))
     assert calls == []
 
 
@@ -1006,15 +1130,18 @@ def test_hub_fresh_instance_isolation() -> None:
     hub2 = MessageHub()
     calls: list[str] = []
 
-    async def handler(msg): calls.append("fired")
+    async def handler(param: AgentParam): calls.append("fired")
 
     hub1.subscribe(SectionCompletedMessage, handler)
+    deps2 = Deps(hub=hub2, board=Blackboard(), context=ResearchContext(
+        university_name="U", intended_course="CS", country="UK"
+    ))
     msg = SectionCompletedMessage(
         section_name="rankings",
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    asyncio.get_event_loop().run_until_complete(hub2.publish(msg))
+    asyncio.run(hub2.publish(msg, deps2))
     assert calls == []   # hub2 has no subscribers
 
 
@@ -1211,9 +1338,9 @@ Cause: the markdown body after the second `---` is empty.
 The body does not need to be complete at this stage, but it must not be blank.
 Add at least a one-line placeholder if the full content is not written yet.
 
-**`test_hub_subscribe_and_publish FAILED — DeprecationWarning: There is no current event loop`**
-Cause: using `asyncio.get_event_loop().run_until_complete()` in Python 3.12.
-Fix: replace with `asyncio.run(hub.publish(msg))` in the test.
+**`test_hub_subscribe_and_publish FAILED — handler received wrong type`**
+Cause: handler signature uses `msg` typed as `BaseMessage` instead of `AgentParam`.
+Fix: all handlers must accept `param: AgentParam` and read `param.message` and `param.deps`.
 
 **`AssertionError: forum should have the highest tool_budget`**
 Cause: `forum/SKILL.md` has `tool_budget: 8` instead of `10`.

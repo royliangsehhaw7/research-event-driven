@@ -1,0 +1,8 @@
+{
+  "yaml.schemas": {
+    "": ["**/skills/**/SKILL.md"]
+  },
+  "files.associations": {
+    "**/skills/**/SKILL.md": "markdown"
+  }
+}

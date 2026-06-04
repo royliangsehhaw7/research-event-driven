@@ -331,10 +331,11 @@ ReportReadyMessage             → [chainlit_ui.handle]
 ProgressUpdateMessage          → [chainlit_ui.handle]
 ```
 
-`publish(message)` does exactly this:
+`publish(message, deps)` does exactly this:
 ```python
 handlers = self._subscribers.get(type(message), [])
-await asyncio.gather(*[h(message) for h in handlers])
+param = AgentParam(message=message, deps=deps)
+await asyncio.gather(*[h(param) for h in handlers])
 ```
 
 **The hub has zero domain knowledge.** It does not know what a university
@@ -355,14 +356,14 @@ data from a message payload.
 # One agent, two distinct steps — every agent follows this:
 
 # 1. Write full rich output to blackboard
-deps.board.forum = forum_result   # ForumOutput — all findings
+param.deps.board.forum = forum_result   # ForumOutput — all findings
 
 # 2. Publish lean notification to hub
-await deps.hub.publish(SectionCompletedMessage(
+await param.deps.hub.publish(SectionCompletedMessage(
     section_name="forum",
     triggered_by="forum_agent",
     timestamp=datetime.now().isoformat(),
-))
+), param.deps)
 ```
 
 **Important:** the term "event loop" is reserved for Python's asyncio
@@ -489,21 +490,30 @@ This is covered in detail in Section 7.
 from __future__ import annotations
 import asyncio
 from collections import defaultdict
-from typing import Callable, Awaitable
+from dataclasses import dataclass
+from typing import Any, Callable
 from pydantic import BaseModel
+
+
+@dataclass
+class AgentParam:
+    message: BaseModel
+    deps: Any
 
 
 class MessageHub:
     def __init__(self) -> None:
         self._subscribers: dict[type, list[Callable]] = defaultdict(list)
 
-    def subscribe(self, message_type: type, handler: Callable[..., Awaitable[None]]) -> None:
+    def subscribe(self, message_type: type, handler: Callable) -> None:
         self._subscribers[message_type].append(handler)
 
-    async def publish(self, message: BaseModel) -> None:
+    async def publish(self, message: BaseModel, deps: Any) -> None:
         handlers = self._subscribers.get(type(message), [])
-        if handlers:
-            await asyncio.gather(*[h(message) for h in handlers])
+        if not handlers:
+            return
+        param = AgentParam(message=message, deps=deps)
+        await asyncio.gather(*[h(param) for h in handlers])
 ```
 
 One instance per research request — created fresh in `ResearchHandler.handle_request()`.
@@ -1496,16 +1506,26 @@ and what it didn't. Do not oversell the report.
 
 ---
 
-## 9. Deps Threading — Handler Closure Pattern
+## 9. Handler Pattern — AgentParam
 
-This is the pattern that handles how `Deps` reaches each agent's handler.
-In pydantic-ai, `agent.run()` takes `deps` as a parameter. But the handler
-registered on the hub receives only the message. The solution: close over
-`deps` at subscription time.
+Every agent's `handle` method receives a single `AgentParam`. This bundles
+the message and `deps` together so all handlers have a uniform, explicit signature.
+No closures. No binding at subscription time. `deps` travels with every dispatch.
 
 ```python
-# In ResearchHandler.handle_request() — called once per research request
+# Every agent handle method looks like this — no exceptions
+async def handle(self, param: AgentParam) -> None:
+    context = param.deps.context
+    board   = param.deps.board
+    hub     = param.deps.hub
+    message = param.message   # typed to the subscribed message type
+    ...
+```
 
+`ResearchHandler.handle_request()` creates fresh per-request objects,
+subscribes agent methods directly, then fires the single trigger:
+
+```python
 async def handle_request(self, university_name: str, intended_course: str) -> Blackboard:
     # 1. Derive country
     country = await self._derive_country(university_name)
@@ -1520,34 +1540,36 @@ async def handle_request(self, university_name: str, intended_course: str) -> Bl
     )
     deps = Deps(hub=hub, board=board, context=context)
 
-    # 3. Subscribe all agents — close over deps in each handler
-    async def career_handle(msg):
-        await self._career_agent.handle(msg, deps)
+    # 3. Subscribe agent methods directly — deps travels through publish
+    hub.subscribe(ResearchRequestedMessage,        self._career_agent.handle)
 
-    async def background_handle(msg):
-        await self._background_agent.handle(msg, deps)
+    hub.subscribe(CareerResearchCompletedMessage,  self._background_agent.handle)
+    hub.subscribe(CareerResearchCompletedMessage,  self._rankings_agent.handle)
+    hub.subscribe(CareerResearchCompletedMessage,  self._program_agent.handle)
+    hub.subscribe(CareerResearchCompletedMessage,  self._employability_agent.handle)
+    hub.subscribe(CareerResearchCompletedMessage,  self._accommodation_agent.handle)
+    hub.subscribe(CareerResearchCompletedMessage,  self._news_agent.handle)
+    hub.subscribe(CareerResearchCompletedMessage,  self._forum_agent.handle)
 
-    # ... same pattern for all agents
+    hub.subscribe(SectionCompletedMessage,         self._scoring_agent.handle)
+    hub.subscribe(SectionFailedMessage,            self._scoring_agent.handle)
+    hub.subscribe(ScoringCompletedMessage,         self._alternatives_agent.handle)
+    hub.subscribe(AlternativesCompletedMessage,    self._report_generator.handle)
 
-    hub.subscribe(ResearchRequestedMessage, career_handle)
-    hub.subscribe(CareerResearchCompletedMessage, background_handle)
-    hub.subscribe(CareerResearchCompletedMessage, rankings_handle)
-    # ... etc.
-
-    # 4. Fire the single trigger
+    # 4. Fire the single trigger — deps flows through every subsequent publish
     await hub.publish(ResearchRequestedMessage(
         university_name=university_name,
         intended_course=intended_course,
         country=country,
         triggered_by="research_handler",
         timestamp=datetime.now().isoformat(),
-    ))
+    ), deps)
 
     return board
 ```
 
-The closure pattern is the reason `MessageHub` and `Deps` are both created
-fresh per request. If the hub were shared across requests, subscriptions
+Because `deps` is passed through every `publish` call, `MessageHub` and `Deps`
+must still be created fresh per request. If the hub were shared, subscriptions
 from previous requests would accumulate and fire again.
 
 ---
@@ -1758,11 +1780,14 @@ verifiable. No stage is purely structural.
 | 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
 | 1a | MessageHub, Blackboard, Deps, all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
 | 1b | Tavily + Fetch MCP + Reddit API (PRAW) + DuckDuckGo tool wrappers | Real searches against university targets confirmed |
-| 1c | CareerAgent end-to-end | `board.career` populated from real data via CLI |
-| 2a | All 7 section agents + ScoringAgent + AlternativesAgent + ReportGenerator | 2 output files generated from CLI for real university |
-| 2b | Chainlit UI — Mode 1 research trigger | Full pipeline firing from UI with live progress |
-| 2c | ConversationAgent + Chainlit Mode 2 | Follow-up questions answered from blackboard |
-| 3a | Report quality pass — template, confidence flags, comparison script | Side-by-side score.json comparison working |
+| 1c | `CareerAgent` end-to-end | `board.career` populated from real data via CLI |
+| 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` | `board.background`, `board.rankings`, `board.program` populated via CLI — Tavily + Fetch only, no upstream dependencies |
+| 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` | `board.employability`, `board.accommodation`, `board.news` populated via CLI — `EmployabilityAgent` reads `board.career`, `NewsAgent` exercises DuckDuckGo fallback |
+| 1f | `ForumAgent` | `board.forum` populated via CLI — Reddit API + Tavily `site:` queries, strictest scope rules, highest tool budget |
+| 2a | `ScoringAgent` + quorum gate | `board.score` populated after all 7 section agents complete — asyncio.Lock verified, partial results handled |
+| 2b | `AlternativesAgent` + `ReportGenerator` | 2 output files generated from CLI for real university — `score.json` and `report.md` |
+| 2c | Chainlit UI Mode 1 + Mode 2 + `ConversationAgent` | Full pipeline firing from UI with live progress, follow-up questions answered from blackboard |
+| 3a | Report quality pass — template, confidence flags, comparison script | Side-by-side `score.json` comparison working |
 | 3b | Edge case hardening | All failure scenarios handled without crash |
 
 ---
