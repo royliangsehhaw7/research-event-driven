@@ -132,12 +132,18 @@ never silently omits a section.
 
 ### Search Tools
 
-| Tool | Role | API Key Required |
-|---|---|---|
-| **Tavily** | Primary search — all agents. Key feature: `days=730` date filter | `TAVILY_API_KEY` |
-| **Fetch MCP** | Direct URL fetch for university catalog pages, rankings pages | None — open |
-| **Reddit API (PRAW)** | ForumAgent — subreddit search, post bodies, comment scores. Richer than `site:reddit.com` via Tavily | `REDDIT_CLIENT_ID` + `REDDIT_CLIENT_SECRET` |
-| **DuckDuckGo Search** | NewsAgent fallback when Tavily misses news. No key, no quota | None — no key needed |
+| Tool | Kind | Role | API Key Required |
+|---|---|---|---|
+| **Tavily** | Python client | Primary search — all agents. Key feature: `days=730` date filter | `TAVILY_API_KEY` |
+| **Fetch MCP** | MCP server | Direct URL fetch for university catalog pages, rankings pages | None — open |
+| **Reddit API (PRAW)** | Python client | ForumAgent — subreddit search, post bodies, comment scores. Richer than `site:reddit.com` via Tavily | `REDDIT_CLIENT_ID` + `REDDIT_CLIENT_SECRET` |
+| **DuckDuckGo Search** | Python client | NewsAgent fallback when Tavily misses news. No key, no quota | None — no key needed |
+
+**Fetch MCP is the only MCP server in the stack.** Tavily, Reddit (PRAW), and
+DuckDuckGo are plain Python client libraries — no MCP protocol involved.
+The MCP server connection for Fetch lives in `mcp/fetch_client.py`. The
+pydantic-ai tool function that wraps it lives in `tools/fetch_tool.py`.
+These are kept separate — one file, one responsibility.
 
 **Why these tools:**
 Tavily handles all general search including `site:thestudentroom.co.uk`, `site:quora.com`,
@@ -331,11 +337,10 @@ ReportReadyMessage             → [chainlit_ui.handle]
 ProgressUpdateMessage          → [chainlit_ui.handle]
 ```
 
-`publish(message, deps)` does exactly this:
+`publish(message)` does exactly this:
 ```python
 handlers = self._subscribers.get(type(message), [])
-param = AgentParam(message=message, deps=deps)
-await asyncio.gather(*[h(param) for h in handlers])
+await asyncio.gather(*[h(message) for h in handlers])
 ```
 
 **The hub has zero domain knowledge.** It does not know what a university
@@ -490,15 +495,8 @@ This is covered in detail in Section 7.
 from __future__ import annotations
 import asyncio
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 from pydantic import BaseModel
-
-
-@dataclass
-class AgentParam:
-    message: BaseModel
-    deps: Any
 
 
 class MessageHub:
@@ -508,12 +506,11 @@ class MessageHub:
     def subscribe(self, message_type: type, handler: Callable) -> None:
         self._subscribers[message_type].append(handler)
 
-    async def publish(self, message: BaseModel, deps: Any) -> None:
+    async def publish(self, message: BaseModel) -> None:
         handlers = self._subscribers.get(type(message), [])
         if not handlers:
             return
-        param = AgentParam(message=message, deps=deps)
-        await asyncio.gather(*[h(param) for h in handlers])
+        await asyncio.gather(*[h(message) for h in handlers])
 ```
 
 One instance per research request — created fresh in `ResearchHandler.handle_request()`.
@@ -584,13 +581,20 @@ class Deps:
     hub:      MessageHub
     board:    Blackboard
     context:  ResearchContext
-    # search clients added here as the project grows
-    # tavily_client: TavilyClient | None = None
+    tavily:   Any              # TavilyClient — used by all research agents
+    fetch:    Any              # Fetch MCP client — used by all research agents
+    reddit:   Any | None       # praw.Reddit — ForumAgent only, None if not configured
+    ddg:      Any              # DDGS — NewsAgent only
 ```
 
 `Deps` is created fresh per request in `ResearchHandler.handle_request()`.
-It bundles the three per-request objects that agents need. Agents receive
-`deps` via their `handle()` method — they never construct it themselves.
+Tool clients (`tavily`, `fetch`, `reddit`, `ddg`) are created once at
+`ResearchHandler` startup and reused across requests — they carry no
+per-request state. `hub` and `board` are fresh each request.
+
+`tool_budget` and `calls_made` live on each agent instance (`self._tool_budget`,
+`self._calls_made`), not on `Deps`. This ensures concurrent section agents each
+manage their own counter independently.
 
 ---
 
@@ -598,41 +602,90 @@ It bundles the three per-request objects that agents need. Agents receive
 
 ```python
 from __future__ import annotations
+
 import logging
+from abc import ABC, abstractmethod
+
 from pydantic_ai import Agent
 
+from core.message_hub import MessageHub
+from core.deps import Deps
 
-class BaseAgent:
+
+class BaseAgent(ABC):
+    """Base class for all research pipeline agents.
+
+    Each subclass:
+    - constructs its own pydantic-ai Agent with exactly the tools it needs
+    - implements subscribe() to register its handler(s) on the hub via closure
+    - implements get_instruction() to return its system prompt (base + SKILL.md body)
+
+    instructions: the full markdown body from the agent's SKILL.md file.
+    Injected by ResearchHandler at construction time. Empty string if SKILL.md
+    is missing — agent is degraded but functional.
+    """
+
     def __init__(self, instructions: str = "") -> None:
         self.instructions = instructions
-        self._agent: Agent | None = None   # set by subclass __init__
+        self._agent: Agent | None = None   # constructed by subclass __init__
         self._logger = logging.getLogger(self.__class__.__name__)
 
-    def _base_prompt(self) -> str:
-        """Override in subclass. Structural context only — no domain knowledge."""
-        return ""
+    def reset(self) -> None:
+        """Called before each request's subscribe loop. No-op by default.
+        Subclasses that carry per-request state (e.g. a _fired flag) override this."""
+        pass
 
-    def _build_system_prompt(self) -> str:
-        """Combines structural base prompt with SKILL.md instructions.
+    @abstractmethod
+    def subscribe(self, hub: MessageHub, deps: Deps) -> None:
+        """Register this agent's handler(s) on the hub via closure.
 
-        Base prompt: what blackboard field the agent writes, what message it fires,
-                     what output schema it produces.
-        Instructions: everything from the SKILL.md body — search strategy,
-                      query construction, quality filters, edge cases.
+        deps is captured at subscription time. The hub never receives deps.
 
-        If instructions is empty (missing SKILL.md), the base prompt runs alone.
-        The agent is degraded but functional — it knows its structural role.
+        Example:
+            def subscribe(self, hub, deps):
+                async def handler(message):
+                    await self.handle(message, deps)
+                hub.subscribe(SomeMessage, handler)
         """
-        base = self._base_prompt()
-        if self.instructions:
-            return base + "\n\n" + self.instructions
-        return base
+        ...
+
+    @abstractmethod
+    def get_instruction(self) -> str:
+        """Return the full system prompt for this agent.
+
+        Combine a short structural preamble (what blackboard field the agent
+        writes, what message it fires, what output schema it returns) with
+        self.instructions (the SKILL.md body — search strategy, query
+        construction, quality filters, edge cases).
+
+        Example:
+            def get_instruction(self) -> str:
+                base = \"\"\"
+                    You are the CareerAgent in a university research pipeline.
+                    Write your findings to deps.board.career as a CareerOutput.
+                    Fire CareerResearchCompletedMessage when done.
+                \"\"\"
+                return base + "\\n\\n" + self.instructions if self.instructions else base
+        """
+        ...
 ```
 
-**The discipline that matters most:** `_base_prompt()` carries only structural
-context. It never contains domain knowledge. Domain knowledge belongs in
-SKILL.md. If you find yourself writing "search for salary ranges" in
-`_base_prompt()`, stop — that belongs in `skills/career/SKILL.md`.
+**Why closures instead of passing `deps` through the hub:** the hub's `publish(message)`
+signature stays clean — it has no knowledge of `deps`. Each agent's `subscribe()` captures
+`deps` in a closure at subscription time. The hub calls `handler(message)`; the handler
+calls `self.handle(message, deps)` with the captured deps. This matches the pattern
+established in the v7 customer service system.
+
+**Why `reset()` is here:** agents are built once and reused across Chainlit sessions.
+Any agent that accumulates per-request state must override `reset()` and be called
+before each new request's subscribe loop. ResearchHandler calls `reset()` on every
+agent before subscribing.
+
+**The discipline that matters most:** `get_instruction()` structural preamble carries
+only pipeline role context. Domain knowledge — what to search, how to construct
+queries, what to discard — belongs entirely in SKILL.md. If you find yourself writing
+"search for salary ranges" in `get_instruction()`, stop — that belongs in
+`skills/career/SKILL.md`.
 
 ---
 
@@ -819,7 +872,7 @@ def load_skill(path: Path) -> SkillMeta | None:
         return None
 
     required = ("key", "name", "description", "tool_budget")
-    missing = [f for f in required if not meta.get(f)]
+    missing = [f for f in required if f not in meta or meta[f] is None]
     if missing:
         logger.warning("skill_loader | %s: missing required fields %s — skipping", path, missing)
         return None
@@ -922,608 +975,339 @@ class ResearchHandler:
 `{"career", "background", "rankings", "program", "employability", "accommodation", "news", "forum"}`.
 `ScoringAgent` receives `expected_sections` from this count — not hardcoded to 7.
 
-### What Goes in `_base_prompt()` vs SKILL.md
+### What Goes in `get_instruction()` vs SKILL.md
 
 This is the most important discipline in the entire system:
 
-| Belongs in `_base_prompt()` — Python | Belongs in SKILL.md body |
+| Belongs in `get_instruction()` structural preamble | Belongs in SKILL.md body |
 |---|---|
 | "You are the Forum Research Agent in a university research pipeline." | What to search for |
 | "You write your findings to deps.board.forum as a ForumOutput." | How to construct queries |
 | "You fire SectionCompletedMessage(section_name='forum') on success." | Which sources to use and in what order |
-| "Your tool budget is enforced by the pipeline." | What to discard and why |
+| | What to discard and why |
 | | Signal quality thresholds |
 | | Output structure requirements |
 | | Edge case handling |
 
-The base prompt describes the agent's structural role in the pipeline — it
-never changes. SKILL.md describes what the agent should actually do — it
-changes as the system is tuned.
+The structural preamble describes the agent's pipeline role — it never changes.
+SKILL.md describes what the agent should actually do — it changes as the system
+is tuned.
 
 ---
 
-## 8. All Eleven SKILL.md Files
+## 8. Tools — Per-Agent Registration
 
-### `skills/career/SKILL.md`
+### 8.1 Design decision
 
-```markdown
----
-key: career
-name: Career Research Agent
-description: Researches career paths, salary ranges, and live job postings for the given course in the university's country.
-tool_budget: 8
-section_name: career
----
+Tools are the **only** mechanism through which research agents access external data.
+Each tool is an async function registered on the pydantic-ai `Agent` at construction
+time. The LLM calls tools mid-reasoning during `agent.run()` — but it can only call
+the tools registered on that specific agent.
 
-## Role
+This is the key constraint: the tool set assigned at construction time limits what
+the LLM can do. There is no free orchestration. A `CareerAgent` cannot call
+Reddit tools because they were never registered on it.
 
-You are the first agent to run. Every other agent depends on the career
-context you establish. Research thoroughly before returning.
+### 8.2 Folder structure — `mcp/` vs `tools/`
 
-## What to research
+Two folders. One responsibility each.
 
-- Realistic career paths a graduate of this course typically enters
-- Salary ranges for those careers in the university's country (not global)
-- A snapshot of live job postings matching those careers (10–15 minimum)
-- In-demand skills extracted from the postings
+**`mcp/`** — MCP server connection objects. One file per MCP server. Each file
+owns the connection, configuration, and lifecycle for exactly one MCP server.
+Nothing else lives here.
 
-## Query construction
+**`tools/`** — pydantic-ai tool functions. One file per tool. Each file defines
+one async tool function that the LLM can call. Tool functions access external
+clients via `ctx.deps`. Nothing else lives here.
 
-Always include: [course] + [career/jobs/salary] + [country]
-Never query on [university name] alone — career paths are course-level.
+```
+mcp/
+└── fetch_client.py         MCP server connection for the Fetch MCP server
 
-Examples:
-- "Computer Science graduate careers UK salary 2024"
-- "Computer Science jobs London entry level 2024"
-- "Psychology graduate employment Australia salary range"
-
-## Date filter
-
-All results must be within 2 years. Discard anything older.
-
-## What to return
-
-- At least 3 distinct career paths with titles and typical progression
-- Salary ranges: entry level, mid, senior — country-scoped, in local currency
-- Job posting snapshot: company, role title, required skills, date posted
-- Top 5–8 in-demand skills extracted across postings
-- Sources: URL + date for every data point
-
-## Quality bar
-
-Salary data without country scoping is not acceptable. Return with
-confidence: low and flag it rather than present global averages as local.
+tools/
+├── search_tool.py          tavily_search — Tavily Python client
+├── fetch_tool.py           fetch_page — calls ctx.deps.fetch (from mcp/fetch_client.py)
+├── reddit_tool.py          reddit_search — PRAW Python client
+└── ddg_tool.py             ddg_search — DuckDuckGo Python client
 ```
 
----
-
-### `skills/background/SKILL.md`
-
-```markdown
----
-key: background
-name: Background Agent
-description: Researches the university's institutional profile — history, size, orientation, and course-specific strengths.
-tool_budget: 5
-section_name: background
----
-
-## What to research
-
-- University founding date, size (student population), public or private status
-- Research-intensive vs teaching-focused orientation
-- Known strengths in the specific course or department being researched
-- Relevant accreditations for the course (e.g. AACSB for business, BCS for CS)
-- Any notable alumni or industry partnerships tied to the specific course
-
-## Query construction
-
-Always include: [university name] + [course/department]
-Never: [university name] alone
-
-Examples:
-- "University of Manchester Computer Science department profile"
-- "University of Manchester research teaching focus"
-- "University of Manchester Computer Science accreditation"
-
-## Date filter
-
-Institutional facts (founding date, size) may use older sources.
-Accreditation status, department orientation: 2-year filter applies.
-
-## What to return
-
-- Factual profile: founded, size, public/private, research vs teaching label
-- Course-specific strengths: what is this department known for?
-- Accreditations: name, body, scope, date last confirmed
-- Industry connections specific to the course (not generic partnerships)
-- Sources: URL + date
-
-## Quality bar
-
-Do not summarise the university's general reputation. Stay scoped to what
-matters for the specific course. A strong law school is irrelevant when
-researching Computer Science.
-```
-
----
-
-### `skills/rankings/SKILL.md`
-
-```markdown
----
-key: rankings
-name: Rankings Agent
-description: Researches subject-specific and employability rankings for the given university and course.
-tool_budget: 6
-section_name: rankings
----
-
-## Priority order
-
-1. Subject-specific ranking for this course (QS by Subject, THE by Subject,
-   Guardian Subject Rankings, Complete University Guide)
-2. Graduate employability ranking (QS Graduate Employability)
-3. Overall university ranking (QS World, THE World) — lowest weight, last resort
-
-Overall ranking is a proxy and is explicitly down-weighted in scoring.
-Subject ranking is what matters.
-
-## Query construction
-
-Always include: [university name] + [course/subject] + [ranking year]
-
-Examples:
-- "QS World University Rankings Computer Science University of Manchester 2024"
-- "Times Higher Education Psychology rankings 2024"
-- "Guardian University Guide Computer Science 2024"
-
-## Date filter
-
-Rankings change annually. Use the most recent published edition only.
-Do not mix years.
-
-## Confidence handling
-
-If no subject-specific ranking is found for this course:
-- Set confidence: low
-- Return overall ranking only with a clear note
-- Do not substitute a general department rank for a subject rank
-
-ScoringAgent will down-weight this dimension if confidence is low.
-```
-
----
-
-### `skills/program/SKILL.md`
-
-```markdown
----
-key: program
-name: Program Agent
-description: Researches the specific undergraduate programs, modules, and delivery format for the given course.
-tool_budget: 5
-section_name: program
----
-
-## What to research
-
-- Available undergraduate programs matching the course name
-- Specialisations or pathways within the program
-- Core modules in years 1 and 2
-- Optional modules and electives
-- Duration in years, delivery format
-- Any program features directly relevant to career outcomes from board.career
-
-## Query construction
-
-Always include: [university name] + [course] + undergraduate
-
-Examples:
-- "University of Manchester Computer Science undergraduate program modules"
-- "University of Edinburgh Psychology undergraduate pathways"
-
-## Date filter
-
-Use current academic year only. Prefer official university catalog pages.
-
-## What to return
-
-- List of matching undergraduate programs with full titles
-- Core modules yr1, core modules yr2, electives
-- Duration, delivery options (sandwich year? study abroad?)
-- Curriculum elements that map to in-demand skills from board.career
-- Official source URL for the course catalog page
-
-## Quality bar
-
-Return factual module names and structure. Marketing language is not
-acceptable output. If the catalog is behind a login, return what is
-publicly available and note the limitation.
-```
-
----
-
-### `skills/employability/SKILL.md`
-
-```markdown
----
-key: employability
-name: Employability Agent
-description: Researches graduate employment outcomes, industry partnerships, and alumni trajectories for the given course.
-tool_budget: 8
-section_name: employability
----
-
-## Dependency
-
-Read board.career before beginning any searches. The career paths and
-in-demand skills already found there define what counts as a relevant
-graduate outcome. Find evidence that this university's graduates actually
-reach those careers.
-
-## What to research
-
-- Graduate employment rate (% employed within 6 months, if available)
-- Industries and companies graduates enter — country-scoped
-- Direct evidence of graduates in career paths from board.career
-- Industry partnerships specific to the department
-- Graduate salary data specific to this university
-
-## Query construction
-
-Always include: [university name] + [course] + graduates/employment/alumni
-Always scope to the university's country.
-
-Examples:
-- "University of Manchester Computer Science graduates employment rate"
-- "University of Manchester CS alumni careers LinkedIn"
-- "site:linkedin.com University of Manchester Computer Science graduate"
-
-## Date filter
-
-Employment statistics older than 2 years are not acceptable.
-
-## Quality bar
-
-Generic statements like "graduates go on to successful careers" are not
-acceptable. Return evidence — named companies, percentage figures with sources.
-```
-
----
-
-### `skills/accommodation/SKILL.md`
-
-```markdown
----
-key: accommodation
-name: Accommodation Agent
-description: Researches on-campus and off-campus accommodation costs, area safety, and transport access.
-tool_budget: 6
-section_name: accommodation
----
-
-## What to research
-
-- On-campus accommodation: cost range per week, what is included
-- Off-campus private accommodation: typical rent range per month in the
-  university's city (not national averages)
-- Area safety: crime statistics or student safety reputation for the campus area
-- Public transport: routes and journey time from student areas to campus
-
-## Query construction
-
-Always include: [university name] + [accommodation/rent/safety]
-For off-campus, include the city name.
-
-Examples:
-- "University of Manchester student accommodation cost 2024"
-- "Manchester city centre student rent per month 2024"
-- "University of Manchester campus area safety crime rate"
-
-## What to return
-
-- On-campus cost range: weekly cost, what is included
-- Off-campus cost range: monthly rent, area of city, bills typically separate
-- Area safety: factual — cite statistics, not forum opinions
-- Transport: named routes, frequency, journey time
-- Sources: URL + date
-
-## Quality bar
-
-Return student-specific figures. Do not conflate city cost-of-living
-with student accommodation costs.
-```
-
----
-
-### `skills/news/SKILL.md`
-
-```markdown
----
-key: news
-name: News Agent
-description: Researches institutional and department-level news from the past 2 years, with sentiment classification per item.
-tool_budget: 6
-section_name: news
----
-
-## Search tool order
-
-1. Tavily — primary. Use `days=730` filter.
-2. DuckDuckGo (`ddg_tool`) — fallback if Tavily returns fewer than 3 news items.
-   Use only for news queries, not general search.
-
-## What to research
-  controversies, award wins, ranking changes, closures
-- Department-specific news: events, research breakthroughs, grant wins,
-  staff departures, course changes — higher weight than institutional news
-
-## Sentiment classification
-
-Classify each item as:
-- positive: award, grant, investment, ranking improvement, new facility
-- negative: strike, controversy, scandal, funding cut, course closure
-- neutral: leadership change, restructure, policy update
-
-Neutral is not a default — it requires an actual neutral item.
-
-## Date filter
-
-This is the strictest filter in the pipeline. Discard any item older
-than 2 years from today without exception. Items without a clear
-publication date are discarded.
-
-## What to return
-
-- List of news items: headline (paraphrased), sentiment, source URL, date
-- Department-specific items flagged separately
-- If no department-specific news found, state this explicitly
-```
-
----
-
-### `skills/forum/SKILL.md`
-
-```markdown
----
-key: forum
-name: Forum Agent
-description: Researches student forum discussions about the specific course at the specific university, filtering strictly for course-level signal.
-tool_budget: 10
-section_name: forum
----
-
-## This agent has the highest tool budget and the strictest scope rules.
-
-## Scope rules — enforced on every query and every result
-
-Every query must include both the university name AND the course name.
-Every result that does not mention the specific course or department is discarded.
-Generic university experience threads are not acceptable output.
-
-## Sources — search in this order
-
-1. **Reddit API** — search r/UniUK, r/AskUK, r/ApplyingToCollege, university-specific subreddits
-   directly via PRAW. Returns full post bodies and comment threads — higher signal than site: queries.
-2. `site:thestudentroom.co.uk` via Tavily — course-specific threads
-3. `site:thegradcafe.com` via Tavily — applicant and student discussion
-4. `site:quora.com` via Tavily — student experience questions
-
-## Query construction
-
-Always: [university name] + [course name] + [signal type]
-
-Examples:
-- "site:reddit.com University of Manchester Computer Science student experience"
-- "site:thestudentroom.co.uk University of Manchester Computer Science review"
-- "site:quora.com University of Manchester Computer Science worth it"
-
-## Signal weighting
-
-1. Current student (enrolled now) — highest weight
-2. Recent graduate (graduated within 2 years) — high weight
-3. Former student (2–4 years ago) — medium weight
-4. Prospective student asking questions — lowest weight, anecdote only
-
-## Qualification threshold
-
-A recurring positive or concern must appear across 3 or more independent
-sources to qualify as a finding. One post does not make a pattern.
-
-## Date filter
-
-Discard posts older than 2 years from today without exception.
-
-## What to return
-
-- Recurring positives: 3+ sources required, paraphrased, source + year each
-- Recurring concerns: 3+ sources required, paraphrased, source + year each
-- Department-specific feedback: teaching quality, lecturers, course content
-- If no course-specific threads found: return empty with explanation.
-  Do not substitute generic university threads.
-
-## What not to return
-
-- Verbatim quotes from forum posts — paraphrase only
-- Single-source opinions presented as patterns
-```
-
----
-
-### `skills/scoring/SKILL.md`
-
-```markdown
----
-key: scoring
-name: Scoring Agent
-description: Produces a weighted score across 7 dimensions and a tiered recommendation after all section agents complete.
-tool_budget: 0
----
-
-## Role
-
-You receive the full blackboard — all 7 research sections — and produce
-a score. You do not search. You do not call tools. You synthesise.
-
-## Scoring dimensions and weights
-
-| Dimension | Blackboard field | Weight |
-|---|---|---|
-| Employability and outcomes | board.employability + board.career | 25% |
-| Program fit | board.program | 20% |
-| Forum and student sentiment | board.forum | 20% |
-| Subject ranking | board.rankings | 15% |
-| Accommodation and living | board.accommodation | 10% |
-| News sentiment | board.news | 5% |
-| Overall prestige | board.background + board.rankings | 5% |
-
-## Scoring rules
-
-Score each dimension 0–10. Provide 1–2 sentences of rationale per dimension
-citing specific evidence from the blackboard. Not generic statements.
-
-Down-weight any dimension where the board field has confidence: low.
-A None field means the dimension cannot be scored — redistribute its
-weight proportionally to remaining dimensions. Flag every missing section.
-
-## Tiered recommendation
-
-| Score | Tier |
-|---|---|
-| 7.5–10 | Strong Consider |
-| 5.5–7.4 | Consider |
-| 3.5–5.4 | Proceed with Caution |
-| 0–3.4 | Avoid |
-
-Accompany the tier with the top 3 reasons supporting it and the top 3
-concerns to investigate further — drawn from evidence, not invented.
-
-## Weaknesses output
-
-Return a `weaknesses` list of 2–3 dimensions where score is lowest
-relative to expectation. AlternativesAgent reads this list verbatim
-to target its search. Be specific: "Subject ranking not found —
-confidence low" not "ranking data weak".
-```
-
----
-
-### `skills/alternatives/SKILL.md`
-
-```markdown
----
-key: alternatives
-name: Alternatives Agent
-description: Researches 2–3 alternative universities that address the specific weaknesses identified by the scoring agent.
-tool_budget: 8
----
-
-## Dependency
-
-Read board.score.weaknesses before beginning any searches. Alternatives
-must directly address the gaps identified there — not general reputation.
-
-## Selection criteria
-
-- Same course, undergraduate only
-- Same country as primary, or a country the parent would consider equivalent
-- Must demonstrably perform better on the weakness dimensions — cite evidence
-
-## For each alternative, research
-
-- Subject-specific ranking (most commonly in weaknesses)
-- Brief program note: does it address the curriculum gap?
-- One-line employability note: evidence of outcomes in careers from board.career
-- Why this alternative addresses the specific weakness — explicit and evidenced
-
-## What to return
-
-2–3 alternatives. For each:
-- University name and country
-- Why it addresses the primary's weakness (evidence required)
-- Subject ranking: position, body, year
-- Program note: one sentence on curriculum fit
-- Employability note: one sentence on graduate outcomes
-- Source URL for each claim
-
-## Quality bar
-
-An alternative with no evidence it addresses the weakness is not acceptable.
-If no suitable alternatives found, return an empty list with explanation.
-```
-
----
-
-### `skills/conversation/SKILL.md`
-
-```markdown
----
-key: conversation
-name: Conversation Agent
-description: Answers follow-up questions from the parent after the report is generated, using only the research data already on the blackboard.
-tool_budget: 0
----
-
-## Role
-
-The research pipeline has completed. The parent is asking follow-up
-questions. You answer from what was found — not from general knowledge,
-not from new searches.
-
-## What you can answer
-
-Any question answerable from the blackboard:
-- Elaboration on any section (forum concerns, accommodation details, salary ranges)
-- Comparisons between primary university and alternatives in board.alternatives
-- Explanation of scoring rationale from board.score
-- Questions about what was and was not found during research
-
-## What you must not do
-
-- Search for new information
-- Answer questions about topics not in the research (visa, postgraduate, other universities)
-- Present general knowledge as if it came from the research
-
-## When you cannot answer
-
-Say so clearly: "The research didn't cover this — check directly with the university."
-Do not guess. Do not substitute general knowledge.
-
-## Tone
-
-You are speaking to a parent making a real decision about their child's
-future. Be direct, factual, and honest about what the research found
-and what it didn't. Do not oversell the report.
-
-## Scope boundaries
-
-- Study level: undergraduate only — hardcoded, never change this
-- The report is a point-in-time snapshot — say so if asked about current availability
-- The report summarises research, it does not verify facts — tell the parent
-  to confirm critical decisions directly with the university
-```
-
----
-
-## 9. Handler Pattern — AgentParam
-
-Every agent's `handle` method receives a single `AgentParam`. This bundles
-the message and `deps` together so all handlers have a uniform, explicit signature.
-No closures. No binding at subscription time. `deps` travels with every dispatch.
+Tavily, Reddit (PRAW), and DuckDuckGo are plain Python client libraries — no MCP
+protocol. Only Fetch is an MCP server. Its connection object is created in
+`mcp/fetch_client.py` and stored on `Deps` as `deps.fetch`. `tools/fetch_tool.py`
+calls it via `ctx.deps.fetch` — the tool function has no knowledge of how the
+client was constructed.
+
+### 8.3 `mcp/fetch_client.py`
 
 ```python
-# Every agent handle method looks like this — no exceptions
-async def handle(self, param: AgentParam) -> None:
-    context = param.deps.context
-    board   = param.deps.board
-    hub     = param.deps.hub
-    message = param.message   # typed to the subscribed message type
+# mcp/fetch_client.py
+from pydantic_ai.mcp import MCPServerStdio
+
+
+def make_fetch_client() -> MCPServerStdio:
+    """Create the Fetch MCP server connection.
+
+    Uses the reference MCP fetch server (npx @modelcontextprotocol/server-fetch).
+    Called once at ResearchHandler startup. The returned client is stored on
+    Deps and passed to every agent that needs URL fetching via ctx.deps.fetch.
+
+    No API key required — the fetch server is open.
+    """
+    return MCPServerStdio(
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-fetch"],
+    )
+```
+
+One file. One responsibility: produce a configured MCP server connection object.
+
+### 8.4 Tool budget enforcement
+
+`tool_budget` from SKILL.md is passed to each agent constructor and stored as
+`self._tool_budget`. A per-request counter `self._calls_made` is reset to `0`
+at the start of each `handle()` call.
+
+Budget is enforced inside each search tool function via a closure over the agent
+instance — `fetch_page` is exempt as it is a targeted retrieval, not a search:
+
+```python
+# Inside agent __init__, wrap search tools with a budget-aware closure
+def _make_search_tool(self):
+    agent_self = self
+    async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
+        if agent_self._calls_made >= agent_self._tool_budget:
+            return json.dumps({"error": "tool budget exhausted", "query": query})
+        agent_self._calls_made += 1
+        results = await ctx.deps.tavily.search(query, days=730, max_results=5)
+        return json.dumps(results)
+    return tavily_search
+```
+
+Storing the counter on the agent instance (not on `Deps`) ensures concurrent
+section agents each manage their own count independently.
+
+When budget is exhausted the tool returns an error dict — the LLM reads it,
+sets `confidence: "low"`, and returns what it has. A partial result with a
+low confidence flag is better than a pipeline failure.
+
+### 8.5 Date filtering
+
+Tavily enforces the 2-year window mechanically via `days=730` — stale results
+never reach the LLM.
+
+Fetch MCP fetches a specific URL — no date filtering needed, the URL is always
+explicit and targeted.
+
+Reddit (PRAW) and DuckDuckGo have no equivalent API parameter. Their wrappers
+filter by `created_utc` / publication date before returning results to the LLM:
+
+```python
+# reddit_tool.py — filter before returning
+cutoff = datetime.now().timestamp() - (730 * 24 * 60 * 60)
+posts = [p for p in raw_results if p.created_utc >= cutoff]
+
+# ddg_tool.py — filter before returning
+cutoff = datetime.now() - timedelta(days=730)
+items = [r for r in raw_results if r.get("date") and parse(r["date"]) >= cutoff]
+```
+
+The SKILL.md instruction ("discard anything older than 2 years") remains as a
+secondary LLM-level check for items with ambiguous or missing dates.
+
+### 8.6 Tool-to-agent mapping
+
+| Tool | career | background | rankings | program | employability | accommodation | news | forum | alternatives | scoring | conversation |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `tavily_search` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | |
+| `fetch_page` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | |
+| `reddit_search` | | | | | | | | ✓ | | | |
+| `ddg_search` | | | | | | | ✓ | | | | |
+
+`scoring` and `conversation` have no tools — they work entirely from the
+blackboard. `tool_budget: 0` in their SKILL.md makes this explicit.
+
+### 8.7 Tool implementations
+
+**`tools/search_tool.py`**
+
+```python
+import json
+from pydantic_ai import RunContext
+from core.deps import Deps
+
+
+async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
+    """Search the web via Tavily. Enforces days=730 on every call.
+    Budget enforcement is handled by the agent's _make_search_tool() closure.
+    This bare function is used only when wrapped by the agent."""
+    results = await ctx.deps.tavily.search(query, days=730, max_results=5)
+    return json.dumps(results)
+```
+
+**`tools/fetch_tool.py`**
+
+```python
+import json
+from pydantic_ai import RunContext
+from core.deps import Deps
+
+
+async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
+    """Fetch a specific URL via the Fetch MCP server.
+    Use for university catalog pages, rankings pages, or any URL found in
+    search results. Does not count against tool_budget — targeted retrieval,
+    not a search."""
+    result = await ctx.deps.fetch.call_tool("fetch", {"url": url})
+    return json.dumps({"url": url, "content": result})
+```
+
+**`tools/reddit_tool.py`**
+
+```python
+import json
+from datetime import datetime
+from pydantic_ai import RunContext
+from core.deps import Deps
+
+
+async def reddit_search(ctx: RunContext[Deps], query: str, subreddit: str = "all") -> str:
+    """Search Reddit via PRAW. Filters to last 730 days before returning.
+    ForumAgent only. Budget enforcement handled by agent closure."""
+    cutoff = datetime.now().timestamp() - (730 * 24 * 60 * 60)
+    raw = await ctx.deps.reddit.search(query, subreddit=subreddit, limit=25)
+    posts = [
+        {
+            "title": p.title,
+            "body": p.selftext[:1000],
+            "score": p.score,
+            "url": p.url,
+            "created_utc": p.created_utc,
+            "subreddit": str(p.subreddit),
+        }
+        for p in raw if p.created_utc >= cutoff
+    ]
+    return json.dumps(posts)
+```
+
+**`tools/ddg_tool.py`**
+
+```python
+import json
+from datetime import datetime, timedelta
+from dateutil.parser import parse as parse_date
+from pydantic_ai import RunContext
+from core.deps import Deps
+
+
+async def ddg_search(ctx: RunContext[Deps], query: str) -> str:
+    """Search via DuckDuckGo. NewsAgent fallback when Tavily misses news items.
+    Filters to last 730 days before returning.
+    Budget enforcement handled by agent closure."""
+    cutoff = datetime.now() - timedelta(days=730)
+    raw = ctx.deps.ddg.text(query, max_results=10)
+    items = []
+    for r in raw:
+        date_str = r.get("date", "")
+        try:
+            if date_str and parse_date(date_str) >= cutoff:
+                items.append(r)
+        except Exception:
+            pass   # discard items with unparseable dates
+    return json.dumps(items)
+```
+
+### 8.8 How tools attach to agents
+
+Tools are registered on the pydantic-ai `Agent` at construction time. Each agent
+wraps its search tools in a budget-aware closure via `_make_search_tool()`.
+`fetch_page` is registered directly — no budget wrapping needed.
+
+```python
+# CareerAgent — Tavily + Fetch only
+class CareerAgent(BaseAgent):
+    def __init__(self, instructions: str, tool_budget: int) -> None:
+        super().__init__(instructions=instructions)
+        self._tool_budget = tool_budget
+        self._calls_made  = 0
+        self._agent = Agent(
+            model=get_model("RESEARCH_MODEL"),
+            deps_type=Deps,
+            output_type=CareerOutput,
+            tools=[self._make_search_tool(), fetch_page],
+        )
+
+# ForumAgent — Tavily + Fetch + Reddit
+class ForumAgent(BaseAgent):
+    def __init__(self, instructions: str, tool_budget: int) -> None:
+        super().__init__(instructions=instructions)
+        self._tool_budget = tool_budget
+        self._calls_made  = 0
+        self._agent = Agent(
+            model=get_model("RESEARCH_MODEL"),
+            deps_type=Deps,
+            output_type=ForumOutput,
+            tools=[self._make_search_tool(), fetch_page, self._make_reddit_tool()],
+        )
+
+# NewsAgent — Tavily + Fetch + DuckDuckGo
+class NewsAgent(BaseAgent):
+    def __init__(self, instructions: str, tool_budget: int) -> None:
+        super().__init__(instructions=instructions)
+        self._tool_budget = tool_budget
+        self._calls_made  = 0
+        self._agent = Agent(
+            model=get_model("RESEARCH_MODEL"),
+            deps_type=Deps,
+            output_type=NewsOutput,
+            tools=[self._make_search_tool(), fetch_page, self._make_ddg_tool()],
+        )
+```
+
+### 8.9 `Deps` — tool client fields
+
+```python
+@dataclass
+class Deps:
+    hub:     MessageHub
+    board:   Blackboard
+    context: ResearchContext
+    tavily:  Any           # TavilyClient — all research agents
+    fetch:   Any           # MCPServerStdio from mcp/fetch_client.py — all research agents
+    reddit:  Any | None    # praw.Reddit — ForumAgent only, None if unconfigured
+    ddg:     Any           # DDGS — NewsAgent only
+```
+
+`tool_budget` and `calls_made` are **not** on `Deps` — they live on each agent
+instance so concurrent agents manage their own counters independently.
+
+---
+
+## 9. Handler Pattern — Closures
+
+Every agent's `subscribe()` method registers a closure on the hub. The closure
+captures `deps` at subscription time. The hub calls `handler(message)` — it never
+receives or knows about `deps`.
+
+```python
+# Every agent subscribe() method looks like this
+def subscribe(self, hub: MessageHub, deps: Deps) -> None:
+    async def handler(message):
+        await self.handle(message, deps)   # deps captured here
+    hub.subscribe(SomeMessage, handler)
+```
+
+Every agent's `handle()` method signature is:
+
+```python
+async def handle(self, message: SomeMessage, deps: Deps) -> None:
+    # reset budget counter for this request
+    deps.calls_made = 0
     ...
 ```
 
-`ResearchHandler.handle_request()` creates fresh per-request objects,
-subscribes agent methods directly, then fires the single trigger:
+`ResearchHandler.handle_request()` creates fresh per-request objects, calls
+`reset()` on every agent, subscribes all agents via their `subscribe()` methods,
+then fires the single trigger:
 
 ```python
 async def handle_request(self, university_name: str, intended_course: str) -> Blackboard:
@@ -1531,46 +1315,94 @@ async def handle_request(self, university_name: str, intended_course: str) -> Bl
     country = await self._derive_country(university_name)
 
     # 2. Create fresh per-request objects
-    hub = MessageHub()
+    hub   = MessageHub()
     board = Blackboard()
     context = ResearchContext(
         university_name=university_name,
         intended_course=intended_course,
         country=country,
     )
-    deps = Deps(hub=hub, board=board, context=context)
+    deps = Deps(
+        hub=hub,
+        board=board,
+        context=context,
+        tavily=self._tavily,
+        fetch=self._fetch,
+        reddit=self._reddit,
+        ddg=self._ddg,
+    )
 
-    # 3. Subscribe agent methods directly — deps travels through publish
-    hub.subscribe(ResearchRequestedMessage,        self._career_agent.handle)
+    # 3. Reset stateful agents, then subscribe all — deps captured in closures
+    for agent in self._all_agents:
+        agent.reset()
 
-    hub.subscribe(CareerResearchCompletedMessage,  self._background_agent.handle)
-    hub.subscribe(CareerResearchCompletedMessage,  self._rankings_agent.handle)
-    hub.subscribe(CareerResearchCompletedMessage,  self._program_agent.handle)
-    hub.subscribe(CareerResearchCompletedMessage,  self._employability_agent.handle)
-    hub.subscribe(CareerResearchCompletedMessage,  self._accommodation_agent.handle)
-    hub.subscribe(CareerResearchCompletedMessage,  self._news_agent.handle)
-    hub.subscribe(CareerResearchCompletedMessage,  self._forum_agent.handle)
+    self._career_agent.subscribe(hub, deps)
 
-    hub.subscribe(SectionCompletedMessage,         self._scoring_agent.handle)
-    hub.subscribe(SectionFailedMessage,            self._scoring_agent.handle)
-    hub.subscribe(ScoringCompletedMessage,         self._alternatives_agent.handle)
-    hub.subscribe(AlternativesCompletedMessage,    self._report_generator.handle)
+    self._background_agent.subscribe(hub, deps)
+    self._rankings_agent.subscribe(hub, deps)
+    self._program_agent.subscribe(hub, deps)
+    self._employability_agent.subscribe(hub, deps)
+    self._accommodation_agent.subscribe(hub, deps)
+    self._news_agent.subscribe(hub, deps)
+    self._forum_agent.subscribe(hub, deps)
 
-    # 4. Fire the single trigger — deps flows through every subsequent publish
+    self._scoring_agent.subscribe(hub, deps)
+    self._alternatives_agent.subscribe(hub, deps)
+    self._report_generator.subscribe(hub, deps)
+
+    # 4. Fire the single trigger
     await hub.publish(ResearchRequestedMessage(
         university_name=university_name,
         intended_course=intended_course,
         country=country,
         triggered_by="research_handler",
         timestamp=datetime.now().isoformat(),
-    ), deps)
+    ))
 
     return board
 ```
 
-Because `deps` is passed through every `publish` call, `MessageHub` and `Deps`
-must still be created fresh per request. If the hub were shared, subscriptions
-from previous requests would accumulate and fire again.
+**Why closures instead of passing `deps` through `publish()`:** the hub's
+`publish(message)` signature stays clean — it has no knowledge of `deps`.
+Each agent captures `deps` once at subscription time. This matches the pattern
+from the v7 customer service system and is the idiomatic pydantic-ai approach.
+
+**Why `reset()` before subscribe:** agents are built once and reused across
+Chainlit sessions. Any per-request state (e.g. `_fired` flags on agents that
+must not run twice) must be cleared before a new request's subscribe loop.
+
+**How `tool_budget` reaches each agent's tool:** each agent sets
+`deps.tool_budget = self._tool_budget` at the start of its `handle()` call
+and resets `deps.calls_made = 0`. Since `asyncio.gather()` interleaves at
+`await` points, two concurrent agents could theoretically read each other's
+counter. To prevent this, `tool_budget` and `calls_made` must be per-agent,
+not on shared `deps`. The clean implementation: store these on the agent
+instance, not on `Deps`:
+
+```python
+async def handle(self, message, deps: Deps) -> None:
+    self._calls_made = 0   # reset on agent instance, not on deps
+    ...
+```
+
+And inside each tool function, `ctx.deps` is replaced with a reference back
+to the agent instance via a closure over `self`:
+
+```python
+# Inside agent __init__, wrap the tool with a budget-aware closure
+def _make_search_tool(self):
+    agent_self = self
+    async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
+        if agent_self._calls_made >= agent_self._tool_budget:
+            return json.dumps({"error": "tool budget exhausted"})
+        agent_self._calls_made += 1
+        results = await ctx.deps.tavily.search(query, days=730, max_results=5)
+        return json.dumps(results)
+    return tavily_search
+```
+
+This keeps `Deps` clean — no `tool_budget` or `calls_made` fields — and
+each concurrent agent manages its own counter independently.
 
 ---
 
@@ -1657,11 +1489,14 @@ university_research/
 │   └── scoring/SKILL.md
 │
 ├── core/
-│   ├── message_hub.py              pure fan-out — subscribe() + publish()
+│   ├── message_hub.py              pure fan-out — subscribe() + publish(message)
 │   ├── blackboard.py               typed per-request result accumulator
 │   ├── deps.py                     Deps + ResearchContext dataclasses
 │   ├── llm_factory.py              model initialisation from env vars
 │   └── skill_loader.py             SkillMeta + load_skill() + scan_skills_dir()
+│
+├── mcp/
+│   └── fetch_client.py             MCPServerStdio connection for Fetch MCP server
 │
 ├── schemas/
 │   ├── messages/                   lean hub notifications
@@ -1688,7 +1523,7 @@ university_research/
 │       └── alternatives_output.py
 │
 ├── agents/
-│   ├── base_agent.py               instructions field + _build_system_prompt()
+│   ├── base_agent.py               ABC: subscribe(), get_instruction(), reset()
 │   ├── career_agent.py
 │   ├── background_agent.py
 │   ├── rankings_agent.py
@@ -1699,13 +1534,13 @@ university_research/
 │   ├── forum_agent.py
 │   ├── scoring_agent.py            quorum gate + asyncio.Lock
 │   ├── alternatives_agent.py
-│   └── conversation_agent.py       reads serialised blackboard, no tools
+│   └── conversation_agent.py       reads blackboard, no tools
 │
 ├── tools/
-│   ├── search_tool.py              Tavily wrapper — days=730 enforced
-│   ├── fetch_tool.py               Fetch MCP wrapper
-│   ├── reddit_tool.py              PRAW wrapper — ForumAgent subreddit search
-│   └── ddg_tool.py                 DuckDuckGo wrapper — NewsAgent fallback
+│   ├── search_tool.py              tavily_search — Tavily Python client
+│   ├── fetch_tool.py               fetch_page — calls ctx.deps.fetch (Fetch MCP)
+│   ├── reddit_tool.py              reddit_search — PRAW Python client (ForumAgent)
+│   └── ddg_tool.py                 ddg_search — DuckDuckGo Python client (NewsAgent)
 │
 ├── report/
 │   ├── generator.py                deterministic Jinja2 renderer, no LLM
@@ -1768,6 +1603,22 @@ SKILL.md edit.
 failed sections. If `section_name` in a SKILL.md frontmatter says `"forums"`
 but the blackboard field is `forum`, the setattr silently does nothing.
 
+**`tool_budget: 0` in SKILL.md must not be treated as missing**
+The `load_skill()` check uses `f not in meta or meta[f] is None` — not
+`not meta.get(f)`. The old form treats `0` as falsy and drops scoring,
+alternatives, and conversation skills entirely.
+
+**Tool budget counter must live on the agent instance, not on `Deps`**
+`asyncio.gather()` runs section agents concurrently. If `calls_made` is on
+shared `Deps`, two agents increment the same counter. Each agent must own
+`self._calls_made` and reset it to `0` at the start of its `handle()` call.
+
+**`reddit_tool` and `ddg_tool` must filter by date before returning**
+Tavily enforces `days=730` mechanically. Reddit and DuckDuckGo do not.
+Both wrappers must filter results by `created_utc` / publication date before
+returning to the LLM — not rely solely on the SKILL.md instruction to discard
+old results.
+
 ---
 
 ## 14. Development Stage Summary
@@ -1778,15 +1629,15 @@ verifiable. No stage is purely structural.
 | Stage | What you build | Ends with |
 |---|---|---|
 | 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
-| 1a | MessageHub, Blackboard, Deps, all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
-| 1b | Tavily + Fetch MCP + Reddit API (PRAW) + DuckDuckGo tool wrappers | Real searches against university targets confirmed |
-| 1c | `CareerAgent` end-to-end | `board.career` populated from real data via CLI |
-| 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` | `board.background`, `board.rankings`, `board.program` populated via CLI — Tavily + Fetch only, no upstream dependencies |
-| 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` | `board.employability`, `board.accommodation`, `board.news` populated via CLI — `EmployabilityAgent` reads `board.career`, `NewsAgent` exercises DuckDuckGo fallback |
-| 1f | `ForumAgent` | `board.forum` populated via CLI — Reddit API + Tavily `site:` queries, strictest scope rules, highest tool budget |
-| 2a | `ScoringAgent` + quorum gate | `board.score` populated after all 7 section agents complete — asyncio.Lock verified, partial results handled |
-| 2b | `AlternativesAgent` + `ReportGenerator` | 2 output files generated from CLI for real university — `score.json` and `report.md` |
-| 2c | Chainlit UI Mode 1 + Mode 2 + `ConversationAgent` | Full pipeline firing from UI with live progress, follow-up questions answered from blackboard |
+| 1a | MessageHub (closure pattern), Blackboard, Deps (with tool client fields), all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
+| 1b | `mcp/fetch_client.py` (MCPServerStdio). `tools/` — `search_tool.py` (Tavily, `days=730`), `fetch_tool.py` (calls Fetch MCP via `ctx.deps.fetch`), `reddit_tool.py` (PRAW + date filter), `ddg_tool.py` (DuckDuckGo + date filter). Tool clients initialised in `ResearchHandler`. | Real searches confirmed against university targets. Date filter verified for all four tools. Fetch MCP server starts cleanly. |
+| 1c | `CareerAgent` end-to-end — pydantic-ai Agent with `tavily_search` + `fetch_page` tools, budget-aware closure, `subscribe()` + `get_instruction()`, `handle()` resets `_calls_made` | `board.career` populated from real data via CLI |
+| 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same tool set as CareerAgent (Tavily + Fetch), same pattern | `board.background`, `board.rankings`, `board.program` populated via CLI |
+| 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` — NewsAgent additionally registered with `ddg_search` tool | `board.employability`, `board.accommodation`, `board.news` populated via CLI — DuckDuckGo fallback exercised |
+| 1f | `ForumAgent` — additionally registered with `reddit_search` tool, highest budget | `board.forum` populated via CLI — Reddit API + Tavily `site:` queries confirmed |
+| 2a | `ScoringAgent` + quorum gate — no tools, reads blackboard only, asyncio.Lock | `board.score` populated after all 7 section agents complete — lock verified, partial results handled |
+| 2b | `AlternativesAgent` (Tavily + Fetch) + `ReportGenerator` (Jinja2, no LLM) | `score.json` and `report.md` generated from CLI for real university |
+| 2c | Chainlit UI Mode 1 + Mode 2 + `ConversationAgent` (no tools, reads blackboard) | Full pipeline from UI with live progress, follow-up questions answered |
 | 3a | Report quality pass — template, confidence flags, comparison script | Side-by-side `score.json` comparison working |
 | 3b | Edge case hardening | All failure scenarios handled without crash |
 
