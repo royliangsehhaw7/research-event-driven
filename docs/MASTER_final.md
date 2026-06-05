@@ -141,9 +141,9 @@ never silently omits a section.
 
 **Fetch MCP is the only MCP server in the stack.** Tavily, Reddit (PRAW), and
 DuckDuckGo are plain Python client libraries — no MCP protocol involved.
-The MCP server connection for Fetch lives in `mcp/fetch_client.py`. The
-pydantic-ai tool function that wraps it lives in `tools/fetch_tool.py`.
-These are kept separate — one file, one responsibility.
+The MCP server connection for Fetch lives in `mcp/fetch_client.py` as a
+managed singleton. The pydantic-ai tool function that wraps it lives in
+`tools/fetch_tool.py`. These are kept separate — one file, one responsibility.
 
 **Why these tools:**
 Tavily handles all general search including `site:thestudentroom.co.uk`, `site:quora.com`,
@@ -563,7 +563,7 @@ class Blackboard:
 
 ```python
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from core.message_hub import MessageHub
 from core.blackboard import Blackboard
 
@@ -581,16 +581,14 @@ class Deps:
     hub:      MessageHub
     board:    Blackboard
     context:  ResearchContext
-    tavily:   Any              # TavilyClient — used by all research agents
-    fetch:    Any              # Fetch MCP client — used by all research agents
-    reddit:   Any | None       # praw.Reddit — ForumAgent only, None if not configured
-    ddg:      Any              # DDGS — NewsAgent only
 ```
 
-`Deps` is created fresh per request in `ResearchHandler.handle_request()`.
-Tool clients (`tavily`, `fetch`, `reddit`, `ddg`) are created once at
-`ResearchHandler` startup and reused across requests — they carry no
-per-request state. `hub` and `board` are fresh each request.
+`Deps` contains only per-request state — hub, board, and context. It is created
+fresh in `ResearchHandler.handle_request()` and discarded when the report is generated.
+
+Tool clients (Tavily, Fetch MCP, Reddit, DuckDuckGo) are **not** on `Deps`. Each
+tool function owns its own client as a module-level singleton — created once at
+import/startup time, reused across all requests. See Section 8 for details.
 
 `tool_budget` and `calls_made` live on each agent instance (`self._tool_budget`,
 `self._calls_made`), not on `Deps`. This ensures concurrent section agents each
@@ -1017,49 +1015,114 @@ owns the connection, configuration, and lifecycle for exactly one MCP server.
 Nothing else lives here.
 
 **`tools/`** — pydantic-ai tool functions. One file per tool. Each file defines
-one async tool function that the LLM can call. Tool functions access external
-clients via `ctx.deps`. Nothing else lives here.
+one async tool function that the LLM can call. Each tool owns its own client as
+a module-level singleton. Nothing else lives here.
 
 ```
 mcp/
-└── fetch_client.py         MCP server connection for the Fetch MCP server
+└── fetch_client.py         Fetch MCP server — singleton lifecycle management
 
 tools/
-├── search_tool.py          tavily_search — Tavily Python client
-├── fetch_tool.py           fetch_page — calls ctx.deps.fetch (from mcp/fetch_client.py)
-├── reddit_tool.py          reddit_search — PRAW Python client
-└── ddg_tool.py             ddg_search — DuckDuckGo Python client
+├── search_tool.py          tavily_search — module-level TavilyClient singleton
+├── fetch_tool.py           fetch_page — calls fetch singleton from mcp/fetch_client.py
+├── reddit_tool.py          reddit_search — module-level praw.Reddit singleton
+└── ddg_tool.py             ddg_search — module-level DDGS singleton
 ```
 
 Tavily, Reddit (PRAW), and DuckDuckGo are plain Python client libraries — no MCP
-protocol. Only Fetch is an MCP server. Its connection object is created in
-`mcp/fetch_client.py` and stored on `Deps` as `deps.fetch`. `tools/fetch_tool.py`
-calls it via `ctx.deps.fetch` — the tool function has no knowledge of how the
-client was constructed.
+protocol. Only Fetch is an MCP server. Its singleton is managed in
+`mcp/fetch_client.py`. `tools/fetch_tool.py` calls it via `get_fetch_server()` —
+the tool function has no knowledge of how the client was constructed.
 
 ### 8.3 `mcp/fetch_client.py`
 
 ```python
 # mcp/fetch_client.py
+from __future__ import annotations
+import logging
 from pydantic_ai.mcp import MCPServerStdio
 
+logger = logging.getLogger("fetch_client")
 
-def make_fetch_client() -> MCPServerStdio:
-    """Create the Fetch MCP server connection.
 
-    Uses the reference MCP fetch server (npx @modelcontextprotocol/server-fetch).
-    Called once at ResearchHandler startup. The returned client is stored on
-    Deps and passed to every agent that needs URL fetching via ctx.deps.fetch.
+class FetchClient:
+    """Singleton wrapper around the Fetch MCP server subprocess.
 
-    No API key required — the fetch server is open.
+    One instance for the lifetime of the application. All state lives on
+    the instance — no globals, no module-level mutation.
+
+    Lifecycle:
+        await fetch_client.startup()   # called once at app boot
+        await fetch_client.shutdown()  # called once at app exit
+
+    Usage in tools:
+        result = await fetch_client.call_tool("fetch", {"url": url})
+
+    The module-level `fetch_client` instance is the singleton. Import and
+    use it directly — never construct FetchClient() yourself.
     """
-    return MCPServerStdio(
-        command="npx",
-        args=["-y", "@modelcontextprotocol/server-fetch"],
-    )
+
+    _instance: FetchClient | None = None
+
+    def __new__(cls) -> FetchClient:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._server = None
+            cls._instance._started = False
+        return cls._instance
+
+    async def startup(self) -> None:
+        """Start the Fetch MCP server subprocess.
+
+        No-op if already started — safe to call multiple times.
+        Raises RuntimeError if the server fails to start.
+        """
+        if self._started:
+            return
+        self._server = MCPServerStdio(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-fetch"],
+        )
+        await self._server.__aenter__()
+        self._started = True
+        logger.info("fetch_client | Fetch MCP server started")
+
+    async def shutdown(self) -> None:
+        """Shut down the Fetch MCP server subprocess cleanly.
+
+        No-op if never started.
+        """
+        if not self._started or self._server is None:
+            return
+        await self._server.__aexit__(None, None, None)
+        self._server = None
+        self._started = False
+        logger.info("fetch_client | Fetch MCP server stopped")
+
+    async def call_tool(self, tool: str, args: dict) -> str:
+        """Call a tool on the Fetch MCP server.
+
+        Raises RuntimeError if startup() has not been called.
+        """
+        if not self._started or self._server is None:
+            raise RuntimeError(
+                "FetchClient is not running — call startup() at application boot"
+            )
+        return await self._server.call_tool(tool, args)
+
+    @property
+    def ready(self) -> bool:
+        """True if the server is running and ready to accept calls."""
+        return self._started and self._server is not None
+
+
+# Module-level singleton — import and use this, never instantiate FetchClient directly
+fetch_client = FetchClient()
 ```
 
-One file. One responsibility: produce a configured MCP server connection object.
+One file. All state on the instance. `tools/fetch_tool.py` imports `fetch_client`
+and calls `call_tool()` — it has no knowledge of the lifecycle. The app entry
+point calls `startup()` and `shutdown()`.
 
 ### 8.4 Tool budget enforcement
 
@@ -1078,7 +1141,8 @@ def _make_search_tool(self):
         if agent_self._calls_made >= agent_self._tool_budget:
             return json.dumps({"error": "tool budget exhausted", "query": query})
         agent_self._calls_made += 1
-        results = await ctx.deps.tavily.search(query, days=730, max_results=5)
+        from tools.search_tool import _client as tavily_client
+        results = await tavily_client.search(query, days=730, max_results=5)
         return json.dumps(results)
     return tavily_search
 ```
@@ -1132,15 +1196,19 @@ blackboard. `tool_budget: 0` in their SKILL.md makes this explicit.
 
 ```python
 import json
+import os
+from tavily import TavilyClient
 from pydantic_ai import RunContext
 from core.deps import Deps
+
+_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
 
 async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
     """Search the web via Tavily. Enforces days=730 on every call.
     Budget enforcement is handled by the agent's _make_search_tool() closure.
     This bare function is used only when wrapped by the agent."""
-    results = await ctx.deps.tavily.search(query, days=730, max_results=5)
+    results = await _client.search(query, days=730, max_results=5)
     return json.dumps(results)
 ```
 
@@ -1150,6 +1218,7 @@ async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
 import json
 from pydantic_ai import RunContext
 from core.deps import Deps
+from mcp.fetch_client import fetch_client
 
 
 async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
@@ -1157,7 +1226,7 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
     Use for university catalog pages, rankings pages, or any URL found in
     search results. Does not count against tool_budget — targeted retrieval,
     not a search."""
-    result = await ctx.deps.fetch.call_tool("fetch", {"url": url})
+    result = await fetch_client.call_tool("fetch", {"url": url})
     return json.dumps({"url": url, "content": result})
 ```
 
@@ -1165,16 +1234,24 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
 
 ```python
 import json
+import os
 from datetime import datetime
+import praw
 from pydantic_ai import RunContext
 from core.deps import Deps
+
+_client = praw.Reddit(
+    client_id=os.environ["REDDIT_CLIENT_ID"],
+    client_secret=os.environ["REDDIT_CLIENT_SECRET"],
+    user_agent="university-research-bot/1.0",
+)
 
 
 async def reddit_search(ctx: RunContext[Deps], query: str, subreddit: str = "all") -> str:
     """Search Reddit via PRAW. Filters to last 730 days before returning.
     ForumAgent only. Budget enforcement handled by agent closure."""
     cutoff = datetime.now().timestamp() - (730 * 24 * 60 * 60)
-    raw = await ctx.deps.reddit.search(query, subreddit=subreddit, limit=25)
+    raw = _client.subreddit(subreddit).search(query, limit=25)
     posts = [
         {
             "title": p.title,
@@ -1195,8 +1272,11 @@ async def reddit_search(ctx: RunContext[Deps], query: str, subreddit: str = "all
 import json
 from datetime import datetime, timedelta
 from dateutil.parser import parse as parse_date
+from duckduckgo_search import DDGS
 from pydantic_ai import RunContext
 from core.deps import Deps
+
+_client = DDGS()
 
 
 async def ddg_search(ctx: RunContext[Deps], query: str) -> str:
@@ -1204,7 +1284,7 @@ async def ddg_search(ctx: RunContext[Deps], query: str) -> str:
     Filters to last 730 days before returning.
     Budget enforcement handled by agent closure."""
     cutoff = datetime.now() - timedelta(days=730)
-    raw = ctx.deps.ddg.text(query, max_results=10)
+    raw = _client.text(query, max_results=10)
     items = []
     for r in raw:
         date_str = r.get("date", "")
@@ -1263,22 +1343,57 @@ class NewsAgent(BaseAgent):
         )
 ```
 
-### 8.9 `Deps` — tool client fields
+### 8.9 Fetch MCP server lifecycle — app entry points
+
+`fetch_client` is a singleton. Its lifecycle is managed at the application
+boundary — not inside `ResearchHandler`. `ResearchHandler` has no startup or
+shutdown responsibilities.
+
+**Chainlit (`ui/app.py`):**
 
 ```python
-@dataclass
-class Deps:
-    hub:     MessageHub
-    board:   Blackboard
-    context: ResearchContext
-    tavily:  Any           # TavilyClient — all research agents
-    fetch:   Any           # MCPServerStdio from mcp/fetch_client.py — all research agents
-    reddit:  Any | None    # praw.Reddit — ForumAgent only, None if unconfigured
-    ddg:     Any           # DDGS — NewsAgent only
+from mcp.fetch_client import fetch_client
+
+@cl.on_chat_start
+async def start():
+    await fetch_client.startup()
+
+@cl.on_chat_end
+async def end():
+    await fetch_client.shutdown()
 ```
 
-`tool_budget` and `calls_made` are **not** on `Deps` — they live on each agent
-instance so concurrent agents manage their own counters independently.
+**FastAPI (when you expose an endpoint):**
+
+```python
+from contextlib import asynccontextmanager
+from mcp.fetch_client import fetch_client
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await fetch_client.startup()
+    yield
+    await fetch_client.shutdown()
+
+app = FastAPI(lifespan=lifespan)
+```
+
+**CLI (`main.py`):**
+
+```python
+from mcp.fetch_client import fetch_client
+
+async def main():
+    await fetch_client.startup()
+    try:
+        result = await handler.handle_request(university_name, course)
+    finally:
+        await fetch_client.shutdown()
+```
+
+`fetch_client.startup()` is idempotent — calling it more than once is safe.
+If `fetch_client.ready` is `False` when the first request arrives,
+`fetch_tool.py` raises `RuntimeError` immediately rather than hanging.
 
 ---
 
@@ -1326,10 +1441,6 @@ async def handle_request(self, university_name: str, intended_course: str) -> Bl
         hub=hub,
         board=board,
         context=context,
-        tavily=self._tavily,
-        fetch=self._fetch,
-        reddit=self._reddit,
-        ddg=self._ddg,
     )
 
     # 3. Reset stateful agents, then subscribe all — deps captured in closures
@@ -1371,13 +1482,12 @@ from the v7 customer service system and is the idiomatic pydantic-ai approach.
 Chainlit sessions. Any per-request state (e.g. `_fired` flags on agents that
 must not run twice) must be cleared before a new request's subscribe loop.
 
-**How `tool_budget` reaches each agent's tool:** each agent sets
-`deps.tool_budget = self._tool_budget` at the start of its `handle()` call
-and resets `deps.calls_made = 0`. Since `asyncio.gather()` interleaves at
-`await` points, two concurrent agents could theoretically read each other's
-counter. To prevent this, `tool_budget` and `calls_made` must be per-agent,
-not on shared `deps`. The clean implementation: store these on the agent
-instance, not on `Deps`:
+**How `tool_budget` reaches each agent's tool:** each agent resets
+`self._calls_made = 0` at the start of its `handle()` call. The budget-aware
+closure over `self` checks and increments this counter before calling the
+module-level client directly. Since `asyncio.gather()` interleaves at `await`
+points, two concurrent agents could theoretically read each other's counter if
+it lived on shared `Deps`. Keeping it on the agent instance prevents this:
 
 ```python
 async def handle(self, message, deps: Deps) -> None:
@@ -1385,8 +1495,8 @@ async def handle(self, message, deps: Deps) -> None:
     ...
 ```
 
-And inside each tool function, `ctx.deps` is replaced with a reference back
-to the agent instance via a closure over `self`:
+And inside each tool function, the closure reaches the module-level client
+directly — no `ctx.deps` needed for the client:
 
 ```python
 # Inside agent __init__, wrap the tool with a budget-aware closure
@@ -1396,13 +1506,14 @@ def _make_search_tool(self):
         if agent_self._calls_made >= agent_self._tool_budget:
             return json.dumps({"error": "tool budget exhausted"})
         agent_self._calls_made += 1
-        results = await ctx.deps.tavily.search(query, days=730, max_results=5)
+        from tools.search_tool import _client as tavily_client
+        results = await tavily_client.search(query, days=730, max_results=5)
         return json.dumps(results)
     return tavily_search
 ```
 
-This keeps `Deps` clean — no `tool_budget` or `calls_made` fields — and
-each concurrent agent manages its own counter independently.
+This keeps `Deps` clean — only `hub`, `board`, `context` — and each concurrent
+agent manages its own counter independently.
 
 ---
 
@@ -1458,6 +1569,7 @@ skill_loader | loaded skills/program/SKILL.md
 skill_loader | loaded skills/rankings/SKILL.md
 skill_loader | loaded skills/scoring/SKILL.md
 research_handler | agents constructed with skill instructions
+fetch_client    | Fetch MCP server started
 ```
 
 Files load alphabetically (`sorted(skills_dir.iterdir())`). If any file
@@ -1496,7 +1608,7 @@ university_research/
 │   └── skill_loader.py             SkillMeta + load_skill() + scan_skills_dir()
 │
 ├── mcp/
-│   └── fetch_client.py             MCPServerStdio connection for Fetch MCP server
+│   └── fetch_client.py             Fetch MCP singleton — get_fetch_server() / close_fetch_server()
 │
 ├── schemas/
 │   ├── messages/                   lean hub notifications
@@ -1537,10 +1649,10 @@ university_research/
 │   └── conversation_agent.py       reads blackboard, no tools
 │
 ├── tools/
-│   ├── search_tool.py              tavily_search — Tavily Python client
-│   ├── fetch_tool.py               fetch_page — calls ctx.deps.fetch (Fetch MCP)
-│   ├── reddit_tool.py              reddit_search — PRAW Python client (ForumAgent)
-│   └── ddg_tool.py                 ddg_search — DuckDuckGo Python client (NewsAgent)
+│   ├── search_tool.py              tavily_search — module-level TavilyClient singleton
+│   ├── fetch_tool.py               fetch_page — calls get_fetch_server() from mcp/fetch_client.py
+│   ├── reddit_tool.py              reddit_search — module-level praw.Reddit singleton (ForumAgent)
+│   └── ddg_tool.py                 ddg_search — module-level DDGS singleton (NewsAgent)
 │
 ├── report/
 │   ├── generator.py                deterministic Jinja2 renderer, no LLM
@@ -1576,7 +1688,19 @@ them before building.
 **Hub and Deps must be created fresh per request**
 If the hub is shared across requests, handlers from previous requests
 accumulate. Each call to `handle_request()` must create a new
-`MessageHub()`, `Blackboard()`, and `Deps` instance.
+`MessageHub()`, `Blackboard()`, and `Deps` instance. Tool client singletons
+are intentionally reused — they carry no per-request state.
+
+**Fetch MCP server must be started before the first request**
+`fetch_client.startup()` must be called at application boot — in the Chainlit
+`on_chat_start` hook, the FastAPI `lifespan`, or the CLI `main()`. If a request
+arrives before startup, `fetch_tool.py` raises `RuntimeError` immediately.
+`ResearchHandler` has no lifecycle responsibilities — it just handles requests.
+
+**Tool client singletons initialise at import time (Tavily, Reddit, DDGS)**
+These three clients read from `os.environ` when their modules are imported.
+If `.env` is not loaded before the modules are imported, they will raise
+`KeyError`. Always call `load_dotenv()` before any tool module is imported.
 
 **Skills load before agents are constructed**
 `scan_skills_dir()` must complete before any agent constructor is called.
@@ -1629,8 +1753,8 @@ verifiable. No stage is purely structural.
 | Stage | What you build | Ends with |
 |---|---|---|
 | 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
-| 1a | MessageHub (closure pattern), Blackboard, Deps (with tool client fields), all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
-| 1b | `mcp/fetch_client.py` (MCPServerStdio). `tools/` — `search_tool.py` (Tavily, `days=730`), `fetch_tool.py` (calls Fetch MCP via `ctx.deps.fetch`), `reddit_tool.py` (PRAW + date filter), `ddg_tool.py` (DuckDuckGo + date filter). Tool clients initialised in `ResearchHandler`. | Real searches confirmed against university targets. Date filter verified for all four tools. Fetch MCP server starts cleanly. |
+| 1a | MessageHub (closure pattern), Blackboard, Deps (hub + board + context only — no tool clients), all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
+| 1b | `mcp/fetch_client.py` (singleton with `get_fetch_server()` / `close_fetch_server()`). `tools/` — `search_tool.py` (module-level TavilyClient, `days=730`), `fetch_tool.py` (calls `get_fetch_server()`), `reddit_tool.py` (module-level PRAW + date filter), `ddg_tool.py` (module-level DDGS + date filter). `ResearchHandler.startup()` warms up Fetch MCP. | Real searches confirmed against university targets. Date filter verified for all four tools. Fetch MCP server starts cleanly. |
 | 1c | `CareerAgent` end-to-end — pydantic-ai Agent with `tavily_search` + `fetch_page` tools, budget-aware closure, `subscribe()` + `get_instruction()`, `handle()` resets `_calls_made` | `board.career` populated from real data via CLI |
 | 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same tool set as CareerAgent (Tavily + Fetch), same pattern | `board.background`, `board.rankings`, `board.program` populated via CLI |
 | 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` — NewsAgent additionally registered with `ddg_search` tool | `board.employability`, `board.accommodation`, `board.news` populated via CLI — DuckDuckGo fallback exercised |

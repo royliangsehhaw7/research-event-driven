@@ -120,13 +120,14 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 
 from agents.base_agent import BaseAgent
-from core.message_hub import AgentParam
+from core.deps import Deps
 from schemas.messages.career_completed import CareerResearchCompletedMessage
 from schemas.messages.progress_update import ProgressUpdateMessage
 from schemas.outputs.career_output import CareerOutput
+from tools.search_tool import _client as tavily_client
 
 logger = logging.getLogger("career_agent")
 
@@ -170,7 +171,7 @@ class CareerAgent(BaseAgent):
             "with board.career = None and log the reason.\n\n"
             "TOOL BUDGET:\n"
             f"- You have {self._tool_budget} tool calls. Use them precisely.\n"
-            "- All calls go through the gated _search() method — never call deps.tavily directly."
+            "- All calls go through the gated search_web tool — never search directly."
         )
 
     async def handle(self, param: AgentParam) -> None:

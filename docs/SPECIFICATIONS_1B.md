@@ -351,18 +351,25 @@ the agent, not hardcoded.
 
 ## 1b.2 `tools/fetch_tool.py` — Fetch MCP Wrapper
 
-`FetchTool` fetches a specific URL and returns its content as plain text.
-Used when an agent has a URL already (from a prior search result) and needs
-the full page — for example, to read a course catalog page that a search
-result pointed to.
+`fetch_page` is the pydantic-ai tool function registered on agents that need
+URL fetching. It delegates to the `FetchClient` singleton in `mcp/fetch_client.py`
+— it has no knowledge of how the MCP server was started or managed.
+
+The `FetchResult` dataclass is used internally and returned by `fetch_page` as
+a JSON string for the LLM to read.
 
 ```python
 # tools/fetch_tool.py
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
+from dataclasses import dataclass
+
+from pydantic_ai import RunContext
+
+from core.deps import Deps
+from mcp.fetch_client import fetch_client
 
 logger = logging.getLogger("fetch_tool")
 
@@ -370,110 +377,61 @@ logger = logging.getLogger("fetch_tool")
 @dataclass
 class FetchResult:
     url:     str
-    content: str    # page content, markdown-formatted text
-    status:  str    # "ok" | "error"
-    error:   str | None  # error message if status == "error"
+    content: str         # page content as markdown-formatted text
+    status:  str         # "ok" | "error"
+    error:   str | None  # error message if status == "error", else None
 
 
-from dataclasses import dataclass
+async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
+    """Fetch a specific URL via the Fetch MCP server.
 
+    Use for university catalog pages, rankings pages, or any URL found
+    in search results when you need the full page content.
 
-class FetchTool:
-    """Wraps the MCP fetch server for direct URL content retrieval.
+    Does not count against tool_budget — targeted retrieval, not a search.
 
-    Spawns the MCP fetch server as a subprocess, sends a single fetch
-    request, returns the page content as text, then closes the subprocess.
+    Args:
+        url: the full URL to fetch (must start with https://)
 
-    Usage:
-        tool = FetchTool()
-        result = await tool.fetch("https://www.cs.manchester.ac.uk/undergraduate/")
-        print(result.content)
+    Returns:
+        JSON string containing url, content, status, and optional error.
+        Never raises — returns status "error" on failure so the agent
+        can note the failure and continue.
     """
+    try:
+        raw = await fetch_client.call_tool("fetch", {
+            "url": url,
+            "max_length": 50000,   # characters — enough for a full catalog page
+        })
+        result = FetchResult(url=url, content=str(raw), status="ok", error=None)
+        logger.debug("fetch_tool | fetched %r — %d chars", url, len(result.content))
+    except Exception as exc:
+        logger.error("fetch_tool | fetch failed for %r: %s", url, exc)
+        result = FetchResult(url=url, content="", status="error", error=str(exc))
 
-    async def fetch(self, url: str) -> FetchResult:
-        """Fetch a URL via the MCP fetch server.
-
-        Returns FetchResult with status "ok" and content on success,
-        or status "error" and error message on failure.
-        Never raises — always returns a FetchResult.
-        """
-        try:
-            result = await self._run_fetch(url)
-            return result
-        except Exception as exc:
-            logger.error("fetch_tool | fetch failed for %r: %s", url, exc)
-            return FetchResult(url=url, content="", status="error", error=str(exc))
-
-    async def _run_fetch(self, url: str) -> FetchResult:
-        """Spawn mcp fetch server, send request, return result."""
-        # MCP fetch server command
-        proc = await asyncio.create_subprocess_exec(
-            "python", "-m", "mcp_server_fetch",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        # JSON-RPC request to the MCP fetch tool
-        request = json.dumps({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "fetch",
-                "arguments": {
-                    "url": url,
-                    "max_length": 50000,   # characters — enough for a catalog page
-                }
-            }
-        }) + "\n"
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(request.encode()),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise RuntimeError(f"FetchTool: timeout after 30s fetching {url}")
-
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"FetchTool: MCP server error (exit {proc.returncode}): "
-                f"{stderr.decode()[:200]}"
-            )
-
-        try:
-            response = json.loads(stdout.decode())
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"FetchTool: invalid JSON response: {exc}") from exc
-
-        if "error" in response:
-            return FetchResult(
-                url=url,
-                content="",
-                status="error",
-                error=response["error"].get("message", "unknown error"),
-            )
-
-        content = ""
-        result_data = response.get("result", {})
-        for block in result_data.get("content", []):
-            if block.get("type") == "text":
-                content += block.get("text", "")
-
-        logger.debug("fetch_tool | fetched %r — %d chars", url, len(content))
-        return FetchResult(url=url, content=content, status="ok", error=None)
+    return json.dumps({
+        "url": result.url,
+        "content": result.content,
+        "status": result.status,
+        "error": result.error,
+    })
 ```
 
-**Why never raises:** fetch failures should not crash an agent. A `FetchResult`
-with `status="error"` lets the agent decide what to do — typically log the
-failure, note it in `notes`, and proceed with what search results already
-returned.
+**Why `fetch_page` is a module-level function, not a class:** pydantic-ai
+registers tools as callables. A plain async function is the cleanest fit —
+no instantiation, no state. The `FetchClient` singleton handles all state.
+
+**Why never raises:** fetch failures should not crash an agent. A `status="error"`
+response lets the agent note the failure in `notes` and continue with what
+search results already returned.
 
 **Why `max_length=50000`:** course catalog pages can be large. 50,000
-characters is enough for a full module listing. Larger values risk
-consuming the agent's context window.
+characters is enough for a full module listing. Larger values risk consuming
+the agent's context window.
+
+**Lifecycle note:** `fetch_client.startup()` must be called at application
+boot before any agent calls `fetch_page`. See Section 1b.5 for where this
+happens per entry point.
 
 ---
 
@@ -840,85 +798,47 @@ the 2-year window.
 
 ---
 
-## 1b.5 Registering Tools on `Deps`
+## 1b.5 Fetch MCP Server Lifecycle — Entry Points
 
-Tool instances are created once at startup in `ResearchHandler.__init__()` and
-added to `Deps` so agents can access them via `param.deps`.
+The `FetchClient` singleton in `mcp/fetch_client.py` must be started before
+any agent calls `fetch_page`. This happens at the application entry point —
+not inside `ResearchHandler`.
 
-**Update `core/deps.py`** to add tool fields:
-
-```python
-# core/deps.py — updated for Stage 1b
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from core.message_hub import MessageHub
-from core.blackboard import Blackboard
-
-
-@dataclass
-class ResearchContext:
-    university_name: str
-    intended_course: str
-    country:         str
-    study_level:     str = "undergraduate"
-
-
-@dataclass
-class Deps:
-    hub:     MessageHub
-    board:   Blackboard
-    context: ResearchContext
-    # Tool instances — set by ResearchHandler after tool initialisation
-    # All typed as Any here to avoid circular imports; agents use them as-is
-    tavily:  object | None = None   # TavilySearchTool instance
-    fetch:   object | None = None   # FetchTool instance
-    reddit:  object | None = None   # RedditTool instance
-    ddg:     object | None = None   # DuckDuckGoTool instance
-```
-
-**Update `services/research_handler.py`** to initialise tools and add them
-to `Deps`. Tool initialisation happens once in `__init__()` — not per request:
+At Stage 1b, the only entry point is `main.py`. Add startup and shutdown there:
 
 ```python
-# services/research_handler.py — __init__ update
-from tools.search_tool import TavilySearchTool
-from tools.fetch_tool import FetchTool
-from tools.reddit_tool import RedditTool
-from tools.ddg_tool import DuckDuckGoTool
+# main.py — Stage 1b addition
+from mcp.fetch_client import fetch_client
 
-class ResearchHandler:
-    def __init__(self) -> None:
-        # Skills loaded first — before agents and tools
-        skills = scan_skills_dir(Path("skills"))
-
-        # Tool instances — created once, shared across requests (all stateless)
-        self._tavily = TavilySearchTool()
-        self._fetch  = FetchTool()
-        self._reddit = RedditTool()
-        self._ddg    = DuckDuckGoTool()
-
-        # ... agent construction follows (unchanged from Stage 1a) ...
+async def run(...):
+    await fetch_client.startup()
+    try:
+        # ... pipeline ...
+    finally:
+        await fetch_client.shutdown()
 ```
 
-In `handle_request()`, add tools to `Deps`:
+For integration tests that call `fetch_page`, add startup/shutdown as fixtures:
 
 ```python
-deps = Deps(
-    hub=hub,
-    board=board,
-    context=context,
-    tavily=self._tavily,
-    fetch=self._fetch,
-    reddit=self._reddit,
-    ddg=self._ddg,
-)
+# tests/test_stage_1b.py — fetch lifecycle fixture
+import pytest
+from mcp.fetch_client import fetch_client
+
+@pytest.fixture(scope="module", autouse=False)
+async def fetch_server():
+    await fetch_client.startup()
+    yield
+    await fetch_client.shutdown()
 ```
 
-**Why tools are shared across requests:** the tool instances are stateless
-wrappers around API clients. Sharing them avoids the overhead of re-initialising
-PRAW's OAuth token exchange on every request. The `MessageHub` and `Blackboard`
-must still be created fresh per request — tools must not.
+`ResearchHandler` has no lifecycle responsibilities. It constructs agents and
+handles requests — the MCP server is already running by the time it is called.
+
+**Tavily, Reddit, and DuckDuckGo** have no async lifecycle. Their module-level
+singletons initialise when the module is imported. Ensure `load_dotenv()` is
+called before any tool module is imported — the singletons read from `os.environ`
+at import time and will raise `EnvironmentError` if keys are missing.
 
 ---
 
@@ -940,7 +860,8 @@ These tests make REAL API calls. You need:
   - TAVILY_API_KEY in .env
   - REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD in .env
 
-DuckDuckGo and Fetch MCP require no credentials.
+DuckDuckGo requires no credentials.
+Fetch tests require the fetch_server fixture (starts the FetchClient singleton).
 Each test confirms: import works, client initialises, real call returns data.
 """
 from __future__ import annotations
@@ -952,6 +873,16 @@ import pytest
 
 from dotenv import load_dotenv
 load_dotenv()
+
+from mcp.fetch_client import fetch_client
+
+
+@pytest.fixture(scope="module")
+async def fetch_server():
+    """Start the FetchClient singleton once for all fetch tests in this module."""
+    await fetch_client.startup()
+    yield
+    await fetch_client.shutdown()
 
 
 # ── Tavily ────────────────────────────────────────────────────────────────────
@@ -1091,59 +1022,43 @@ async def test_ddg_returns_empty_on_nonsense_query() -> None:
 # ── FetchTool ─────────────────────────────────────────────────────────────────
 
 def test_fetch_imports_cleanly() -> None:
-    from tools.fetch_tool import FetchTool, FetchResult
-    assert FetchTool
+    from tools.fetch_tool import fetch_page, FetchResult
+    assert fetch_page
     assert FetchResult
 
 
+def test_fetch_client_singleton_is_same_instance() -> None:
+    """Importing fetch_client twice returns the same object."""
+    from mcp.fetch_client import fetch_client as a
+    from mcp.fetch_client import fetch_client as b
+    assert a is b
+
+
 @pytest.mark.asyncio
-async def test_fetch_returns_content_for_known_url() -> None:
-    from tools.fetch_tool import FetchTool
-    tool = FetchTool()
-    result = await tool.fetch("https://www.cs.manchester.ac.uk/undergraduate/")
-    # FetchTool never raises — check status instead
-    if result.status == "ok":
-        assert len(result.content) > 100, "Expected non-trivial page content"
+async def test_fetch_returns_content_for_known_url(fetch_server) -> None:
+    from tools.fetch_tool import fetch_page
+    import json
+    from unittest.mock import MagicMock
+    ctx = MagicMock()
+    raw = await fetch_page(ctx, "https://www.cs.manchester.ac.uk/undergraduate/")
+    result = json.loads(raw)
+    if result["status"] == "ok":
+        assert len(result["content"]) > 100, "Expected non-trivial page content"
     else:
-        # MCP server not installed or page unavailable — log and pass
-        pytest.skip(f"FetchTool not available in test environment: {result.error}")
+        pytest.skip(f"FetchTool not available in test environment: {result['error']}")
 
 
 @pytest.mark.asyncio
-async def test_fetch_returns_error_status_for_bad_url() -> None:
-    from tools.fetch_tool import FetchTool
-    tool = FetchTool()
-    result = await tool.fetch("https://this.url.does.not.exist.invalid/")
-    assert result.status == "error"
-    assert result.error is not None
-    assert result.content == ""
-
-
-# ── Deps integration ─────────────────────────────────────────────────────────
-
-def test_deps_accepts_tool_fields() -> None:
-    """Deps can be constructed with tool instances attached."""
-    from core.message_hub import MessageHub
-    from core.blackboard import Blackboard
-    from core.deps import Deps, ResearchContext
-    from tools.search_tool import TavilySearchTool
-    from tools.ddg_tool import DuckDuckGoTool
-
-    hub     = MessageHub()
-    board   = Blackboard()
-    context = ResearchContext(
-        university_name="University of Manchester",
-        intended_course="Computer Science",
-        country="UK",
-    )
-    tavily = TavilySearchTool()
-    ddg    = DuckDuckGoTool()
-
-    deps = Deps(hub=hub, board=board, context=context, tavily=tavily, ddg=ddg)
-    assert deps.tavily is tavily
-    assert deps.ddg    is ddg
-    assert deps.reddit is None   # not set in this test — should default to None
-    assert deps.fetch  is None
+async def test_fetch_returns_error_status_for_bad_url(fetch_server) -> None:
+    from tools.fetch_tool import fetch_page
+    import json
+    from unittest.mock import MagicMock
+    ctx = MagicMock()
+    raw = await fetch_page(ctx, "https://this.url.does.not.exist.invalid/")
+    result = json.loads(raw)
+    assert result["status"] == "error"
+    assert result["error"] is not None
+    assert result["content"] == ""
 ```
 
 ---
@@ -1173,15 +1088,15 @@ tests/test_stage_1b.py::test_ddg_imports_cleanly PASSED
 tests/test_stage_1b.py::test_ddg_search_returns_results PASSED
 tests/test_stage_1b.py::test_ddg_returns_empty_on_nonsense_query PASSED
 tests/test_stage_1b.py::test_fetch_imports_cleanly PASSED
+tests/test_stage_1b.py::test_fetch_client_singleton_is_same_instance PASSED
 tests/test_stage_1b.py::test_fetch_returns_content_for_known_url PASSED
 tests/test_stage_1b.py::test_fetch_returns_error_status_for_bad_url PASSED
-tests/test_stage_1b.py::test_deps_accepts_tool_fields PASSED
 
 16 passed in X.Xs
 ```
 
-The fetch test may `SKIP` if the MCP server is not installed — this is acceptable
-at Stage 1b. It must pass before Stage 2a.
+The fetch tests may `SKIP` if the MCP server is not installed — this is acceptable
+at Stage 1b. They must pass before Stage 2a.
 
 ---
 
@@ -1230,14 +1145,14 @@ Fix: the test reloads the module after deleting the env var. Confirm
 - [ ] Reddit app created at https://www.reddit.com/prefs/apps — `client_id`,
       `client_secret`, `username`, `password` added to `.env`
 - [ ] `pip install tavily-python praw duckduckgo-search mcp` confirmed clean
-- [ ] `tools/search_tool.py` — `TavilySearchTool` implemented with `days=730` enforced
-- [ ] `tools/fetch_tool.py` — `FetchTool` implemented, never raises
-- [ ] `tools/reddit_tool.py` — `RedditTool` implemented with `run_in_executor`
-- [ ] `tools/ddg_tool.py` — `DuckDuckGoTool` implemented with rate-limit retry
-- [ ] `core/deps.py` updated — `tavily`, `fetch`, `reddit`, `ddg` fields added
-- [ ] `services/research_handler.py` updated — tools initialised in `__init__()`,
-      added to `Deps` in `handle_request()`
-- [ ] `pytest tests/test_stage_1b.py -v` — 16 passed (fetch test may SKIP)
+- [ ] `tools/search_tool.py` — `TavilySearchTool` implemented with `days=730` enforced, module-level `_client` singleton
+- [ ] `tools/fetch_tool.py` — `fetch_page` function implemented, delegates to `fetch_client` singleton, never raises
+- [ ] `tools/reddit_tool.py` — `RedditTool` implemented with `run_in_executor`, module-level `_client` singleton
+- [ ] `tools/ddg_tool.py` — `DuckDuckGoTool` implemented with rate-limit retry, module-level `_client` singleton
+- [ ] `mcp/fetch_client.py` — `FetchClient` singleton implemented with `startup()`, `shutdown()`, `call_tool()`
+- [ ] `main.py` — `fetch_client.startup()` called before pipeline, `shutdown()` in `finally`
+- [ ] `core/deps.py` unchanged from Stage 1a — no tool fields added
+- [ ] `pytest tests/test_stage_1b.py -v` — 16 passed (fetch tests may SKIP if MCP not installed)
 - [ ] Stage 1a tests still pass: `pytest tests/test_stage_1a.py -v`
 
 ---

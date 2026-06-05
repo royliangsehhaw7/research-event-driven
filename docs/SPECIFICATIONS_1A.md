@@ -30,8 +30,8 @@ the hub is already tested. No guessing.
 
 The hub is a pure fan-out dispatcher. It has no domain knowledge. It maps
 message types to lists of async handler functions and calls them all concurrently.
-`AgentParam` is defined here — it bundles the message and deps into a single
-object that every handler receives.
+Handlers are registered as closures that capture `deps` at subscription time —
+the hub never receives or knows about `deps`.
 
 ```python
 # core/message_hub.py
@@ -39,21 +39,9 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
 from pydantic import BaseModel
-
-
-@dataclass
-class AgentParam:
-    """Single parameter received by every agent handler.
-
-    message: the event that triggered this handler — typed to the subscribed message type.
-    deps:    the per-request bundle (hub, board, context) — same instance across all handlers.
-    """
-    message: BaseModel
-    deps: Any
 
 
 class MessageHub:
@@ -65,8 +53,8 @@ class MessageHub:
 
     Usage:
         hub = MessageHub()
-        hub.subscribe(SomeMessage, agent.handle)
-        await hub.publish(SomeMessage(triggered_by="x", timestamp="..."), deps)
+        hub.subscribe(SomeMessage, handler)   # handler is a closure capturing deps
+        await hub.publish(SomeMessage(triggered_by="x", timestamp="..."))
     """
 
     def __init__(self) -> None:
@@ -75,13 +63,14 @@ class MessageHub:
     def subscribe(self, message_type: type, handler: Callable) -> None:
         """Register an async handler for a message type.
 
+        The handler must be a closure that already captures deps.
         Multiple handlers per type are allowed — all fire concurrently
         on publish. Same handler registered twice will fire twice.
         """
         self._subscribers[message_type].append(handler)
 
-    async def publish(self, message: BaseModel, deps: Any) -> None:
-        """Package message + deps into AgentParam, dispatch to all handlers concurrently.
+    async def publish(self, message: BaseModel) -> None:
+        """Dispatch message to all registered handlers concurrently.
 
         Uses asyncio.gather() — all handlers start simultaneously.
         If no handlers are registered for the message type, does nothing.
@@ -90,8 +79,7 @@ class MessageHub:
         handlers = self._subscribers.get(type(message), [])
         if not handlers:
             return
-        param = AgentParam(message=message, deps=deps)
-        await asyncio.gather(*[h(param) for h in handlers])
+        await asyncio.gather(*[h(message) for h in handlers])
 
     def subscriber_count(self, message_type: type) -> int:
         """Return number of registered handlers for a message type.
@@ -99,9 +87,12 @@ class MessageHub:
         return len(self._subscribers.get(message_type, []))
 ```
 
-**Why `AgentParam` lives here:** it is defined at the hub level because
-it is the hub's output contract — the shape of what every handler receives.
-Placing it in `deps.py` or a separate file would scatter a tightly coupled pair.
+**Why closures instead of passing `deps` through `publish()`:** the hub's
+`publish(message)` signature stays clean — it has no knowledge of `deps`.
+Each agent's `subscribe()` method captures `deps` in a closure at subscription
+time. The hub calls `handler(message)`; the handler calls
+`self.handle(message, deps)` with the captured deps. This is the pattern
+established in the master reference and used throughout all agents.
 
 **Why `defaultdict(list)`:** accessing an unregistered message type returns
 an empty list rather than raising `KeyError`. This means publishing to a
@@ -246,6 +237,15 @@ class Deps:
     Passed to every agent handler via closure (see ResearchHandler).
     Agents read context, write to board, publish via hub.
     Never share a Deps instance across requests.
+
+    Tool clients (Tavily, Fetch MCP, Reddit, DuckDuckGo) are NOT on Deps.
+    Each tool owns its own client:
+      - Tavily, Reddit, DuckDuckGo: module-level singletons in their tools/ file
+      - Fetch MCP: FetchClient singleton in mcp/fetch_client.py, exposed as
+        the module-level `fetch_client` instance
+
+    tool_budget and calls_made are NOT on Deps — they live on each agent
+    instance so concurrent agents manage their own counters independently.
     """
     hub:     MessageHub
     board:   Blackboard
@@ -261,6 +261,20 @@ grep for `study_level`, not a hunt through 11 agent files.
 derive country themselves — different agents could derive it differently.
 ResearchHandler derives it once, sets it on `ResearchContext`, and all agents
 read the same value.
+
+**Why tool clients are not on `Deps`:** Tavily, Reddit, and DuckDuckGo are
+module-level singletons in their `tools/` files — stateless across requests,
+no lifecycle needed. Fetch MCP is a `FetchClient` class singleton in
+`mcp/fetch_client.py` — it requires async lifecycle management (`startup()` /
+`shutdown()`), which is the app entry point's responsibility, not `Deps`.
+Keeping all clients off `Deps` also makes the per-agent tool set explicit:
+`CareerAgent` registers `tavily_search` and `fetch_page` at construction time;
+it cannot call `reddit_search` because that function was never registered on it,
+regardless of what is on `Deps`.
+
+**Why `tool_budget`/`calls_made` are not on `Deps`:**
+budget counters are per-agent state — if they lived on shared `Deps`, concurrent
+section agents would corrupt each other's counts via `asyncio.gather()`.
 
 ---
 
@@ -1100,6 +1114,7 @@ section_name: news
    Use only for news queries, not general search.
 
 ## What to research
+- Institutional news: significant events from the past 2 years — strikes,
   controversies, award wins, ranking changes, closures
 - Department-specific news: events, research breakthroughs, grant wins,
   staff departures, course changes — higher weight than institutional news
@@ -1187,8 +1202,7 @@ Discard posts older than 2 years from today without exception.
 key: scoring
 name: Scoring Agent
 description: Produces a weighted score across 7 dimensions and a tiered recommendation after all section agents complete.
-tool_budget: 10
-section_name: null
+tool_budget: 0
 ---
 
 ## Role
@@ -1239,8 +1253,7 @@ confidence low" not "ranking data weak".
 key: alternatives
 name: Alternatives Agent
 description: Researches 2–3 alternative universities that address the specific weaknesses identified by the scoring agent.
-tool_budget: 10
-section_name: null
+tool_budget: 8
 ---
 
 ## Dependency
@@ -1280,7 +1293,6 @@ key: conversation
 name: Conversation Agent
 description: Answers follow-up questions from the parent after the report is generated, using only the research data already on the blackboard.
 tool_budget: 0
-section_name: null
 ---
 
 ## Role
