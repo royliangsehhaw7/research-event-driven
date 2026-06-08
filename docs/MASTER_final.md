@@ -171,7 +171,7 @@ Sign up free. Free tier: 1,000 API credits/month. Paid from $35/month.
 A full pipeline run uses approximately 50–70 tool calls total across all agents.
 
 **DuckDuckGo Search** — no signup, no key, no quota.
-Install: `pip install duckduckgo-search`. Used by NewsAgent as fallback only.
+Install: `pip install ddgs`. Used by NewsAgent as fallback only.
 
 **OpenRouter** — https://openrouter.ai  
 Create API key from dashboard. Set `OPENROUTER_API_KEY`.
@@ -199,7 +199,8 @@ pydantic
 chainlit
 pyyaml                # SKILL.md frontmatter parsing
 tavily-python         # Tavily search client
-duckduckgo-search     # News fallback — no key needed (NewsAgent)
+ddgs                  # News fallback — no key needed (NewsAgent)
+mcp-server-fetch      # Fetch MCP Server subprocess
 jinja2                # report generation
 python-dotenv
 pytest                # testing
@@ -1205,7 +1206,7 @@ async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
 import json
 from pydantic_ai import RunContext
 from core.deps import Deps
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 
 async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
@@ -1223,7 +1224,7 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
 import json
 from datetime import datetime, timedelta
 from dateutil.parser import parse as parse_date
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from pydantic_ai import RunContext
 from core.deps import Deps
 
@@ -1303,7 +1304,7 @@ shutdown responsibilities.
 **Chainlit (`ui/app.py`):**
 
 ```python
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 @cl.on_chat_start
 async def start():
@@ -1318,7 +1319,7 @@ async def end():
 
 ```python
 from contextlib import asynccontextmanager
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1332,7 +1333,7 @@ app = FastAPI(lifespan=lifespan)
 **CLI (`main.py`):**
 
 ```python
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 async def main():
     await fetch_client.startup()
