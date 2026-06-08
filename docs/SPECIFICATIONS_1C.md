@@ -230,15 +230,18 @@ from the course name and search for that.
 the exact pattern all subsequent agents follow. Read this implementation
 carefully before writing any other agent.
 
+Note: there is no `_make_search_tool()` method on this class. The budget-aware
+search closure is produced by `make_search_tool()` from `tools/search_tool_factory.py`
+— tool logic belongs in `tools/`, not in agent files.
+
 ```python
 # agents/career_agent.py
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent
 
 from agents.base_agent import BaseAgent
 from core.deps import Deps
@@ -247,6 +250,7 @@ from schemas.messages.career_completed import CareerResearchCompletedMessage
 from schemas.messages.progress_update import ProgressUpdateMessage
 from schemas.outputs.career_output import CareerOutput
 from tools.fetch_tool import fetch_page
+from tools.search_tool_factory import make_search_tool
 
 logger = logging.getLogger("career_agent")
 
@@ -258,20 +262,23 @@ class CareerAgent(BaseAgent):
     Writes to:     board.career (CareerOutput)
     Fires:         CareerResearchCompletedMessage
 
-    Tools: tavily_search (budget-capped), fetch_page (uncapped)
+    Tools: tavily_search (budget-capped via make_search_tool), fetch_page (uncapped)
     """
 
     def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
         super().__init__(instructions=instructions)
-        self._tool_budget = tool_budget
-        self._calls_made  = 0
+        self._tool_budget  = tool_budget
+        self._calls_made   = [0]   # mutable ref passed to closure
 
         self._agent = Agent(
             model=get_model("RESEARCH_MODEL"),
             deps_type=Deps,
             output_type=CareerOutput,
             system_prompt=self.get_instruction(),
-            tools=[self._make_search_tool(), fetch_page],
+            tools=[
+                make_search_tool("career_agent", self._calls_made, self._tool_budget),
+                fetch_page,
+            ],
         )
 
     # ── BaseAgent interface ───────────────────────────────────────────────────
@@ -314,13 +321,13 @@ class CareerAgent(BaseAgent):
 
     def reset(self) -> None:
         """Reset per-request state. Called by ResearchHandler before each request."""
-        self._calls_made = 0
+        self._calls_made[0] = 0
 
     # ── Core handler ─────────────────────────────────────────────────────────
 
     async def handle(self, message, deps: Deps) -> None:
         """Run career research and fire CareerResearchCompletedMessage."""
-        self._calls_made = 0   # reset on instance, not on deps
+        self._calls_made[0] = 0   # reset counter on each run
 
         logger.info(
             "career_agent | starting — university=%r course=%r country=%r",
@@ -374,67 +381,24 @@ class CareerAgent(BaseAgent):
             triggered_by="career_agent",
             timestamp=datetime.now().isoformat(),
         ))
-
-    # ── Tool factory ─────────────────────────────────────────────────────────
-
-    def _make_search_tool(self):
-        """Return a budget-aware tavily_search closure over this agent instance."""
-        agent_self = self
-
-        async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
-            """Search the web via Tavily. Enforces days=730 on every call.
-            Returns an error dict if the tool budget is exhausted."""
-            if agent_self._calls_made >= agent_self._tool_budget:
-                logger.warning(
-                    "career_agent | tool budget exhausted (%d/%d) — query=%r",
-                    agent_self._calls_made, agent_self._tool_budget, query,
-                )
-                return json.dumps({
-                    "error": "tool budget exhausted",
-                    "query": query,
-                    "calls_made": agent_self._calls_made,
-                    "budget": agent_self._tool_budget,
-                })
-            agent_self._calls_made += 1
-            logger.debug(
-                "career_agent | tavily_search call %d/%d — query=%r",
-                agent_self._calls_made, agent_self._tool_budget, query,
-            )
-            from tools.search_tool import _client as tavily_client
-            response = await tavily_client.search(query, max_results=5)
-            return json.dumps({
-                "query": response.query,
-                "results": [
-                    {
-                        "url": r.url,
-                        "title": r.title,
-                        "content": r.content,
-                        "score": r.score,
-                        "date": r.date,
-                    }
-                    for r in response.results
-                ],
-            })
-
-        return tavily_search
 ```
 
-**Why `system_prompt` in the constructor, not in `agent.run()`:** pydantic-ai's
-`Agent` accepts `system_prompt` at construction time. This is where the
-SKILL.md body is injected, via `get_instruction()`. The task brief passed to
-`agent.run()` is the per-request context (university, course, country) — not
-the behavioural instructions.
+**Why no `_make_search_tool()` method:** tool logic belongs in `tools/`.
+`make_search_tool()` in `tools/search_tool_factory.py` is reused by every
+agent — defining it on `CareerAgent` would mean duplicating it on all nine
+agents. The factory takes the agent name and counter ref; the agent owns
+the counter and resets it.
+
+**Why `_calls_made` is `[0]` not `0`:** the closure returned by
+`make_search_tool` needs to mutate the counter. A plain `int` cannot be
+rebound inside a closure. A single-element list is a mutable container —
+`calls_made_ref[0] += 1` works correctly across the closure boundary.
 
 **Why `CareerResearchCompletedMessage` fires even on failure:** if the LLM
 call throws, `board.career` is `None`. The seven section agents still need to
 run — they handle a `None` career gracefully, scoping their own searches without
 career context. If the message never fires, the entire pipeline stalls. Firing
 always is the correct behaviour.
-
-**Why `_calls_made = 0` at the top of `handle()` and not in `reset()`:**
-`reset()` is called once before `subscribe()`. `handle()` may be called
-multiple times in tests. Resetting in `handle()` guarantees a clean counter
-on each actual run regardless of test order.
 
 ---
 
@@ -765,9 +729,9 @@ def test_career_agent_constructs() -> None:
 def test_career_agent_reset_clears_calls_made() -> None:
     from agents.career_agent import CareerAgent
     agent = CareerAgent(tool_budget=5)
-    agent._calls_made = 4
+    agent._calls_made[0] = 4
     agent.reset()
-    assert agent._calls_made == 0
+    assert agent._calls_made[0] == 0
 
 
 def test_get_instruction_includes_skill_body() -> None:
@@ -817,26 +781,6 @@ async def test_career_agent_subscribes_to_research_requested() -> None:
     ))
 
     assert len(called) == 1
-
-
-# ── Budget enforcement ────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_budget_exhausted_returns_error_dict() -> None:
-    import json
-    from agents.career_agent import CareerAgent
-    from unittest.mock import MagicMock
-
-    agent = CareerAgent(tool_budget=2)
-    agent._calls_made = 2   # budget already at limit
-
-    search_tool = agent._make_search_tool()
-    ctx = MagicMock()
-    raw = await search_tool(ctx, "test query")
-    result = json.loads(raw)
-
-    assert result["error"] == "tool budget exhausted"
-    assert result["query"] == "test query"
 
 
 # ── LLM integration (real API call) ──────────────────────────────────────────
@@ -922,11 +866,10 @@ tests/test_stage_1c.py::test_career_agent_constructs PASSED
 tests/test_stage_1c.py::test_career_agent_reset_clears_calls_made PASSED
 tests/test_stage_1c.py::test_get_instruction_includes_skill_body PASSED
 tests/test_stage_1c.py::test_career_agent_subscribes_to_research_requested PASSED
-tests/test_stage_1c.py::test_budget_exhausted_returns_error_dict PASSED
 tests/test_stage_1c.py::test_career_agent_populates_board_career PASSED
 tests/test_stage_1c.py::test_career_agent_fires_completed_message PASSED
 
-10 passed in X.Xs
+9 passed in X.Xs
 ```
 
 The last two tests make real API calls. They take 10–30 seconds depending on
@@ -1012,16 +955,16 @@ can happen for niche courses or when Tavily returns sparse results. Inspect the
       instructions body present
 - [ ] `core/llm_factory.py` — `get_model()` reads from env, returns
       pydantic-ai `OpenAIModel` configured for OpenRouter
-- [ ] `agents/career_agent.py` — `CareerAgent` implemented with
-      `_make_search_tool()` budget closure, `subscribe()`, `get_instruction()`,
-      `handle()`, `reset()`
+- [ ] `agents/career_agent.py` — `CareerAgent` implemented with `_calls_made = [0]`,
+      `make_search_tool()` from `tools/search_tool_factory.py`, no `_make_search_tool()` method,
+      `subscribe()`, `get_instruction()`, `handle()`, `reset()`
 - [ ] `services/research_handler.py` — minimal Stage 1c version — loads career
       skill, constructs `CareerAgent`, wires it, publishes trigger
 - [ ] `main.py` — `load_dotenv()` first, `fetch_client.startup()` before
       handler, `shutdown()` in `finally`, prints `board.career`
 - [ ] `schemas/messages/research_requested.py` — `country` field confirmed present
 - [ ] `schemas/messages/career_completed.py` — no-payload message confirmed
-- [ ] `pytest tests/test_stage_1c.py -v` — 10 passed
+- [ ] `pytest tests/test_stage_1c.py -v` — 9 passed
 - [ ] `python main.py` — `board.career` printed with real data, `confidence`
       is `"high"` or `"medium"` for University of Manchester Computer Science
 - [ ] Stage 1b tests still pass: `pytest tests/test_stage_1b.py -v`

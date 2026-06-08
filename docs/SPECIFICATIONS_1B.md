@@ -100,8 +100,8 @@ If that command fails, the server needs to be invoked via `uvx` instead. In that
 ```python
 server_params = StdioServerParameters(
     command="uvx",
-     args=["mcp-server-fetch"],
- )
+    args=["mcp-server-fetch"],
+)
 ```
 
 And install `uv` if not already present:
@@ -331,7 +331,121 @@ the agent, not hardcoded.
 
 ---
 
-## 1b.2 `tools/fetch_tool.py` — Fetch MCP Wrapper
+## 1b.2 `tools/search_tool_factory.py` — Budget-Aware Search Closure Factory
+
+All agents need a budget-capped `tavily_search` tool. The budget logic is
+identical across every agent — only the agent name and counter differ.
+`search_tool_factory.py` lives in `tools/` and is the single place this
+pattern is defined. Agents import the factory and pass their own counter —
+no tool logic lives inside any agent file.
+
+```python
+# tools/search_tool_factory.py
+from __future__ import annotations
+
+import json
+import logging
+
+from pydantic_ai import RunContext
+
+from core.deps import Deps
+from tools.search_tool import search_tool
+
+logger = logging.getLogger("search_tool_factory")
+
+
+def make_search_tool(agent_name: str, calls_made_ref: list[int], tool_budget: int):
+    """Return a budget-aware tavily_search closure.
+
+    Args:
+        agent_name:      used in log messages — e.g. "career_agent"
+        calls_made_ref:  single-element list acting as a mutable int reference
+                         so the closure can increment it — e.g. [0]
+        tool_budget:     max Tavily calls allowed for this agent instance
+
+    Returns:
+        An async function suitable for registration as a pydantic-ai tool.
+
+    Usage:
+        self._calls_made = [0]
+        tool = make_search_tool("career_agent", self._calls_made, self._tool_budget)
+        # pass tool to Agent(tools=[tool, ...])
+        # reset with: self._calls_made[0] = 0
+    """
+
+    async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
+        """Search the web via Tavily. Enforces days=730 on every call.
+        Returns an error dict if the tool budget is exhausted."""
+        if calls_made_ref[0] >= tool_budget:
+            logger.warning(
+                "%s | tool budget exhausted (%d/%d) — query=%r",
+                agent_name, calls_made_ref[0], tool_budget, query,
+            )
+            return json.dumps({
+                "error": "tool budget exhausted",
+                "query": query,
+                "calls_made": calls_made_ref[0],
+                "budget": tool_budget,
+            })
+        calls_made_ref[0] += 1
+        logger.debug(
+            "%s | tavily_search call %d/%d — query=%r",
+            agent_name, calls_made_ref[0], tool_budget, query,
+        )
+        return await search_tool(ctx, query)
+
+    return tavily_search
+```
+
+**Why `calls_made_ref` is a `list[int]` not a plain `int`:** closures in
+Python can read an outer variable but cannot rebind it with `+=`. A
+single-element list is a mutable container — `calls_made_ref[0] += 1`
+mutates the list in place, which is visible both inside the closure and
+on the agent instance that owns the list. The agent resets it with
+`self._calls_made[0] = 0`.
+
+**Why this lives in `tools/` not `agents/`:** it is tool infrastructure,
+not agent logic. Any agent that needs a budget-capped Tavily tool imports
+this factory. No agent file contains tool implementation code.
+
+**`search_tool` dependency:** `make_search_tool` delegates to the module-level
+`search_tool` function in `tools/search_tool.py` — add that function to the
+bottom of `search_tool.py` now:
+
+```python
+# tools/search_tool.py — add at the bottom after TavilySearchTool class
+
+import json as _json
+from pydantic_ai import RunContext
+from core.deps import Deps
+
+_client = TavilySearchTool()
+
+
+async def search_tool(ctx: RunContext[Deps], query: str) -> str:
+    """Module-level Tavily tool function. Budget enforcement is handled
+    by the agent closure from search_tool_factory — do not call this directly
+    from agents.
+    """
+    response = await _client.search(query, max_results=5)
+    return _json.dumps({
+        "query": response.query,
+        "results": [
+            {
+                "url": r.url,
+                "title": r.title,
+                "content": r.content,
+                "score": r.score,
+                "date": r.date,
+            }
+            for r in response.results
+        ],
+    })
+```
+
+---
+
+## 1b.3 `tools/fetch_tool.py` — Fetch MCP Wrapper
 
 `fetch_page` is the pydantic-ai tool function registered on agents that need
 URL fetching. It delegates to the `FetchClient` singleton in `mcps/fetch_client.py`
@@ -351,7 +465,7 @@ from dataclasses import dataclass
 from pydantic_ai import RunContext
 
 from core.deps import Deps
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 logger = logging.getLogger("fetch_tool")
 
@@ -417,7 +531,7 @@ happens per entry point.
 
 ---
 
-## 1b.3 Forum Sources — Tavily `site:` Queries
+## 1b.4 Forum Sources — Tavily `site:` Queries
 
 ForumAgent has no separate tool file. It uses the same `TavilySearchTool` as
 all other section agents. The forum-specific behaviour is entirely in the
@@ -446,7 +560,7 @@ This does not count against `tool_budget`.
 
 ---
 
-## 1b.4 `tools/ddg_tool.py` — DuckDuckGo Wrapper
+## 1b.5 `tools/ddg_tool.py` — DuckDuckGo Wrapper
 
 `DuckDuckGoTool` wraps `ddgs` as a fallback for `NewsAgent`.
 It is only called when Tavily returns fewer than 3 news results for a query.
@@ -575,7 +689,7 @@ the 2-year window.
 
 ---
 
-## 1b.5 mcps/fetch_client.py — Fetch MCP Client Singleton
+## 1b.6 mcps/fetch_client.py — Fetch MCP Client Singleton
 **What it is**
 
 A thin lifecycle wrapper around the mcp package's stdio client. It spawns the mcp-server-fetch subprocess, holds the session open for the duration of the application run, and exposes a single call_tool() method that the rest of the project uses to fetch URLs.
@@ -591,7 +705,7 @@ Three responsibilities, nothing more:
 
 How it works
 The mcp package communicates with tool servers over stdio — it writes a request to the subprocess's stdin, the server processes it and writes a response to stdout, and the client reads it back. FetchClient manages the two context managers that make this work (stdio_client for the transport, ClientSession for the protocol) using an AsyncExitStack, which lets both be opened and closed together in a single startup()/shutdown() call.
-The module-level line fetch_client = FetchClient() creates the singleton at import time. Because Python caches module imports, any file that does from mcp.fetch_client import fetch_client gets the exact same object — the one that was started in main.py. No object is passed around, no dependency injection needed.
+The module-level line fetch_client = FetchClient() creates the singleton at import time. Because Python caches module imports, any file that does from mcps.fetch_client import fetch_client gets the exact same object — the one that was started in main.py. No object is passed around, no dependency injection needed.
 
 How it fits in the project
 ```
@@ -706,7 +820,7 @@ fetch_client = FetchClient()
 
 ---
 
-## 1b.6 Fetch MCP Server Lifecycle — Entry Points
+## 1b.7 Fetch MCP Server Lifecycle — Entry Points
 
 The `FetchClient` singleton in `mcps/fetch_client.py` must be started before
 any agent calls `fetch_page`. This happens at the application entry point —
@@ -716,7 +830,7 @@ At Stage 1b, the only entry point is `main.py`. Add startup and shutdown there:
 
 ```python
 # main.py — Stage 1b addition
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 async def run(...):
     await fetch_client.startup()
@@ -731,7 +845,7 @@ For integration tests that call `fetch_page`, add startup/shutdown as fixtures:
 ```python
 # tests/test_stage_1b.py — fetch lifecycle fixture
 import pytest
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 @pytest.fixture(scope="module", autouse=False)
 async def fetch_server():
@@ -750,7 +864,7 @@ at import time and will raise `EnvironmentError` if keys are missing.
 
 ---
 
-## 1b.7 Tests — `tests/test_stage_1b.py`
+## 1b.8 Tests — `tests/test_stage_1b.py`
 
 These tests make **real network calls**. They require valid API keys in `.env`.
 They are integration tests, not unit tests — their purpose is to confirm that
@@ -781,7 +895,7 @@ import pytest
 from dotenv import load_dotenv
 load_dotenv()
 
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 
 @pytest.fixture(scope="module")
@@ -790,6 +904,54 @@ async def fetch_server():
     await fetch_client.startup()
     yield
     await fetch_client.shutdown()
+
+
+# ── search_tool_factory ───────────────────────────────────────────────────────
+
+def test_search_tool_factory_imports_cleanly() -> None:
+    from tools.search_tool_factory import make_search_tool
+    assert make_search_tool
+
+
+def test_make_search_tool_returns_callable() -> None:
+    from tools.search_tool_factory import make_search_tool
+    tool = make_search_tool("test_agent", [0], 5)
+    import asyncio
+    assert callable(tool)
+
+
+@pytest.mark.asyncio
+async def test_make_search_tool_budget_exhausted_returns_error_dict() -> None:
+    import json
+    from tools.search_tool_factory import make_search_tool
+    from unittest.mock import MagicMock
+
+    calls_made = [3]
+    tool = make_search_tool("test_agent", calls_made, 3)  # budget already at limit
+    ctx = MagicMock()
+    raw = await tool(ctx, "test query")
+    result = json.loads(raw)
+
+    assert result["error"] == "tool budget exhausted"
+    assert result["calls_made"] == 3
+    assert result["budget"] == 3
+
+
+@pytest.mark.asyncio
+async def test_make_search_tool_increments_counter() -> None:
+    """Counter increments on each call until budget is reached."""
+    from tools.search_tool_factory import make_search_tool
+    from unittest.mock import MagicMock, AsyncMock, patch
+
+    calls_made = [0]
+    tool = make_search_tool("test_agent", calls_made, 5)
+    ctx = MagicMock()
+
+    with patch("tools.search_tool_factory.search_tool", new=AsyncMock(return_value="{}")):
+        await tool(ctx, "query one")
+        await tool(ctx, "query two")
+
+    assert calls_made[0] == 2
 
 
 # ── Tavily ────────────────────────────────────────────────────────────────────
@@ -905,8 +1067,8 @@ def test_fetch_imports_cleanly() -> None:
 
 def test_fetch_client_singleton_is_same_instance() -> None:
     """Importing fetch_client twice returns the same object."""
-    from mcp.fetch_client import fetch_client as a
-    from mcp.fetch_client import fetch_client as b
+    from mcps.fetch_client import fetch_client as a
+    from mcps.fetch_client import fetch_client as b
     assert a is b
 
 
@@ -939,7 +1101,7 @@ async def test_fetch_returns_error_status_for_bad_url(fetch_server) -> None:
 
 ---
 
-## 1b.8 Run the Tests
+## 1b.9 Run the Tests
 
 ```bash
 pytest tests/test_stage_1b.py -v -s
@@ -951,6 +1113,10 @@ what each API call returns during the first run.
 Expected output on clean pass:
 
 ```
+tests/test_stage_1b.py::test_search_tool_factory_imports_cleanly PASSED
+tests/test_stage_1b.py::test_make_search_tool_returns_callable PASSED
+tests/test_stage_1b.py::test_make_search_tool_budget_exhausted_returns_error_dict PASSED
+tests/test_stage_1b.py::test_make_search_tool_increments_counter PASSED
 tests/test_stage_1b.py::test_tavily_imports_cleanly PASSED
 tests/test_stage_1b.py::test_tavily_initialises_with_env_key PASSED
 tests/test_stage_1b.py::test_tavily_raises_on_missing_key PASSED
@@ -965,7 +1131,7 @@ tests/test_stage_1b.py::test_fetch_client_singleton_is_same_instance PASSED
 tests/test_stage_1b.py::test_fetch_returns_content_for_known_url PASSED
 tests/test_stage_1b.py::test_fetch_returns_error_status_for_bad_url PASSED
 
-13 passed in X.Xs
+17 passed in X.Xs
 ```
 
 The fetch tests may `SKIP` if the MCP server is not installed — this is acceptable
@@ -973,7 +1139,7 @@ at Stage 1b. They must pass before Stage 2a.
 
 ---
 
-## 1b.8 Common Failure Modes at This Stage
+## 1b.10 Common Failure Modes at This Stage
 
 **`EnvironmentError: TAVILY_API_KEY not set`**
 Cause: `.env` file not in project root, or key has extra whitespace.
@@ -1008,13 +1174,14 @@ Fix: the test reloads the module after deleting the env var. Confirm
 
 - [ ] Tavily API key obtained from https://app.tavily.com — added to `.env`
 - [ ] `pip install tavily-python ddgs mcp mcp-server-fetch` confirmed clean (or `uv` installed if using `uvx` invocation)
-- [ ] `tools/search_tool.py` — `TavilySearchTool` implemented with `days=730` enforced, module-level `_client` singleton
+- [ ] `tools/search_tool.py` — `TavilySearchTool` implemented with `days=730` enforced, `search_tool` module-level function added
+- [ ] `tools/search_tool_factory.py` — `make_search_tool()` implemented, delegates to `search_tool`, counter via `list[int]` ref
 - [ ] `tools/fetch_tool.py` — `fetch_page` function implemented, delegates to `fetch_client` singleton, never raises
 - [ ] `tools/ddg_tool.py` — `DuckDuckGoTool` implemented with rate-limit retry, module-level `_client` singleton
 - [ ] `mcps/fetch_client.py` — `FetchClient` singleton implemented with `startup()`, `shutdown()`, `call_tool()`
 - [ ] `main.py` — `fetch_client.startup()` called before pipeline, `shutdown()` in `finally`
 - [ ] `core/deps.py` unchanged from Stage 1a — no tool fields added
-- [ ] `pytest tests/test_stage_1b.py -v` — 13 passed (fetch tests may SKIP if MCP not installed)
+- [ ] `pytest tests/test_stage_1b.py -v` — 17 passed (fetch tests may SKIP if MCP not installed)
 - [ ] Stage 1a tests still pass: `pytest tests/test_stage_1a.py -v`
 
 ---
