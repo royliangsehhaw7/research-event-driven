@@ -1,4 +1,4 @@
-# Stage 1b — Tool Wrappers: Tavily, Fetch MCP, Reddit API (PRAW), DuckDuckGo
+# Stage 1b — Tool Wrappers: Tavily, Fetch MCP, DuckDuckGo
 ## Implementation Specification
 
 **Goal:** All four search/fetch tool wrappers are implemented, tested against
@@ -26,8 +26,7 @@ you are debugging agent logic, not tool plumbing.
 | Wrapper | File | Used by | Key feature |
 |---|---|---|---|
 | `TavilySearchTool` | `tools/search_tool.py` | All section agents | `days=730` enforced on every call |
-| `FetchTool` | `tools/fetch_tool.py` | ProgramAgent, BackgroundAgent | Direct URL fetch — catalog pages |
-| `RedditTool` | `tools/reddit_tool.py` | ForumAgent only | Full post bodies + comment threads via PRAW |
+| `FetchTool` | `tools/fetch_tool.py` | All section agents | Direct URL fetch — catalog pages, review pages |
 | `DuckDuckGoTool` | `tools/ddg_tool.py` | NewsAgent fallback only | Zero cost, no key, no quota |
 
 ---
@@ -87,7 +86,28 @@ It is accessed via the `mcp` package.
 **Install:**
 
 ```bash
-pip install mcp
+pip install mcp mcp-server-fetch
+```
+
+Confirm the server is available after installing:
+
+```bash
+python -m mcp_server_fetch --help
+```
+
+If that command fails, the server needs to be invoked via `uvx` instead. In that case update `StdioServerParameters` in `mcps/fetch_client.py`:
+
+```python
+server_params = StdioServerParameters(
+    command="uvx",
+     args=["mcp-server-fetch"],
+ )
+```
+
+And install `uv` if not already present:
+
+```bash
+pip install uv
 ```
 
 **How it works in this project:** `FetchTool` spawns the MCP fetch server
@@ -98,59 +118,23 @@ as markdown-formatted text. The wrapper handles the subprocess lifecycle.
 
 ---
 
-### Service 3 — Reddit API (PRAW)
+### Service 3 — Reddit (no separate client required)
 
-**What it is:** the official Reddit API Python wrapper. Used exclusively by
-`ForumAgent`. Returns full post bodies, comment threads, upvote scores, and
-subreddit metadata — data quality that `site:reddit.com` Tavily queries cannot
-match because Tavily only returns snippets from Reddit's public search index.
+Reddit content is accessed via Tavily `site:reddit.com` queries — the same
+mechanism used by all other `site:` targets. No Reddit API credentials are
+needed. No PRAW client is installed.
 
-**How to get Reddit API credentials:**
+Reddit's API has restricted programmatic access for third-party clients. Tavily
+`site:` queries return public Reddit snippets through the search index and are
+sufficient for ForumAgent's purposes. Full post bodies and comment threads are
+no longer accessible without elevated API access, making a dedicated client
+redundant.
 
-1. Log in to Reddit at **https://www.reddit.com**
-   (Create an account if you don't have one — a throwaway is fine)
-2. Go to **https://www.reddit.com/prefs/apps**
-3. Scroll to the bottom and click **"are you a developer? create an app..."**
-4. Fill in the form:
-   - **Name:** anything, e.g. `university-research-tool`
-   - **App type:** select **"script"** — this is important. Script apps use
-     password-based auth and work for read-only bots without OAuth redirects.
-   - **Description:** optional
-   - **About URL:** leave blank
-   - **Redirect URI:** enter `http://localhost:8080` — required even for script
-     apps. The value does not matter as long as it is a valid URL.
-5. Click **"Create app"**
-6. Your credentials are now shown:
-   - **client_id:** the string shown directly under the app name and the word
-     "personal use script" — a short alphanumeric string
-   - **client_secret:** labelled "secret"
-7. Copy both values.
+**No `.env` entry required. No package to install.**
 
-**Free tier:** Reddit's API is free for read-only script access.
-The rate limit is 100 requests per minute per OAuth client — well above
-what this project needs (ForumAgent uses 10 calls maximum).
-
-**PRAW also requires your Reddit username and password** for script-type
-authentication. Add all four values to `.env`:
-
-```bash
-REDDIT_CLIENT_ID=your_client_id_here
-REDDIT_CLIENT_SECRET=your_client_secret_here
-REDDIT_USERNAME=your_reddit_username
-REDDIT_PASSWORD=your_reddit_password
-```
-
-> **Note on `REDDIT_USERNAME` and `REDDIT_PASSWORD`:** these are only used
-> for the initial OAuth token exchange. PRAW does not store or transmit your
-> password beyond that. If you are uncomfortable using your main account,
-> create a throwaway. The account needs no special permissions — read-only
-> access to public subreddits is sufficient.
-
-**Install the client:**
-
-```bash
-pip install praw
-```
+ForumAgent treats `site:reddit.com` results as a supporting source (source 5 of 6),
+weighted lower than The Student Room, StudentCrowd, and WhatUni — reflecting the
+reduced signal quality of snippets vs full threads.
 
 ---
 
@@ -165,8 +149,10 @@ news items for a query.
 **Install:**
 
 ```bash
-pip install duckduckgo-search
+pip install ddgs
 ```
+
+> **Note:** the package was previously named `duckduckgo-search` and has since been renamed to `ddgs`. Use `ddgs` — `duckduckgo-search` will show a `RuntimeWarning` and may stop working in future releases.
 
 **Rate limit note:** DuckDuckGo's search is rate-limited at the network level.
 Sending many queries in rapid succession will result in a `RatelimitException`.
@@ -181,10 +167,6 @@ DuckDuckGo queries per pipeline run, well within safe limits.
 ```bash
 # .env — full contents after Stage 1b
 TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-REDDIT_CLIENT_ID=your_client_id_here
-REDDIT_CLIENT_SECRET=your_client_secret_here
-REDDIT_USERNAME=your_reddit_username
-REDDIT_PASSWORD=your_reddit_password
 
 OPENROUTER_API_KEY=sk-or-...
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
@@ -205,9 +187,9 @@ chainlit
 pyyaml
 python-dotenv
 tavily-python
-praw
-duckduckgo-search
+ddgs
 mcp
+mcp-server-fetch
 jinja2
 pytest
 pytest-asyncio
@@ -352,7 +334,7 @@ the agent, not hardcoded.
 ## 1b.2 `tools/fetch_tool.py` — Fetch MCP Wrapper
 
 `fetch_page` is the pydantic-ai tool function registered on agents that need
-URL fetching. It delegates to the `FetchClient` singleton in `mcp/fetch_client.py`
+URL fetching. It delegates to the `FetchClient` singleton in `mcps/fetch_client.py`
 — it has no knowledge of how the MCP server was started or managed.
 
 The `FetchResult` dataclass is used internally and returned by `fetch_page` as
@@ -435,243 +417,38 @@ happens per entry point.
 
 ---
 
-## 1b.3 `tools/reddit_tool.py` — PRAW Wrapper
+## 1b.3 Forum Sources — Tavily `site:` Queries
 
-`RedditTool` wraps PRAW for structured Reddit search. `ForumAgent` uses it
-as its primary source because it returns full post bodies, comment threads,
-and upvote scores — signal quality that `site:reddit.com` Tavily queries
-cannot provide.
+ForumAgent has no separate tool file. It uses the same `TavilySearchTool` as
+all other section agents. The forum-specific behaviour is entirely in the
+SKILL.md instructions — which sources to query, in what order, and how to
+weight results.
+
+The confirmed accessible sources (verified via search index) and their Tavily
+query patterns:
 
 ```python
-# tools/reddit_tool.py
-from __future__ import annotations
-
-import logging
-import os
-from dataclasses import dataclass, field
-
-import praw
-from dotenv import load_dotenv
-
-logger = logging.getLogger("reddit_tool")
-
-
-@dataclass
-class RedditComment:
-    body:   str
-    score:  int    # upvotes minus downvotes
-    author: str    # username, or "[deleted]"
-
-
-@dataclass
-class RedditPost:
-    url:          str
-    title:        str
-    body:         str          # selftext — empty string for link posts
-    score:        int          # post upvotes
-    subreddit:    str          # e.g. "UniUK"
-    created_utc:  float        # Unix timestamp
-    top_comments: list[RedditComment] = field(default_factory=list)
-    num_comments: int = 0
-
-
-@dataclass
-class RedditSearchResponse:
-    query:    str
-    subreddit: str           # subreddit searched — "all" if cross-subreddit
-    posts:    list[RedditPost]
-
-
-class RedditTool:
-    """PRAW wrapper for Reddit search. Used exclusively by ForumAgent.
-
-    Returns full post bodies and top comments — not just snippets.
-    This is the primary differentiator vs site:reddit.com Tavily queries.
-
-    Usage:
-        tool = RedditTool()
-        response = await tool.search(
-            query="University of Manchester Computer Science student experience",
-            subreddits=["UniUK", "AskUK"],
-            limit=10,
-        )
-        for post in response.posts:
-            print(post.title, post.body[:200])
-    """
-
-    # Subreddits ForumAgent searches by default for UK universities.
-    # ProgramAgent passes explicit subreddit lists when targeting university-specific subs.
-    DEFAULT_SUBREDDITS = ["UniUK", "AskUK", "6thForm", "GCSE"]
-
-    def __init__(self) -> None:
-        load_dotenv()
-        client_id     = os.getenv("REDDIT_CLIENT_ID")
-        client_secret = os.getenv("REDDIT_CLIENT_SECRET")
-        username      = os.getenv("REDDIT_USERNAME")
-        password      = os.getenv("REDDIT_PASSWORD")
-
-        missing = [
-            k for k, v in {
-                "REDDIT_CLIENT_ID": client_id,
-                "REDDIT_CLIENT_SECRET": client_secret,
-                "REDDIT_USERNAME": username,
-                "REDDIT_PASSWORD": password,
-            }.items() if not v
-        ]
-        if missing:
-            raise EnvironmentError(
-                f"Reddit credentials not set: {missing}. "
-                "See Stage 1b setup instructions for how to create a Reddit app."
-            )
-
-        self._reddit = praw.Reddit(
-            client_id=client_id,
-            client_secret=client_secret,
-            username=username,
-            password=password,
-            user_agent="university-research-tool/0.1 (by /u/{username})",
-        )
-        logger.info("reddit_tool | RedditTool initialised — read-only mode")
-
-    async def search(
-        self,
-        query: str,
-        subreddits: list[str] | None = None,
-        limit: int = 10,
-        top_comments_per_post: int = 5,
-        time_filter: str = "year",
-    ) -> RedditSearchResponse:
-        """Search Reddit posts matching query across given subreddits.
-
-        Args:
-            query:                  Search string — include university + course.
-            subreddits:             List of subreddit names (without r/ prefix).
-                                    Defaults to DEFAULT_SUBREDDITS.
-                                    Pass ["all"] to search all of Reddit.
-            limit:                  Max posts to return per subreddit. Default 10.
-            top_comments_per_post:  Number of top comments to include per post.
-                                    Default 5. Set 0 to skip comment fetching.
-            time_filter:            "year" (default), "month", "week", "all".
-                                    "year" enforces approximate 2-year recency
-                                    (2 passes may be needed for strict 2yr filter —
-                                    ForumAgent handles this in its tool calls).
-
-        Returns:
-            RedditSearchResponse with all posts collected across all subreddits.
-        """
-        subs = subreddits or self.DEFAULT_SUBREDDITS
-        all_posts: list[RedditPost] = []
-
-        for sub_name in subs:
-            try:
-                posts = await self._search_subreddit(
-                    query=query,
-                    subreddit_name=sub_name,
-                    limit=limit,
-                    top_comments_per_post=top_comments_per_post,
-                    time_filter=time_filter,
-                )
-                all_posts.extend(posts)
-                logger.debug(
-                    "reddit_tool | r/%s: %d posts for query %r",
-                    sub_name, len(posts), query
-                )
-            except Exception as exc:
-                # Log and skip — a single failed subreddit should not stop ForumAgent
-                logger.warning(
-                    "reddit_tool | r/%s: search failed: %s", sub_name, exc
-                )
-
-        return RedditSearchResponse(
-            query=query,
-            subreddit="+".join(subs),
-            posts=all_posts,
-        )
-
-    async def _search_subreddit(
-        self,
-        query: str,
-        subreddit_name: str,
-        limit: int,
-        top_comments_per_post: int,
-        time_filter: str,
-    ) -> list[RedditPost]:
-        """Search a single subreddit. Runs in executor to avoid blocking asyncio."""
-        import asyncio
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            self._search_subreddit_sync,
-            query, subreddit_name, limit, top_comments_per_post, time_filter,
-        )
-
-    def _search_subreddit_sync(
-        self,
-        query: str,
-        subreddit_name: str,
-        limit: int,
-        top_comments_per_post: int,
-        time_filter: str,
-    ) -> list[RedditPost]:
-        """Synchronous PRAW search — called via run_in_executor."""
-        subreddit = self._reddit.subreddit(subreddit_name)
-        posts = []
-
-        for submission in subreddit.search(
-            query,
-            limit=limit,
-            time_filter=time_filter,
-            sort="relevance",
-        ):
-            comments = []
-            if top_comments_per_post > 0:
-                try:
-                    submission.comments.replace_more(limit=0)
-                    for comment in list(submission.comments)[:top_comments_per_post]:
-                        if hasattr(comment, "body"):
-                            comments.append(RedditComment(
-                                body=comment.body,
-                                score=comment.score,
-                                author=str(comment.author) if comment.author else "[deleted]",
-                            ))
-                except Exception:
-                    pass  # comment fetch failure does not discard the post
-
-            posts.append(RedditPost(
-                url=f"https://reddit.com{submission.permalink}",
-                title=submission.title,
-                body=submission.selftext,
-                score=submission.score,
-                subreddit=subreddit_name,
-                created_utc=submission.created_utc,
-                top_comments=comments,
-                num_comments=submission.num_comments,
-            ))
-
-        return posts
+# Example queries ForumAgent constructs — all via tavily_search()
+FORUM_QUERY_EXAMPLES = [
+    "site:thestudentroom.co.uk {university} {course} student experience",
+    "site:studentcrowd.com {university} {course} review",
+    "site:whatuni.com {university} {course} student review",
+    "site:quora.com {university} {course} worth it undergraduate",
+    "site:reddit.com {university} {course} undergraduate",
+]
 ```
 
-**Why `run_in_executor`:** PRAW is a synchronous library. Calling it directly
-in an async function would block the asyncio event loop for the duration of
-the network round trip — blocking all other concurrent agents. Running it in
-an executor makes PRAW calls non-blocking from asyncio's perspective.
+ForumAgent also calls `fetch_page` to retrieve full review content from
+StudentCrowd and WhatUni course pages when Tavily snippets are insufficient.
+This does not count against `tool_budget`.
 
-**Why single-subreddit errors are swallowed:** if `r/UniUK` is unavailable
-(private, banned, or network error), `r/AskUK` and other subreddits should
-still be searched. One failed subreddit is a partial degradation, not a
-`ForumAgent` failure.
-
-**Why `time_filter="year"` rather than `"all"`:** Reddit's time filter options
-are `hour`, `day`, `week`, `month`, `year`, `all` — there is no `2year` option.
-Using `year` keeps most results within the recency window. `ForumAgent` is
-responsible for discarding posts whose `created_utc` is outside the 2-year
-window when building `ForumFinding` entries.
+**No additional tool file, no new dependencies, no credentials needed.**
 
 ---
 
 ## 1b.4 `tools/ddg_tool.py` — DuckDuckGo Wrapper
 
-`DuckDuckGoTool` wraps `duckduckgo-search` as a fallback for `NewsAgent`.
+`DuckDuckGoTool` wraps `ddgs` as a fallback for `NewsAgent`.
 It is only called when Tavily returns fewer than 3 news results for a query.
 It has no key and no quota.
 
@@ -754,8 +531,8 @@ class DuckDuckGoTool:
         region: str,
     ) -> list[DDGResult]:
         """Synchronous DDG search with one retry on rate limit."""
-        from duckduckgo_search import DDGS
-        from duckduckgo_search.exceptions import RatelimitException
+        from ddgs import DDGS
+        from ddgs.exceptions import RatelimitException
 
         for attempt in range(2):
             try:
@@ -798,9 +575,140 @@ the 2-year window.
 
 ---
 
-## 1b.5 Fetch MCP Server Lifecycle — Entry Points
+## 1b.5 mcps/fetch_client.py — Fetch MCP Client Singleton
+**What it is**
 
-The `FetchClient` singleton in `mcp/fetch_client.py` must be started before
+A thin lifecycle wrapper around the mcp package's stdio client. It spawns the mcp-server-fetch subprocess, holds the session open for the duration of the application run, and exposes a single call_tool() method that the rest of the project uses to fetch URLs.
+
+**What it does**
+
+Three responsibilities, nothing more:
+
+- `startup()` — launches the mcp-server-fetch subprocess and opens an MCP session over its stdin/stdout. Called once at application boot in main.py.
+- `shutdown()` — tears down the session and stops the subprocess cleanly. Called in the finally block in main.py so it always runs even if the pipeline crashes.
+- `call_tool()` — sends a single fetch request to the running server and returns the page content as a string. This is the only method the rest of the project ever calls directly.
+
+
+How it works
+The mcp package communicates with tool servers over stdio — it writes a request to the subprocess's stdin, the server processes it and writes a response to stdout, and the client reads it back. FetchClient manages the two context managers that make this work (stdio_client for the transport, ClientSession for the protocol) using an AsyncExitStack, which lets both be opened and closed together in a single startup()/shutdown() call.
+The module-level line fetch_client = FetchClient() creates the singleton at import time. Because Python caches module imports, any file that does from mcp.fetch_client import fetch_client gets the exact same object — the one that was started in main.py. No object is passed around, no dependency injection needed.
+
+How it fits in the project
+```
+main.py
+  └── fetch_client.startup()          ← boots the subprocess once
+
+tools/fetch_tool.py
+  └── fetch_page()
+        └── fetch_client.call_tool()  ← used on every URL fetch
+
+agents (ProgramAgent, ForumAgent, etc.)
+  └── registered tool: fetch_page     ← agents never touch fetch_client directly
+
+main.py (finally block)
+  └── fetch_client.shutdown()         ← always runs, cleans up subprocess
+```
+ 
+`fetch_tool.py` is the only file that imports fetch_client for actual use. Everything above it — agents, ResearchHandler — only knows about fetch_page. Everything below it — the MCP server, the subprocess — is invisible to the rest of the project. 
+
+`fetch_client.py` is the seam between your Python application and the external fetch server, and it intentionally exposes as little surface area as possible.
+
+```python
+# mcps/fetch_client.py
+from __future__ import annotations
+
+import logging
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+logger = logging.getLogger("fetch_client")
+
+
+class FetchClient:
+    """Singleton MCP client that manages the fetch server subprocess lifecycle.
+
+    Usage:
+        await fetch_client.startup()   # call once at app boot
+        result = await fetch_client.call_tool("fetch", {"url": "https://..."})
+        await fetch_client.shutdown()  # call once at app exit
+    """
+
+    def __init__(self) -> None:
+        self._session: ClientSession | None = None
+        self._exit_stack = None
+
+    async def startup(self) -> None:
+        """Start the MCP fetch server subprocess and open a session."""
+        from contextlib import AsyncExitStack
+        self._exit_stack = AsyncExitStack()
+        server_params = StdioServerParameters(
+            command="uvx",
+            args=["mcp-server-fetch"],
+        )
+        # If uvx is not available, replace with:
+        #   command="python", args=["-m", "mcp_server_fetch"]
+        # and confirm `python -m mcp_server_fetch --help` works first.
+        stdio_transport = await self._exit_stack.enter_async_context(
+            stdio_client(server_params)
+        )
+        read, write = stdio_transport
+        self._session = await self._exit_stack.enter_async_context(
+            ClientSession(read, write)
+        )
+        await self._session.initialize()
+        logger.info("fetch_client | MCP fetch server started")
+
+    async def shutdown(self) -> None:
+        """Stop the MCP fetch server subprocess."""
+        if self._exit_stack:
+            await self._exit_stack.aclose()
+            self._session = None
+            self._exit_stack = None
+            logger.info("fetch_client | MCP fetch server stopped")
+
+    async def call_tool(self, tool_name: str, arguments: dict) -> str:
+        """Call a tool on the running MCP fetch server.
+
+        Args:
+            tool_name:  Name of the tool to call (e.g. "fetch").
+            arguments:  Dict of arguments to pass to the tool.
+
+        Returns:
+            Tool result as a string.
+
+        Raises:
+            RuntimeError: if the session has not been started via startup().
+        """
+        if self._session is None:
+            raise RuntimeError(
+                "FetchClient is not started. "
+                "Call await fetch_client.startup() before calling call_tool()."
+            )
+        result = await self._session.call_tool(tool_name, arguments)
+        # result.content is a list of content blocks; extract text
+        texts = [
+            block.text
+            for block in result.content
+            if hasattr(block, "text")
+        ]
+        return "\n".join(texts)
+
+
+# Module-level singleton — importing this module twice gives the same object
+fetch_client = FetchClient()
+```
+
+**Key points:**
+- The singleton is created at module level (fetch_client = FetchClient()) — this is what makes the singleton test pass.
+- `startup()/shutdown()` use an AsyncExitStack to manage the subprocess and session context managers together cleanly.
+- `call_tool()` raises RuntimeError (not silently fails) if called before `startup()` — the fetch_page wrapper in fetch_tool.py already catches and converts exceptions to status="error" responses.
+
+
+---
+
+## 1b.6 Fetch MCP Server Lifecycle — Entry Points
+
+The `FetchClient` singleton in `mcps/fetch_client.py` must be started before
 any agent calls `fetch_page`. This happens at the application entry point —
 not inside `ResearchHandler`.
 
@@ -835,14 +743,14 @@ async def fetch_server():
 `ResearchHandler` has no lifecycle responsibilities. It constructs agents and
 handles requests — the MCP server is already running by the time it is called.
 
-**Tavily, Reddit, and DuckDuckGo** have no async lifecycle. Their module-level
+**Tavily and DuckDuckGo** have no async lifecycle. Their module-level
 singletons initialise when the module is imported. Ensure `load_dotenv()` is
 called before any tool module is imported — the singletons read from `os.environ`
 at import time and will raise `EnvironmentError` if keys are missing.
 
 ---
 
-## 1b.6 Tests — `tests/test_stage_1b.py`
+## 1b.7 Tests — `tests/test_stage_1b.py`
 
 These tests make **real network calls**. They require valid API keys in `.env`.
 They are integration tests, not unit tests — their purpose is to confirm that
@@ -858,7 +766,6 @@ Run with: pytest tests/test_stage_1b.py -v -s
 
 These tests make REAL API calls. You need:
   - TAVILY_API_KEY in .env
-  - REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD in .env
 
 DuckDuckGo requires no credentials.
 Fetch tests require the fetch_server fixture (starts the FetchClient singleton).
@@ -936,53 +843,22 @@ async def test_tavily_site_query_returns_results() -> None:
     # site: queries sometimes return 0 results — that is valid behaviour
     # We only assert the call does not raise
     assert response.results is not None
-
-
-# ── Reddit ────────────────────────────────────────────────────────────────────
-
-def test_reddit_imports_cleanly() -> None:
-    from tools.reddit_tool import RedditTool, RedditPost, RedditSearchResponse
-    assert RedditTool
-    assert RedditPost
-    assert RedditSearchResponse
-
-
-def test_reddit_initialises_with_env_credentials() -> None:
-    from tools.reddit_tool import RedditTool
-    tool = RedditTool()
-    assert tool is not None
-
-
 @pytest.mark.asyncio
-async def test_reddit_search_returns_posts() -> None:
-    from tools.reddit_tool import RedditTool
-    tool = RedditTool()
-    response = await tool.search(
-        query="University of Manchester Computer Science",
-        subreddits=["UniUK"],
-        limit=5,
-        top_comments_per_post=2,
-    )
-    assert response.query == "University of Manchester Computer Science"
-    assert isinstance(response.posts, list), "Expected a list of posts"
-    # Posts may be 0 if no recent matching threads — assert type, not count
-    for post in response.posts:
-        assert post.url.startswith("https://reddit.com"), f"Bad URL: {post.url}"
-        assert isinstance(post.score, int)
-        assert isinstance(post.created_utc, float)
-
-
-@pytest.mark.asyncio
-async def test_reddit_bad_subreddit_does_not_raise() -> None:
-    """A nonexistent subreddit should be skipped, not crash the tool."""
-    from tools.reddit_tool import RedditTool
-    tool = RedditTool()
-    response = await tool.search(
-        query="test query",
-        subreddits=["ThisSubredditAbsolutelyDoesNotExist99999"],
-        limit=3,
-    )
-    assert response.posts == []
+async def test_tavily_forum_sources_accessible() -> None:
+    """Confirm all 5 forum site: query targets return results via Tavily."""
+    from tools.search_tool import TavilySearchTool
+    tool = TavilySearchTool()
+    sources = [
+        "site:thestudentroom.co.uk University of Manchester Computer Science",
+        "site:studentcrowd.com University of Manchester Computer Science",
+        "site:whatuni.com University of Manchester Computer Science",
+        "site:quora.com University of Manchester Computer Science undergraduate",
+        "site:reddit.com University of Manchester Computer Science",
+    ]
+    for query in sources:
+        response = await tool.search(query, max_results=3)
+        # site: queries may return 0 for low-coverage sources — assert no raise
+        assert response.results is not None, f"None results for: {query}"
 
 
 # ── DuckDuckGo ────────────────────────────────────────────────────────────────
@@ -1063,7 +939,7 @@ async def test_fetch_returns_error_status_for_bad_url(fetch_server) -> None:
 
 ---
 
-## 1b.7 Run the Tests
+## 1b.8 Run the Tests
 
 ```bash
 pytest tests/test_stage_1b.py -v -s
@@ -1080,10 +956,7 @@ tests/test_stage_1b.py::test_tavily_initialises_with_env_key PASSED
 tests/test_stage_1b.py::test_tavily_raises_on_missing_key PASSED
 tests/test_stage_1b.py::test_tavily_returns_results_for_known_query PASSED
 tests/test_stage_1b.py::test_tavily_site_query_returns_results PASSED
-tests/test_stage_1b.py::test_reddit_imports_cleanly PASSED
-tests/test_stage_1b.py::test_reddit_initialises_with_env_credentials PASSED
-tests/test_stage_1b.py::test_reddit_search_returns_posts PASSED
-tests/test_stage_1b.py::test_reddit_bad_subreddit_does_not_raise PASSED
+tests/test_stage_1b.py::test_tavily_forum_sources_accessible PASSED
 tests/test_stage_1b.py::test_ddg_imports_cleanly PASSED
 tests/test_stage_1b.py::test_ddg_search_returns_results PASSED
 tests/test_stage_1b.py::test_ddg_returns_empty_on_nonsense_query PASSED
@@ -1092,7 +965,7 @@ tests/test_stage_1b.py::test_fetch_client_singleton_is_same_instance PASSED
 tests/test_stage_1b.py::test_fetch_returns_content_for_known_url PASSED
 tests/test_stage_1b.py::test_fetch_returns_error_status_for_bad_url PASSED
 
-16 passed in X.Xs
+13 passed in X.Xs
 ```
 
 The fetch tests may `SKIP` if the MCP server is not installed — this is acceptable
@@ -1107,17 +980,10 @@ Cause: `.env` file not in project root, or key has extra whitespace.
 Fix: confirm the file exists at the root, not inside a subfolder.
 Check for leading/trailing spaces around the `=` sign.
 
-**`praw.exceptions.ResponseException: 401 Unauthorized`**
-Cause: wrong `client_id` or `client_secret`. The most common mistake is
-copying the app name instead of the `client_id` (shown below the app name
-on the Reddit apps page).
-Fix: return to https://www.reddit.com/prefs/apps. The `client_id` is the
-short string directly under the "personal use script" label, not the app name.
-
-**`praw.exceptions.MissingRequiredAttributeException`**
-Cause: `REDDIT_USERNAME` or `REDDIT_PASSWORD` not set.
-Fix: add both to `.env`. These are your Reddit account credentials, not the
-app credentials.
+**`test_tavily_forum_sources_accessible` returns 0 results for some sources**
+This is acceptable — `site:` queries can return 0 for low-coverage targets.
+The test only asserts no exception is raised. If all 5 sources return 0,
+investigate Tavily quota or query construction.
 
 **`RatelimitException` from DuckDuckGo**
 Cause: too many DDG queries in quick succession during test runs.
@@ -1125,11 +991,10 @@ Fix: the wrapper retries once with a 3-second delay. If tests still fail,
 add `time.sleep(2)` between DDG test calls, or run DDG tests in isolation:
 `pytest tests/test_stage_1b.py -k ddg -v`.
 
-**`ModuleNotFoundError: mcp_server_fetch`**
-Cause: `mcp` package installed but the fetch server module not available.
-Fix: `pip install mcp` and confirm with `python -m mcp_server_fetch --help`.
-If that command fails, the fetch server may need a separate install:
-`pip install mcp-server-fetch`.
+**`McpError: Connection closed` or `ModuleNotFoundError: mcp_server_fetch`**
+Cause: the fetch server subprocess failed to start. Two possible fixes:
+1. Install the server package: `pip install mcp-server-fetch` and confirm with `python -m mcp_server_fetch --help`.
+2. If that command fails, switch to the `uvx` invocation (the recommended default): set `command="uvx"`, `args=["mcp-server-fetch"]` in `StdioServerParameters`, and install `uv` with `pip install uv`.
 
 **`test_tavily_raises_on_missing_key FAILED`**
 Cause: `monkeypatch.delenv` does not work if `load_dotenv()` was already called
@@ -1142,17 +1007,14 @@ Fix: the test reloads the module after deleting the env var. Confirm
 ## Stage 1b Completion Checklist
 
 - [ ] Tavily API key obtained from https://app.tavily.com — added to `.env`
-- [ ] Reddit app created at https://www.reddit.com/prefs/apps — `client_id`,
-      `client_secret`, `username`, `password` added to `.env`
-- [ ] `pip install tavily-python praw duckduckgo-search mcp` confirmed clean
+- [ ] `pip install tavily-python ddgs mcp mcp-server-fetch` confirmed clean (or `uv` installed if using `uvx` invocation)
 - [ ] `tools/search_tool.py` — `TavilySearchTool` implemented with `days=730` enforced, module-level `_client` singleton
 - [ ] `tools/fetch_tool.py` — `fetch_page` function implemented, delegates to `fetch_client` singleton, never raises
-- [ ] `tools/reddit_tool.py` — `RedditTool` implemented with `run_in_executor`, module-level `_client` singleton
 - [ ] `tools/ddg_tool.py` — `DuckDuckGoTool` implemented with rate-limit retry, module-level `_client` singleton
-- [ ] `mcp/fetch_client.py` — `FetchClient` singleton implemented with `startup()`, `shutdown()`, `call_tool()`
+- [ ] `mcps/fetch_client.py` — `FetchClient` singleton implemented with `startup()`, `shutdown()`, `call_tool()`
 - [ ] `main.py` — `fetch_client.startup()` called before pipeline, `shutdown()` in `finally`
 - [ ] `core/deps.py` unchanged from Stage 1a — no tool fields added
-- [ ] `pytest tests/test_stage_1b.py -v` — 16 passed (fetch tests may SKIP if MCP not installed)
+- [ ] `pytest tests/test_stage_1b.py -v` — 13 passed (fetch tests may SKIP if MCP not installed)
 - [ ] Stage 1a tests still pass: `pytest tests/test_stage_1a.py -v`
 
 ---

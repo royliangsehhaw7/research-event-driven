@@ -238,9 +238,9 @@ class Deps:
     Agents read context, write to board, publish via hub.
     Never share a Deps instance across requests.
 
-    Tool clients (Tavily, Fetch MCP, Reddit, DuckDuckGo) are NOT on Deps.
+    Tool clients (Tavily, Fetch MCP, DuckDuckGo) are NOT on Deps.
     Each tool owns its own client:
-      - Tavily, Reddit, DuckDuckGo: module-level singletons in their tools/ file
+      - Tavily, DuckDuckGo: module-level singletons in their tools/ file
       - Fetch MCP: FetchClient singleton in mcp/fetch_client.py, exposed as
         the module-level `fetch_client` instance
 
@@ -262,14 +262,14 @@ derive country themselves — different agents could derive it differently.
 ResearchHandler derives it once, sets it on `ResearchContext`, and all agents
 read the same value.
 
-**Why tool clients are not on `Deps`:** Tavily, Reddit, and DuckDuckGo are
+**Why tool clients are not on `Deps`:** Tavily and DuckDuckGo are
 module-level singletons in their `tools/` files — stateless across requests,
 no lifecycle needed. Fetch MCP is a `FetchClient` class singleton in
 `mcp/fetch_client.py` — it requires async lifecycle management (`startup()` /
 `shutdown()`), which is the app entry point's responsibility, not `Deps`.
 Keeping all clients off `Deps` also makes the per-agent tool set explicit:
 `CareerAgent` registers `tavily_search` and `fetch_page` at construction time;
-it cannot call `reddit_search` because that function was never registered on it,
+it cannot call `ddg_search` because that function was never registered on it,
 regardless of what is on `Deps`.
 
 **Why `tool_budget`/`calls_made` are not on `Deps`:**
@@ -710,7 +710,7 @@ from typing import Literal
 
 class ForumSource(BaseModel):
     url:         str
-    platform:    str    # "reddit", "thestudentroom", "thegradcafe", "quora"
+    platform:    str    # "thestudentroom", "studentcrowd", "whatuni", "quora", "reddit"
     year:        int
     poster_type: str    # "current_student" | "recent_graduate" | "former_student" | "prospective"
 
@@ -832,7 +832,7 @@ lines. The `key` field must match the folder name exactly.
 | `skills/employability/` | `employability` | `8` | `employability` | Reads `board.career` |
 | `skills/accommodation/` | `accommodation` | `6` | `accommodation` | |
 | `skills/news/` | `news` | `6` | `news` | DuckDuckGo fallback documented |
-| `skills/forum/` | `forum` | `10` | `forum` | Reddit API as source #1 |
+| `skills/forum/` | `forum` | `10` | `forum` | TSR + StudentCrowd + WhatUni as primary sources |
 | `skills/scoring/` | `scoring` | `0` | *(omit)* | No tools, no section_name |
 | `skills/alternatives/` | `alternatives` | `8` | *(omit)* | No section_name |
 | `skills/conversation/` | `conversation` | `0` | *(omit)* | No tools, no section_name |
@@ -1156,19 +1156,30 @@ Every result that does not mention the specific course or department is discarde
 Generic university experience threads are not acceptable output.
 
 ## Sources — search in this order
-1. **Reddit API** — search r/UniUK, r/AskUK, r/ApplyingToCollege, university-specific subreddits
-   directly via PRAW. Returns full post bodies and comment threads — higher signal than site: queries.
-2. `site:thestudentroom.co.uk` via Tavily — course-specific threads
-3. `site:thegradcafe.com` via Tavily — applicant and student discussion
-4. `site:quora.com` via Tavily — student experience questions
+1. `site:thestudentroom.co.uk` via Tavily — primary source. Deep UK student forum,
+   course-specific threads, high signal. Use for course experience, teaching quality,
+   and student life feedback.
+2. `site:studentcrowd.com` via Tavily — verified student reviews per course with
+   structured ratings. Fetch the course-specific page via fetch_page for full reviews.
+3. `site:whatuni.com` via Tavily — student ratings and reviews per course.
+   Fetch the course page via fetch_page for full review text.
+4. `site:quora.com` via Tavily — student Q&A threads, useful for international
+   student perspectives and course comparisons.
+5. `site:reddit.com` via Tavily — best-effort snippets only (no full threads).
+   Use as a supporting source, not primary. Weight lower than sources 1–4.
+   For non-UK universities, promote this to source 2 if TSR coverage is sparse.
+6. `site:collegeconfidential.com` via Tavily — use for US and international
+   universities only. Skip for UK-only queries where TSR and StudentCrowd suffice.
 
 ## Query construction
 Always: [university name] + [course name] + [signal type]
 
 Examples:
-- "site:reddit.com University of Manchester Computer Science student experience"
-- "site:thestudentroom.co.uk University of Manchester Computer Science review"
+- "site:thestudentroom.co.uk University of Manchester Computer Science student experience"
+- "site:studentcrowd.com University of Manchester Computer Science review"
+- "site:whatuni.com University of Manchester Computer Science student review"
 - "site:quora.com University of Manchester Computer Science worth it"
+- "site:reddit.com University of Manchester Computer Science undergraduate"
 
 ## Signal weighting
 1. Current student (enrolled now) — highest weight
@@ -1340,8 +1351,7 @@ constructor by `ResearchHandler`.
 
 It exists for three reasons:
 
-**Cost control.** Every Tavily call costs 1 API credit. Every Reddit API
-call counts against the rate limit. A hard cap makes worst-case API spend
+**Cost control.** Every Tavily call costs 1 API credit. A hard cap makes worst-case API spend
 per pipeline run predictable. With the values in this spec, a full run
 across all agents costs at most 50–70 Tavily calls — within the free tier.
 
@@ -1358,7 +1368,7 @@ stalling the others.
 
 | Agent | `tool_budget` | Why |
 |---|---|---|
-| `forum` | 10 | Highest — Reddit API + multiple `site:` Tavily queries across 3 platforms |
+| `forum` | 10 | Highest — 5 forum sources × Tavily `site:` queries + fetch_page calls for StudentCrowd and WhatUni course pages |
 | `career` | 8 | Job postings snapshot + salary data requires multiple queries |
 | `employability` | 8 | Named companies require several targeted queries |
 | `alternatives` | 8 | 2–3 universities × multiple queries each |
@@ -1401,7 +1411,7 @@ class CareerAgent(BaseAgent):
 ```
 
 Every tool call goes through `_search()` or an equivalent gated wrapper
-for `deps.reddit` and `deps.ddg`. Direct calls to `deps.tavily.search()`
+for `deps.ddg`. Direct calls to `deps.tavily.search()`
 that bypass the gate are a bug.
 
 `_calls_made` is reset at the start of each `handle()` call — not in

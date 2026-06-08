@@ -48,8 +48,4 @@ class Deps:
     hub:     MessageHub
     board:   Blackboard
     context: ResearchContext
-    tavily:  Any              # TavilyClient — used by all research agents
-    fetch:   Any              # MCPServerStdio from mcp/fetch_client.py — all research agents
-    reddit:  Any | None       # praw.Reddit — ForumAgent only, None if not configured
-    ddg:     Any              # DDGS — NewsAgent only
     

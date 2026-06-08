@@ -136,21 +136,21 @@ never silently omits a section.
 |---|---|---|---|
 | **Tavily** | Python client | Primary search — all agents. Key feature: `days=730` date filter | `TAVILY_API_KEY` |
 | **Fetch MCP** | MCP server | Direct URL fetch for university catalog pages, rankings pages | None — open |
-| **Reddit API (PRAW)** | Python client | ForumAgent — subreddit search, post bodies, comment scores. Richer than `site:reddit.com` via Tavily | `REDDIT_CLIENT_ID` + `REDDIT_CLIENT_SECRET` |
 | **DuckDuckGo Search** | Python client | NewsAgent fallback when Tavily misses news. No key, no quota | None — no key needed |
 
-**Fetch MCP is the only MCP server in the stack.** Tavily, Reddit (PRAW), and
-DuckDuckGo are plain Python client libraries — no MCP protocol involved.
+**Fetch MCP is the only MCP server in the stack.** Tavily and DuckDuckGo are
+plain Python client libraries — no MCP protocol involved.
 The MCP server connection for Fetch lives in `mcp/fetch_client.py` as a
 managed singleton. The pydantic-ai tool function that wraps it lives in
 `tools/fetch_tool.py`. These are kept separate — one file, one responsibility.
 
 **Why these tools:**
-Tavily handles all general search including `site:thestudentroom.co.uk`, `site:quora.com`,
-and `site:reddit.com` queries. Reddit API is added for ForumAgent specifically because it
-returns full post bodies, comment threads, upvote scores, and subreddit context — signal
-quality that Tavily `site:` queries cannot match. DuckDuckGo replaces SerpAPI as a
-zero-cost news fallback with no monthly quota.
+Tavily handles all general search including `site:thestudentroom.co.uk`,
+`site:studentcrowd.com`, `site:whatuni.com`, `site:quora.com`, and
+`site:reddit.com` queries. ForumAgent uses `site:` queries across multiple
+confirmed-accessible public student forums — no separate Reddit API client is
+required. DuckDuckGo replaces SerpAPI as a zero-cost news fallback with no
+monthly quota.
 
 ### LLM Provider
 
@@ -170,10 +170,6 @@ at the OpenRouter base URL.
 Sign up free. Free tier: 1,000 API credits/month. Paid from $35/month.
 A full pipeline run uses approximately 50–70 tool calls total across all agents.
 
-**Reddit API** — https://www.reddit.com/prefs/apps  
-Create a "script" app. Free. Returns `client_id` and `client_secret`.
-Used by ForumAgent only — stays well within free tier limits.
-
 **DuckDuckGo Search** — no signup, no key, no quota.
 Install: `pip install duckduckgo-search`. Used by NewsAgent as fallback only.
 
@@ -186,8 +182,6 @@ Choose models via `RESEARCH_MODEL`, `SCORING_MODEL`, `CONVERSATION_MODEL` env va
 ```bash
 # .env
 TAVILY_API_KEY=tvly-...
-REDDIT_CLIENT_ID=...
-REDDIT_CLIENT_SECRET=...
 OPENROUTER_API_KEY=sk-or-...
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
@@ -205,7 +199,6 @@ pydantic
 chainlit
 pyyaml                # SKILL.md frontmatter parsing
 tavily-python         # Tavily search client
-praw                  # Reddit API client (ForumAgent)
 duckduckgo-search     # News fallback — no key needed (NewsAgent)
 jinja2                # report generation
 python-dotenv
@@ -586,7 +579,7 @@ class Deps:
 `Deps` contains only per-request state — hub, board, and context. It is created
 fresh in `ResearchHandler.handle_request()` and discarded when the report is generated.
 
-Tool clients (Tavily, Fetch MCP, Reddit, DuckDuckGo) are **not** on `Deps`. Each
+Tool clients (Tavily, Fetch MCP, DuckDuckGo) are **not** on `Deps`. Each
 tool function owns its own client as a module-level singleton — created once at
 import/startup time, reused across all requests. See Section 8 for details.
 
@@ -1004,7 +997,7 @@ the tools registered on that specific agent.
 
 This is the key constraint: the tool set assigned at construction time limits what
 the LLM can do. There is no free orchestration. A `CareerAgent` cannot call
-Reddit tools because they were never registered on it.
+it cannot call `ddg_search` because that function was never registered on it.
 
 ### 8.2 Folder structure — `mcp/` vs `tools/`
 
@@ -1025,11 +1018,10 @@ mcp/
 tools/
 ├── search_tool.py          tavily_search — module-level TavilyClient singleton
 ├── fetch_tool.py           fetch_page — calls fetch singleton from mcp/fetch_client.py
-├── reddit_tool.py          reddit_search — module-level praw.Reddit singleton
 └── ddg_tool.py             ddg_search — module-level DDGS singleton
 ```
 
-Tavily, Reddit (PRAW), and DuckDuckGo are plain Python client libraries — no MCP
+Tavily and DuckDuckGo are plain Python client libraries — no MCP
 protocol. Only Fetch is an MCP server. Its singleton is managed in
 `mcp/fetch_client.py`. `tools/fetch_tool.py` calls it via `get_fetch_server()` —
 the tool function has no knowledge of how the client was constructed.
@@ -1162,14 +1154,10 @@ never reach the LLM.
 Fetch MCP fetches a specific URL — no date filtering needed, the URL is always
 explicit and targeted.
 
-Reddit (PRAW) and DuckDuckGo have no equivalent API parameter. Their wrappers
-filter by `created_utc` / publication date before returning results to the LLM:
+DuckDuckGo has no equivalent API parameter. Its wrapper filters by publication
+date before returning results to the LLM:
 
 ```python
-# reddit_tool.py — filter before returning
-cutoff = datetime.now().timestamp() - (730 * 24 * 60 * 60)
-posts = [p for p in raw_results if p.created_utc >= cutoff]
-
 # ddg_tool.py — filter before returning
 cutoff = datetime.now() - timedelta(days=730)
 items = [r for r in raw_results if r.get("date") and parse(r["date"]) >= cutoff]
@@ -1184,7 +1172,6 @@ secondary LLM-level check for items with ambiguous or missing dates.
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `tavily_search` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | |
 | `fetch_page` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | |
-| `reddit_search` | | | | | | | | ✓ | | | |
 | `ddg_search` | | | | | | | ✓ | | | | |
 
 `scoring` and `conversation` have no tools — they work entirely from the
@@ -1228,42 +1215,6 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
     not a search."""
     result = await fetch_client.call_tool("fetch", {"url": url})
     return json.dumps({"url": url, "content": result})
-```
-
-**`tools/reddit_tool.py`**
-
-```python
-import json
-import os
-from datetime import datetime
-import praw
-from pydantic_ai import RunContext
-from core.deps import Deps
-
-_client = praw.Reddit(
-    client_id=os.environ["REDDIT_CLIENT_ID"],
-    client_secret=os.environ["REDDIT_CLIENT_SECRET"],
-    user_agent="university-research-bot/1.0",
-)
-
-
-async def reddit_search(ctx: RunContext[Deps], query: str, subreddit: str = "all") -> str:
-    """Search Reddit via PRAW. Filters to last 730 days before returning.
-    ForumAgent only. Budget enforcement handled by agent closure."""
-    cutoff = datetime.now().timestamp() - (730 * 24 * 60 * 60)
-    raw = _client.subreddit(subreddit).search(query, limit=25)
-    posts = [
-        {
-            "title": p.title,
-            "body": p.selftext[:1000],
-            "score": p.score,
-            "url": p.url,
-            "created_utc": p.created_utc,
-            "subreddit": str(p.subreddit),
-        }
-        for p in raw if p.created_utc >= cutoff
-    ]
-    return json.dumps(posts)
 ```
 
 **`tools/ddg_tool.py`**
@@ -1316,7 +1267,7 @@ class CareerAgent(BaseAgent):
             tools=[self._make_search_tool(), fetch_page],
         )
 
-# ForumAgent — Tavily + Fetch + Reddit
+# ForumAgent — Tavily + Fetch (same tool set as all section agents)
 class ForumAgent(BaseAgent):
     def __init__(self, instructions: str, tool_budget: int) -> None:
         super().__init__(instructions=instructions)
@@ -1326,7 +1277,7 @@ class ForumAgent(BaseAgent):
             model=get_model("RESEARCH_MODEL"),
             deps_type=Deps,
             output_type=ForumOutput,
-            tools=[self._make_search_tool(), fetch_page, self._make_reddit_tool()],
+            tools=[self._make_search_tool(), fetch_page],
         )
 
 # NewsAgent — Tavily + Fetch + DuckDuckGo
@@ -1651,7 +1602,6 @@ university_research/
 ├── tools/
 │   ├── search_tool.py              tavily_search — module-level TavilyClient singleton
 │   ├── fetch_tool.py               fetch_page — calls get_fetch_server() from mcp/fetch_client.py
-│   ├── reddit_tool.py              reddit_search — module-level praw.Reddit singleton (ForumAgent)
 │   └── ddg_tool.py                 ddg_search — module-level DDGS singleton (NewsAgent)
 │
 ├── report/
@@ -1697,8 +1647,8 @@ are intentionally reused — they carry no per-request state.
 arrives before startup, `fetch_tool.py` raises `RuntimeError` immediately.
 `ResearchHandler` has no lifecycle responsibilities — it just handles requests.
 
-**Tool client singletons initialise at import time (Tavily, Reddit, DDGS)**
-These three clients read from `os.environ` when their modules are imported.
+**Tool client singletons initialise at import time (Tavily, DDGS)**
+These clients read from `os.environ` when their modules are imported.
 If `.env` is not loaded before the modules are imported, they will raise
 `KeyError`. Always call `load_dotenv()` before any tool module is imported.
 
@@ -1737,11 +1687,10 @@ alternatives, and conversation skills entirely.
 shared `Deps`, two agents increment the same counter. Each agent must own
 `self._calls_made` and reset it to `0` at the start of its `handle()` call.
 
-**`reddit_tool` and `ddg_tool` must filter by date before returning**
-Tavily enforces `days=730` mechanically. Reddit and DuckDuckGo do not.
-Both wrappers must filter results by `created_utc` / publication date before
-returning to the LLM — not rely solely on the SKILL.md instruction to discard
-old results.
+**`ddg_tool` must filter by date before returning**
+Tavily enforces `days=730` mechanically. DuckDuckGo does not.
+The wrapper must filter results by publication date before returning to the LLM
+— not rely solely on the SKILL.md instruction to discard old results.
 
 ---
 
@@ -1754,11 +1703,11 @@ verifiable. No stage is purely structural.
 |---|---|---|
 | 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
 | 1a | MessageHub (closure pattern), Blackboard, Deps (hub + board + context only — no tool clients), all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
-| 1b | `mcp/fetch_client.py` (singleton with `get_fetch_server()` / `close_fetch_server()`). `tools/` — `search_tool.py` (module-level TavilyClient, `days=730`), `fetch_tool.py` (calls `get_fetch_server()`), `reddit_tool.py` (module-level PRAW + date filter), `ddg_tool.py` (module-level DDGS + date filter). `ResearchHandler.startup()` warms up Fetch MCP. | Real searches confirmed against university targets. Date filter verified for all four tools. Fetch MCP server starts cleanly. |
+| 1b | `mcp/fetch_client.py` (singleton with `get_fetch_server()` / `close_fetch_server()`). `tools/` — `search_tool.py` (module-level TavilyClient, `days=730`), `fetch_tool.py` (calls `get_fetch_server()`), `ddg_tool.py` (module-level DDGS + date filter). `ResearchHandler.startup()` warms up Fetch MCP. | Real searches confirmed against university targets. Date filter verified for all tools. Fetch MCP server starts cleanly. |
 | 1c | `CareerAgent` end-to-end — pydantic-ai Agent with `tavily_search` + `fetch_page` tools, budget-aware closure, `subscribe()` + `get_instruction()`, `handle()` resets `_calls_made` | `board.career` populated from real data via CLI |
 | 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same tool set as CareerAgent (Tavily + Fetch), same pattern | `board.background`, `board.rankings`, `board.program` populated via CLI |
 | 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` — NewsAgent additionally registered with `ddg_search` tool | `board.employability`, `board.accommodation`, `board.news` populated via CLI — DuckDuckGo fallback exercised |
-| 1f | `ForumAgent` — additionally registered with `reddit_search` tool, highest budget | `board.forum` populated via CLI — Reddit API + Tavily `site:` queries confirmed |
+| 1f | `ForumAgent` — Tavily + Fetch, highest budget, strict scope rules across 5 confirmed forum sources | `board.forum` populated via CLI — TSR, StudentCrowd, WhatUni, Quora, Reddit snippets via Tavily confirmed |
 | 2a | `ScoringAgent` + quorum gate — no tools, reads blackboard only, asyncio.Lock | `board.score` populated after all 7 section agents complete — lock verified, partial results handled |
 | 2b | `AlternativesAgent` (Tavily + Fetch) + `ReportGenerator` (Jinja2, no LLM) | `score.json` and `report.md` generated from CLI for real university |
 | 2c | Chainlit UI Mode 1 + Mode 2 + `ConversationAgent` (no tools, reads blackboard) | Full pipeline from UI with live progress, follow-up questions answered |
