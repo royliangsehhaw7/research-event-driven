@@ -24,6 +24,7 @@ class FetchClient:
     async def startup(self) -> None:
         """Start the MCP fetch server subprocess and open a session."""
         from contextlib import AsyncExitStack
+        
         self._exit_stack = AsyncExitStack()
         server_params = StdioServerParameters(
             command="uvx",

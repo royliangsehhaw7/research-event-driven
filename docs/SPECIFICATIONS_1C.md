@@ -73,46 +73,58 @@ from typing import Literal
 
 
 class CareerPath(BaseModel):
-    title: str                  # job title — e.g. "Software Engineer"
-    description: str            # 1–2 sentences: what the role involves
-    typical_employers: list[str]  # named companies or sectors, country-scoped
-    salary_range_local: str     # local currency — e.g. "£35,000–£60,000"
-    seniority_note: str         # e.g. "entry-level to mid", "graduate scheme entry"
+    title:             str        # e.g. "Software Engineer"
+    description:       str        # typical responsibilities and progression
+    typical_companies: list[str]  # named employers, not generic "tech companies"
 
 
-class JobPostingSnapshot(BaseModel):
-    query_used: str             # the search query that found this snapshot
-    approximate_volume: str     # e.g. "~1,200 live postings", "limited market"
-    top_skill_keywords: list[str]  # extracted from postings — max 10
-    source_url: str
-    source_date: str            # ISO date or "approx YYYY-MM"
+class SalaryRange(BaseModel):
+    career_path:  str
+    entry_level:  str   # e.g. "£28,000–£35,000"
+    mid_level:    str
+    senior_level: str
+    currency:     str   # ISO code: "GBP", "AUD", "USD"
+    country:      str   # must match ResearchContext.country
+
+
+class JobPosting(BaseModel):
+    company:         str
+    role_title:      str
+    required_skills: list[str]
+    date_posted:     str   # ISO date string
+    source_url:      str
 
 
 class CareerSource(BaseModel):
-    url: str
-    title: str
-    date: str | None            # publication date, or None if unavailable
+    url:  str
+    date: str
+    type: str   # "job_board", "salary_survey", "industry_report"
 
 
 class CareerOutput(BaseModel):
-    career_paths: list[CareerPath]      # 3–6 distinct career paths
-    job_posting_snapshot: JobPostingSnapshot | None  # may be None if search returned nothing
-    in_demand_skills: list[str]         # deduplicated across all postings found — max 15
-    salary_context: str                 # 1 paragraph: ranges, currency, seniority notes
-    country_scope: str                  # the country used to scope all searches — from context
-    confidence: Literal["high", "medium", "low"]
-    sources: list[CareerSource]
-    notes: str                          # empty string if no edge cases; otherwise explain gaps
+    career_paths:     list[CareerPath]   # minimum 3
+    salary_ranges:    list[SalaryRange]  # one per career path
+    job_postings:     list[JobPosting]   # 10–15 minimum
+    in_demand_skills: list[str]          # top 5–8 extracted across postings
+    country_scope:    str                # the country used to scope all searches — from context
+    confidence:       Literal["high", "medium", "low"]
+    sources:          list[CareerSource]
+    notes:            str                # empty string if no edge cases; otherwise explain gaps
 ```
 
-**Why `career_paths` is a list not a single object:** a Computer Science
-graduate does not enter a single career. The list lets downstream agents
-(particularly `EmployabilityAgent`) iterate over paths when scoping
-employment searches.
+**Why `SalaryRange` is a separate model not a string on `CareerPath`:**
+entry/mid/senior breakdown gives `ScoringAgent` and `EmployabilityAgent`
+structured data to work with. A string like `"£35,000–£60,000"` requires
+parsing; a structured model does not.
 
-**Why `job_posting_snapshot` is nullable:** some courses have thin job
-posting coverage in search results — especially niche programmes. Returning
-`None` with a note is better than forcing a low-quality snapshot.
+**Why `currency` is an ISO code:** the report renderer can format figures
+correctly without guessing from the country name. `"GBP"` is unambiguous;
+`"UK pounds"` is not.
+
+**Why `job_postings` is a list of real postings not a snapshot summary:**
+named companies and required skills from actual postings give downstream
+agents (`EmployabilityAgent`, `ForumAgent`) concrete data to cross-reference
+rather than an aggregated summary they cannot decompose.
 
 **Why `country_scope` is on the output:** downstream agents read
 `board.career` and need to know which country was used for salary scoping —
@@ -193,14 +205,17 @@ and soft skills only if they appear in multiple independent sources.
 
 ## Output Requirements
 
-- `career_paths`: minimum 3, maximum 6. Each must have all fields populated.
-- `in_demand_skills`: maximum 15. No duplicates.
-- `salary_context`: one paragraph summarising ranges, currency, seniority
-  context, and data source quality.
+- `career_paths`: minimum 3. Each must have `title`, `description`, and
+  `typical_companies` populated with named employers, not generic sectors.
+- `salary_ranges`: one entry per career path. All three levels required —
+  entry, mid, senior. Use ISO currency code. Country must match context.
+- `job_postings`: 10–15 minimum. Each must have company name, role title,
+  required skills, date posted, and source URL.
+- `in_demand_skills`: top 5–8 only. Extracted from job postings, deduplicated.
 - `country_scope`: copy the country from your context — do not derive it.
 - `confidence`: "high" if 5+ sources confirm career paths and salary ranges;
   "medium" if 3–4 sources; "low" if fewer than 3.
-- `sources`: every URL you used. Include date if available.
+- `sources`: every URL you used. Include date and type.
 - `notes`: empty string unless you hit edge cases (thin results, ambiguous
   country, conflicting salary data).
 
@@ -247,6 +262,7 @@ from schemas.messages.career_completed import CareerResearchCompletedMessage
 from schemas.messages.progress_update import ProgressUpdateMessage
 from schemas.outputs.career_output import CareerOutput
 from tools.fetch_tool import fetch_page
+from tools.search_tool import tavily_search as _tavily_search
 
 logger = logging.getLogger("career_agent")
 
@@ -258,7 +274,7 @@ class CareerAgent(BaseAgent):
     Writes to:     board.career (CareerOutput)
     Fires:         CareerResearchCompletedMessage
 
-    Tools: tavily_search (budget-capped), fetch_page (uncapped)
+    Tools: tavily_search (budget-capped via _make_search_tool), fetch_page (uncapped)
     """
 
     def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
@@ -271,8 +287,32 @@ class CareerAgent(BaseAgent):
             deps_type=Deps,
             output_type=CareerOutput,
             system_prompt=self.get_instruction(),
-            tools=[self._make_search_tool(), fetch_page],
+            tools=[
+                self._make_search_tool(),
+                fetch_page,
+            ],
         )
+
+    def _make_search_tool(self):
+        """Return a budget-aware tavily_search closure over this agent instance."""
+        agent_self = self
+
+        async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
+            """Search the web via Tavily. Budget-capped per agent instance."""
+            if agent_self._calls_made >= agent_self._tool_budget:
+                logger.warning(
+                    "career_agent | budget exhausted (%d/%d) — query=%r",
+                    agent_self._calls_made, agent_self._tool_budget, query,
+                )
+                return json.dumps({
+                    "error": "tool budget exhausted",
+                    "calls_made": agent_self._calls_made,
+                    "budget": agent_self._tool_budget,
+                })
+            agent_self._calls_made += 1
+            return await _tavily_search(ctx, query)
+
+        return tavily_search
 
     # ── BaseAgent interface ───────────────────────────────────────────────────
 
@@ -320,7 +360,7 @@ class CareerAgent(BaseAgent):
 
     async def handle(self, message, deps: Deps) -> None:
         """Run career research and fire CareerResearchCompletedMessage."""
-        self._calls_made = 0   # reset on instance, not on deps
+        self._calls_made = 0   # reset counter on each run
 
         logger.info(
             "career_agent | starting — university=%r course=%r country=%r",
@@ -374,67 +414,27 @@ class CareerAgent(BaseAgent):
             triggered_by="career_agent",
             timestamp=datetime.now().isoformat(),
         ))
-
-    # ── Tool factory ─────────────────────────────────────────────────────────
-
-    def _make_search_tool(self):
-        """Return a budget-aware tavily_search closure over this agent instance."""
-        agent_self = self
-
-        async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
-            """Search the web via Tavily. Enforces days=730 on every call.
-            Returns an error dict if the tool budget is exhausted."""
-            if agent_self._calls_made >= agent_self._tool_budget:
-                logger.warning(
-                    "career_agent | tool budget exhausted (%d/%d) — query=%r",
-                    agent_self._calls_made, agent_self._tool_budget, query,
-                )
-                return json.dumps({
-                    "error": "tool budget exhausted",
-                    "query": query,
-                    "calls_made": agent_self._calls_made,
-                    "budget": agent_self._tool_budget,
-                })
-            agent_self._calls_made += 1
-            logger.debug(
-                "career_agent | tavily_search call %d/%d — query=%r",
-                agent_self._calls_made, agent_self._tool_budget, query,
-            )
-            from tools.search_tool import _client as tavily_client
-            response = await tavily_client.search(query, max_results=5)
-            return json.dumps({
-                "query": response.query,
-                "results": [
-                    {
-                        "url": r.url,
-                        "title": r.title,
-                        "content": r.content,
-                        "score": r.score,
-                        "date": r.date,
-                    }
-                    for r in response.results
-                ],
-            })
-
-        return tavily_search
 ```
 
-**Why `system_prompt` in the constructor, not in `agent.run()`:** pydantic-ai's
-`Agent` accepts `system_prompt` at construction time. This is where the
-SKILL.md body is injected, via `get_instruction()`. The task brief passed to
-`agent.run()` is the per-request context (university, course, country) — not
-the behavioural instructions.
+**Why `_make_search_tool()` is on the agent, not in a separate factory file:**
+budget enforcement closes over `self` — `agent_self._calls_made` and
+`agent_self._tool_budget`. Since the closure already needs the instance,
+putting it on the agent is the natural fit. A separate factory would require
+passing a mutable counter ref as an argument, which is a workaround for a
+problem that doesn't exist when the closure owns `self` directly. Every agent
+defines its own `_make_search_tool()` — the pattern is identical across all of
+them, just with a different logger name.
+
+**Why `_calls_made` is a plain `int` not `[0]`:** the closure captures `agent_self`
+(the instance), not a bare local variable. `agent_self._calls_made += 1` is an
+attribute assignment on the instance, not a rebind of a local name — Python
+allows this without a `list` wrapper.
 
 **Why `CareerResearchCompletedMessage` fires even on failure:** if the LLM
 call throws, `board.career` is `None`. The seven section agents still need to
 run — they handle a `None` career gracefully, scoping their own searches without
 career context. If the message never fires, the entire pipeline stalls. Firing
 always is the correct behaviour.
-
-**Why `_calls_made = 0` at the top of `handle()` and not in `reset()`:**
-`reset()` is called once before `subscribe()`. `handle()` may be called
-multiple times in tests. Resetting in `handle()` guarantees a clean counter
-on each actual run regardless of test order.
 
 ---
 
@@ -726,10 +726,11 @@ async def fetch_server():
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 def test_career_output_imports_cleanly() -> None:
-    from schemas.outputs.career_output import CareerOutput, CareerPath, JobPostingSnapshot, CareerSource
+    from schemas.outputs.career_output import CareerOutput, CareerPath, SalaryRange, JobPosting, CareerSource
     assert CareerOutput
     assert CareerPath
-    assert JobPostingSnapshot
+    assert SalaryRange
+    assert JobPosting
     assert CareerSource
 
 
@@ -819,26 +820,6 @@ async def test_career_agent_subscribes_to_research_requested() -> None:
     assert len(called) == 1
 
 
-# ── Budget enforcement ────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_budget_exhausted_returns_error_dict() -> None:
-    import json
-    from agents.career_agent import CareerAgent
-    from unittest.mock import MagicMock
-
-    agent = CareerAgent(tool_budget=2)
-    agent._calls_made = 2   # budget already at limit
-
-    search_tool = agent._make_search_tool()
-    ctx = MagicMock()
-    raw = await search_tool(ctx, "test query")
-    result = json.loads(raw)
-
-    assert result["error"] == "tool budget exhausted"
-    assert result["query"] == "test query"
-
-
 # ── LLM integration (real API call) ──────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -854,7 +835,9 @@ async def test_career_agent_populates_board_career(fetch_server) -> None:
     )
 
     assert board.career is not None, "board.career is None — CareerAgent failed"
-    assert len(board.career.career_paths) >= 1, "Expected at least 1 career path"
+    assert len(board.career.career_paths) >= 3, "Expected at least 3 career paths"
+    assert len(board.career.salary_ranges) >= 1, "Expected at least 1 salary range"
+    assert len(board.career.job_postings) >= 1, "Expected at least 1 job posting"
     assert board.career.country_scope == "UK"
     assert board.career.confidence in ("high", "medium", "low")
     assert isinstance(board.career.sources, list)
@@ -922,11 +905,10 @@ tests/test_stage_1c.py::test_career_agent_constructs PASSED
 tests/test_stage_1c.py::test_career_agent_reset_clears_calls_made PASSED
 tests/test_stage_1c.py::test_get_instruction_includes_skill_body PASSED
 tests/test_stage_1c.py::test_career_agent_subscribes_to_research_requested PASSED
-tests/test_stage_1c.py::test_budget_exhausted_returns_error_dict PASSED
 tests/test_stage_1c.py::test_career_agent_populates_board_career PASSED
 tests/test_stage_1c.py::test_career_agent_fires_completed_message PASSED
 
-10 passed in X.Xs
+9 passed in X.Xs
 ```
 
 The last two tests make real API calls. They take 10–30 seconds depending on
@@ -956,9 +938,12 @@ INFO | fetch_client | Fetch MCP server stopped
 
 Followed by `board.career` JSON printed to stdout. Confirm:
 
-- `career_paths` contains 3–6 items with `title`, `salary_range_local`,
-  and `typical_employers` populated
-- `country_scope` is `"UK"` (not `"United Kingdom"` or anything else)
+- `career_paths` contains 3+ items with `title`, `description`, and
+  `typical_companies` populated with named employers
+- `salary_ranges` contains one entry per career path with entry/mid/senior
+  levels, ISO currency code, and country matching `"UK"`
+- `job_postings` contains 10+ items with company, role title, skills, date, URL
+- `country_scope` is `"UK"`
 - `confidence` is `"high"` or `"medium"` for a well-known university
 - `sources` contains at least 2 URLs
 
@@ -1007,13 +992,13 @@ can happen for niche courses or when Tavily returns sparse results. Inspect the
 ## Stage 1c Completion Checklist
 
 - [ ] `schemas/outputs/career_output.py` — `CareerOutput`, `CareerPath`,
-      `JobPostingSnapshot`, `CareerSource` implemented
+      `SalaryRange`, `JobPosting`, `CareerSource` implemented
 - [ ] `skills/career/SKILL.md` — frontmatter valid, `tool_budget` set,
       instructions body present
 - [ ] `core/llm_factory.py` — `get_model()` reads from env, returns
       pydantic-ai `OpenAIModel` configured for OpenRouter
-- [ ] `agents/career_agent.py` — `CareerAgent` implemented with
-      `_make_search_tool()` budget closure, `subscribe()`, `get_instruction()`,
+- [ ] `agents/career_agent.py` — `CareerAgent` implemented with `_calls_made = 0`,
+      `_make_search_tool()` method on the class, `subscribe()`, `get_instruction()`,
       `handle()`, `reset()`
 - [ ] `services/research_handler.py` — minimal Stage 1c version — loads career
       skill, constructs `CareerAgent`, wires it, publishes trigger
@@ -1021,7 +1006,7 @@ can happen for niche courses or when Tavily returns sparse results. Inspect the
       handler, `shutdown()` in `finally`, prints `board.career`
 - [ ] `schemas/messages/research_requested.py` — `country` field confirmed present
 - [ ] `schemas/messages/career_completed.py` — no-payload message confirmed
-- [ ] `pytest tests/test_stage_1c.py -v` — 10 passed
+- [ ] `pytest tests/test_stage_1c.py -v` — 9 passed
 - [ ] `python main.py` — `board.career` printed with real data, `confidence`
       is `"high"` or `"medium"` for University of Manchester Computer Science
 - [ ] Stage 1b tests still pass: `pytest tests/test_stage_1b.py -v`

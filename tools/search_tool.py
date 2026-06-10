@@ -1,11 +1,17 @@
+# tools/search_tool.py
 from __future__ import annotations
 
+import json as _json
 import logging
 import os
+import os as _os
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
+from pydantic_ai import RunContext
 from tavily import TavilyClient
+
+from core.deps import Deps
 
 logger = logging.getLogger("search_tool")
 
@@ -28,7 +34,6 @@ class SearchResponse:
     answer:  str | None   # Tavily's synthesised answer, if requested
 
 
-
 class TavilySearchTool:
     """Tavily search wrapper. Enforces days=730 on every call.
 
@@ -44,8 +49,12 @@ class TavilySearchTool:
     def __init__(self, api_key: str | None = None) -> None:
         load_dotenv()
         key = api_key or os.getenv("TAVILY_API_KEY")
+        if not key:
+            raise EnvironmentError(
+                "TAVILY_API_KEY not set. Check your .env file. "
+                "Get a key at https://app.tavily.com"
+            )
         self._client = TavilyClient(api_key=key)
-
         logger.info("search_tool | TavilySearchTool initialised")
 
     async def search(
@@ -104,3 +113,30 @@ class TavilySearchTool:
             results=results,
             answer=raw.get("answer"),
         )
+
+
+# ── Module-level singleton and tool function ──────────────────────────────────
+# Agents import tavily_search and wrap it in _make_search_tool() to add
+# budget enforcement. tavily_search is never registered on an agent directly.
+
+_client = TavilySearchTool(api_key=_os.environ["TAVILY_API_KEY"])
+
+
+async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
+    """Bare Tavily search. days=730 always enforced.
+    Never register this directly on an agent — agents wrap it via
+    _make_search_tool() to add budget enforcement."""
+    response = await _client.search(query, max_results=5)
+    return _json.dumps({
+        "query": response.query,
+        "results": [
+            {
+                "url": r.url,
+                "title": r.title,
+                "content": r.content,
+                "score": r.score,
+                "date": r.date,
+            }
+            for r in response.results
+        ],
+    })

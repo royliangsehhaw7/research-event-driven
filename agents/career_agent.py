@@ -1,10 +1,10 @@
+# agents/career_agent.py
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent
 
 from agents.base_agent import BaseAgent
 from core.deps import Deps
@@ -13,6 +13,7 @@ from schemas.messages.career_completed import CareerResearchCompletedMessage
 from schemas.messages.progress_update import ProgressUpdateMessage
 from schemas.outputs.career_output import CareerOutput
 from tools.fetch_tool import fetch_page
+from tools.search_tool_factory import make_search_tool
 
 logger = logging.getLogger("career_agent")
 
@@ -24,20 +25,23 @@ class CareerAgent(BaseAgent):
     Writes to:     board.career (CareerOutput)
     Fires:         CareerResearchCompletedMessage
 
-    Tools: tavily_search (budget-capped), fetch_page (uncapped)
+    Tools: tavily_search (budget-capped via make_search_tool), fetch_page (uncapped)
     """
 
     def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
         super().__init__(instructions=instructions)
-        self._tool_budget = tool_budget
-        self._calls_made  = 0
+        self._tool_budget  = tool_budget
+        self._calls_made   = [0]   # mutable ref passed to closure
 
         self._agent = Agent(
             model=get_model("RESEARCH_MODEL"),
             deps_type=Deps,
             output_type=CareerOutput,
             system_prompt=self.get_instruction(),
-            tools=[self._make_search_tool(), fetch_page],
+            tools=[
+                make_search_tool("career_agent", self._calls_made, self._tool_budget),
+                fetch_page,
+            ],
         )
 
     # ── BaseAgent interface ───────────────────────────────────────────────────
@@ -80,13 +84,13 @@ class CareerAgent(BaseAgent):
 
     def reset(self) -> None:
         """Reset per-request state. Called by ResearchHandler before each request."""
-        self._calls_made = 0
+        self._calls_made[0] = 0
 
     # ── Core handler ─────────────────────────────────────────────────────────
 
     async def handle(self, message, deps: Deps) -> None:
         """Run career research and fire CareerResearchCompletedMessage."""
-        self._calls_made = 0   # reset on instance, not on deps
+        self._calls_made[0] = 0   # reset counter on each run
 
         logger.info(
             "career_agent | starting — university=%r course=%r country=%r",
@@ -140,46 +144,3 @@ class CareerAgent(BaseAgent):
             triggered_by="career_agent",
             timestamp=datetime.now().isoformat(),
         ))
-
-    # ── Tool factory ─────────────────────────────────────────────────────────
-
-    def _make_search_tool(self):
-        """Return a budget-aware tavily_search closure over this agent instance."""
-        agent_self = self
-
-        async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
-            """Search the web via Tavily. Enforces days=730 on every call.
-            Returns an error dict if the tool budget is exhausted."""
-            if agent_self._calls_made >= agent_self._tool_budget:
-                logger.warning(
-                    "career_agent | tool budget exhausted (%d/%d) — query=%r",
-                    agent_self._calls_made, agent_self._tool_budget, query,
-                )
-                return json.dumps({
-                    "error": "tool budget exhausted",
-                    "query": query,
-                    "calls_made": agent_self._calls_made,
-                    "budget": agent_self._tool_budget,
-                })
-            agent_self._calls_made += 1
-            logger.debug(
-                "career_agent | tavily_search call %d/%d — query=%r",
-                agent_self._calls_made, agent_self._tool_budget, query,
-            )
-            from tools.search_tool import _client as tavily_client
-            response = await tavily_client.search(query, max_results=5)
-            return json.dumps({
-                "query": response.query,
-                "results": [
-                    {
-                        "url": r.url,
-                        "title": r.title,
-                        "content": r.content,
-                        "score": r.score,
-                        "date": r.date,
-                    }
-                    for r in response.results
-                ],
-            })
-
-        return tavily_search

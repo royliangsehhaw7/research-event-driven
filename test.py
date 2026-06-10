@@ -1,5 +1,5 @@
 import asyncio
-from tools.search_tool import TavilySearchTool
+from tools.tavily_tool import TavilySearchTool
 
 # 1. Keep it as a normal async function for debugging
 async def debug_tavily() -> None:

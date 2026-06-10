@@ -64,14 +64,17 @@ and soft skills only if they appear in multiple independent sources.
 
 ## Output Requirements
 
-- `career_paths`: minimum 3, maximum 6. Each must have all fields populated.
-- `in_demand_skills`: maximum 15. No duplicates.
-- `salary_context`: one paragraph summarising ranges, currency, seniority
-  context, and data source quality.
+- `career_paths`: minimum 3. Each must have `title`, `description`, and
+  `typical_companies` populated with named employers, not generic sectors.
+- `salary_ranges`: one entry per career path. All three levels required —
+  entry, mid, senior. Use ISO currency code. Country must match context.
+- `job_postings`: 10–15 minimum. Each must have company name, role title,
+  required skills, date posted, and source URL.
+- `in_demand_skills`: top 5–8 only. Extracted from job postings, deduplicated.
 - `country_scope`: copy the country from your context — do not derive it.
 - `confidence`: "high" if 5+ sources confirm career paths and salary ranges;
   "medium" if 3–4 sources; "low" if fewer than 3.
-- `sources`: every URL you used. Include date if available.
+- `sources`: every URL you used. Include date and type.
 - `notes`: empty string unless you hit edge cases (thin results, ambiguous
   country, conflicting salary data).
 

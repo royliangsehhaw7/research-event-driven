@@ -137,6 +137,9 @@ never silently omits a section.
 | **Tavily** | Python client | Primary search — all agents. Key feature: `days=730` date filter | `TAVILY_API_KEY` |
 | **Fetch MCP** | MCP server | Direct URL fetch for university catalog pages, rankings pages | None — open |
 | **DuckDuckGo Search** | Python client | NewsAgent fallback when Tavily misses news. No key, no quota | None — no key needed |
+>[!WARNING]
+> DDG will NOT be wired up first as it does NOT filter by dates
+>
 
 **Fetch MCP is the only MCP server in the stack.** Tavily and DuckDuckGo are
 plain Python client libraries — no MCP protocol involved.
@@ -998,7 +1001,7 @@ the tools registered on that specific agent.
 
 This is the key constraint: the tool set assigned at construction time limits what
 the LLM can do. There is no free orchestration. A `CareerAgent` cannot call
-it cannot call `ddg_search` because that function was never registered on it.
+`ddg_search` because that function was never registered on it.
 
 ### 8.2 Folder structure — `mcp/` vs `tools/`
 
@@ -1173,7 +1176,7 @@ secondary LLM-level check for items with ambiguous or missing dates.
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | `tavily_search` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | |
 | `fetch_page` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | |
-| `ddg_search` | | | | | | | ✓ | | | | |
+| `ddg_search` | | | | | | |  | | | | |
 
 `scoring` and `conversation` have no tools — they work entirely from the
 blackboard. `tool_budget: 0` in their SKILL.md makes this explicit.
@@ -1206,7 +1209,7 @@ async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
 import json
 from pydantic_ai import RunContext
 from core.deps import Deps
-from mcps.fetch_client import fetch_client
+from mcp.fetch_client import fetch_client
 
 
 async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
@@ -1230,11 +1233,13 @@ from core.deps import Deps
 
 _client = DDGS()
 
-
 async def ddg_search(ctx: RunContext[Deps], query: str) -> str:
     """Search via DuckDuckGo. NewsAgent fallback when Tavily misses news items.
     Filters to last 730 days before returning.
-    Budget enforcement handled by agent closure."""
+    Budget enforcement handled by agent closure.
+    
+    CURRENTLY NOT WIRED TO ANY AGENTS
+    """
     cutoff = datetime.now() - timedelta(days=730)
     raw = _client.text(query, max_results=10)
     items = []
@@ -1247,6 +1252,10 @@ async def ddg_search(ctx: RunContext[Deps], query: str) -> str:
             pass   # discard items with unparseable dates
     return json.dumps(items)
 ```
+>[!WARNING]
+> DDG will NOT be wired up first as it does NOT filter by dates
+>
+
 
 ### 8.8 How tools attach to agents
 
@@ -1304,7 +1313,7 @@ shutdown responsibilities.
 **Chainlit (`ui/app.py`):**
 
 ```python
-from mcps.fetch_client import fetch_client
+from mcp.fetch_client import fetch_client
 
 @cl.on_chat_start
 async def start():
@@ -1319,7 +1328,7 @@ async def end():
 
 ```python
 from contextlib import asynccontextmanager
-from mcps.fetch_client import fetch_client
+from mcp.fetch_client import fetch_client
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1333,7 +1342,7 @@ app = FastAPI(lifespan=lifespan)
 **CLI (`main.py`):**
 
 ```python
-from mcps.fetch_client import fetch_client
+from mcp.fetch_client import fetch_client
 
 async def main():
     await fetch_client.startup()
@@ -1367,8 +1376,8 @@ Every agent's `handle()` method signature is:
 
 ```python
 async def handle(self, message: SomeMessage, deps: Deps) -> None:
-    # reset budget counter for this request
-    deps.calls_made = 0
+    # reset budget counter for this request — counter lives on the agent instance
+    self._calls_made = 0
     ...
 ```
 
@@ -1560,7 +1569,7 @@ university_research/
 │   └── skill_loader.py             SkillMeta + load_skill() + scan_skills_dir()
 │
 ├── mcp/
-│   └── fetch_client.py             Fetch MCP singleton — get_fetch_server() / close_fetch_server()
+│   └── fetch_client.py             Fetch MCP singleton — startup() / shutdown() / call_tool()
 │
 ├── schemas/
 │   ├── messages/                   lean hub notifications
@@ -1602,7 +1611,7 @@ university_research/
 │
 ├── tools/
 │   ├── search_tool.py              tavily_search — module-level TavilyClient singleton
-│   ├── fetch_tool.py               fetch_page — calls get_fetch_server() from mcp/fetch_client.py
+│   ├── fetch_tool.py               fetch_page — calls fetch_client.call_tool() from mcp/fetch_client.py
 │   └── ddg_tool.py                 ddg_search — module-level DDGS singleton (NewsAgent)
 │
 ├── report/
@@ -1687,11 +1696,16 @@ alternatives, and conversation skills entirely.
 `asyncio.gather()` runs section agents concurrently. If `calls_made` is on
 shared `Deps`, two agents increment the same counter. Each agent must own
 `self._calls_made` and reset it to `0` at the start of its `handle()` call.
+The budget closure captures `self` — incrementing `self._calls_made` inside
+`_make_search_tool()` is safe across the closure boundary.
 
 **`ddg_tool` must filter by date before returning**
 Tavily enforces `days=730` mechanically. DuckDuckGo does not.
 The wrapper must filter results by publication date before returning to the LLM
 — not rely solely on the SKILL.md instruction to discard old results.
+
+**DuckDuckGo** date filtering is unreliable — do not wire to any agent
+DDG has no API-level date range parameter equivalent to Tavily's days=730. Post-call filtering on the date field is insufficient — results with missing or unparseable dates pass through silently, and the LLM cannot reliably distinguish a 2009 post from a 2024 one when no date is present. `ddg_tool.py` is retained for future use if a reliable date-filtering solution becomes available, but must not be registered on any agent until that guarantee exists. NewsAgent handles sparse Tavily results via confidence: "low" — not by falling back to DDG.
 
 ---
 
@@ -1707,7 +1721,7 @@ verifiable. No stage is purely structural.
 | 1b | `mcp/fetch_client.py` (singleton with `get_fetch_server()` / `close_fetch_server()`). `tools/` — `search_tool.py` (module-level TavilyClient, `days=730`), `fetch_tool.py` (calls `get_fetch_server()`), `ddg_tool.py` (module-level DDGS + date filter). `ResearchHandler.startup()` warms up Fetch MCP. | Real searches confirmed against university targets. Date filter verified for all tools. Fetch MCP server starts cleanly. |
 | 1c | `CareerAgent` end-to-end — pydantic-ai Agent with `tavily_search` + `fetch_page` tools, budget-aware closure, `subscribe()` + `get_instruction()`, `handle()` resets `_calls_made` | `board.career` populated from real data via CLI |
 | 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same tool set as CareerAgent (Tavily + Fetch), same pattern | `board.background`, `board.rankings`, `board.program` populated via CLI |
-| 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` — NewsAgent additionally registered with `ddg_search` tool | `board.employability`, `board.accommodation`, `board.news` populated via CLI — DuckDuckGo fallback exercised |
+| 1e | EmployabilityAgent + AccommodationAgent + NewsAgent — all three use Tavily + Fetch only. NewsAgent sets confidence: "low" when news results are sparse | board.employability, board.accommodation, board.news populated from a single pipeline run |
 | 1f | `ForumAgent` — Tavily + Fetch, highest budget, strict scope rules across 5 confirmed forum sources | `board.forum` populated via CLI — TSR, StudentCrowd, WhatUni, Quora, Reddit snippets via Tavily confirmed |
 | 2a | `ScoringAgent` + quorum gate — no tools, reads blackboard only, asyncio.Lock | `board.score` populated after all 7 section agents complete — lock verified, partial results handled |
 | 2b | `AlternativesAgent` (Tavily + Fetch) + `ReportGenerator` (Jinja2, no LLM) | `score.json` and `report.md` generated from CLI for real university |

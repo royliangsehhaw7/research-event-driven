@@ -58,6 +58,7 @@ def main() -> None:
 
     if args.validate_env:
         print("\nEnvironment validation:")
+        
         ok = validate_env()
         if ok:
             print("\n  All required keys present. Environment is ready.\n")
