@@ -238,9 +238,9 @@ class Deps:
     Agents read context, write to board, publish via hub.
     Never share a Deps instance across requests.
 
-    Tool clients (Tavily, Fetch MCP, DuckDuckGo) are NOT on Deps.
+    Tool clients (Tavily, Fetch MCP) are NOT on Deps.
     Each tool owns its own client:
-      - Tavily, DuckDuckGo: module-level singletons in their tools/ file
+      - Tavily: module-level singleton in tools/search_tool.py
       - Fetch MCP: FetchClient singleton in mcp/fetch_client.py, exposed as
         the module-level `fetch_client` instance
 
@@ -262,15 +262,14 @@ derive country themselves — different agents could derive it differently.
 ResearchHandler derives it once, sets it on `ResearchContext`, and all agents
 read the same value.
 
-**Why tool clients are not on `Deps`:** Tavily and DuckDuckGo are
-module-level singletons in their `tools/` files — stateless across requests,
-no lifecycle needed. Fetch MCP is a `FetchClient` class singleton in
-`mcp/fetch_client.py` — it requires async lifecycle management (`startup()` /
-`shutdown()`), which is the app entry point's responsibility, not `Deps`.
-Keeping all clients off `Deps` also makes the per-agent tool set explicit:
-`CareerAgent` registers `tavily_search` and `fetch_page` at construction time;
-it cannot call `ddg_search` because that function was never registered on it,
-regardless of what is on `Deps`.
+**Why tool clients are not on `Deps`:** Tavily is a module-level singleton
+in `tools/search_tool.py` — stateless across requests, no lifecycle needed.
+Fetch MCP is a `FetchClient` class singleton in `mcp/fetch_client.py` — it
+requires async lifecycle management (`startup()` / `shutdown()`), which is
+the app entry point's responsibility, not `Deps`. Keeping all clients off
+`Deps` also makes the per-agent tool set explicit: `CareerAgent` registers
+`tavily_search` and `fetch_page` at construction time; it cannot call a tool
+that was never registered on it, regardless of what exists elsewhere.
 
 **Why `tool_budget`/`calls_made` are not on `Deps`:**
 budget counters are per-agent state — if they lived on shared `Deps`, concurrent
@@ -831,7 +830,7 @@ lines. The `key` field must match the folder name exactly.
 | `skills/program/` | `program` | `5` | `program` | |
 | `skills/employability/` | `employability` | `8` | `employability` | Reads `board.career` |
 | `skills/accommodation/` | `accommodation` | `6` | `accommodation` | |
-| `skills/news/` | `news` | `6` | `news` | DuckDuckGo fallback documented |
+| `skills/news/` | `news` | `6` | `news` | Tavily only — sets confidence: low if sparse |
 | `skills/forum/` | `forum` | `10` | `forum` | TSR + StudentCrowd + WhatUni as primary sources |
 | `skills/scoring/` | `scoring` | `0` | *(omit)* | No tools, no section_name |
 | `skills/alternatives/` | `alternatives` | `8` | *(omit)* | No section_name |
@@ -1109,9 +1108,8 @@ section_name: news
 ---
 
 ## Search tool order
-1. Tavily — primary. Use `days=730` filter.
-2. DuckDuckGo (`ddg_tool`) — fallback if Tavily returns fewer than 3 news items.
-   Use only for news queries, not general search.
+1. Tavily — primary and only search tool. Use `days=730` filter on every query.
+   If results are sparse, set `confidence: "low"` and explain in `notes`.
 
 ## What to research
 - Institutional news: significant events from the past 2 years — strikes,
@@ -1374,7 +1372,7 @@ stalling the others.
 | `alternatives` | 8 | 2–3 universities × multiple queries each |
 | `rankings` | 6 | Multiple ranking bodies — QS, THE, Guardian, Complete University Guide |
 | `accommodation` | 6 | On-campus + off-campus + safety + transport — four distinct searches |
-| `news` | 6 | Tavily primary + DuckDuckGo fallback both count against this budget |
+| `news` | 6 | Tavily only — news queries plus department-specific searches |
 | `background` | 5 | Institutional facts — fewer queries needed |
 | `program` | 5 | Course catalog fetch + 1–2 search queries |
 | `scoring` | 0 | No tools — synthesises from blackboard only, never searches |
@@ -1410,9 +1408,8 @@ class CareerAgent(BaseAgent):
         return await deps.tavily.search(query, **kwargs)
 ```
 
-Every tool call goes through `_search()` or an equivalent gated wrapper
-for `deps.ddg`. Direct calls to `deps.tavily.search()`
-that bypass the gate are a bug.
+Every tool call goes through `_make_search_tool()` or an equivalent gated
+wrapper. Direct calls to the Tavily client that bypass the gate are a bug.
 
 `_calls_made` is reset at the start of each `handle()` call — not in
 `__init__()` — so the same agent instance handles multiple requests across
@@ -1864,4 +1861,4 @@ Fix: set `tool_budget: 10` in `skills/forum/SKILL.md`.
 - [ ] All 10 output schema files created in `schemas/outputs/`
 - [ ] All 11 SKILL.md files created with correct frontmatter and non-empty body
 - [ ] `pytest tests/test_stage_1a.py -v` — 17 passed, 0 failed
-- [ ] Stage 0 tests still pass: `pytest tests/test_env.py -v` — 6 passed
+- [ ] Stage 0 tests still pass: `pytest tests/test_env.py -v` — 6 passed31
