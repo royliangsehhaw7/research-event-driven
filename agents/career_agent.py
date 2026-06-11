@@ -1,10 +1,11 @@
 # agents/career_agent.py
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 
 from agents.base_agent import BaseAgent
 from core.deps import Deps
@@ -13,7 +14,7 @@ from schemas.messages.career_completed import CareerResearchCompletedMessage
 from schemas.messages.progress_update import ProgressUpdateMessage
 from schemas.outputs.career_output import CareerOutput
 from tools.fetch_tool import fetch_page
-from tools.search_tool_factory import make_search_tool
+from tools.search_tool import tavily_search
 
 logger = logging.getLogger("career_agent")
 
@@ -25,13 +26,17 @@ class CareerAgent(BaseAgent):
     Writes to:     board.career (CareerOutput)
     Fires:         CareerResearchCompletedMessage
 
-    Tools: tavily_search (budget-capped via make_search_tool), fetch_page (uncapped)
+    Tools: tavily_search (budget-capped via _make_search_tool), fetch_page (uncapped)
+
+    Note: site: queries must not be passed to tavily_search — Tavily does not
+    honour time_range filtering on site: prefixed queries. Use tavily_search to
+    find URLs, then fetch_page to retrieve content from those URLs.
     """
 
     def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
         super().__init__(instructions=instructions)
-        self._tool_budget  = tool_budget
-        self._calls_made   = [0]   # mutable ref passed to closure
+        self._tool_budget = tool_budget
+        self._calls_made  = 0
 
         self._agent = Agent(
             model=get_model("RESEARCH_MODEL"),
@@ -39,7 +44,7 @@ class CareerAgent(BaseAgent):
             output_type=CareerOutput,
             system_prompt=self.get_instruction(),
             tools=[
-                make_search_tool("career_agent", self._calls_made, self._tool_budget),
+                tavily_search,
                 fetch_page,
             ],
         )
@@ -75,6 +80,13 @@ class CareerAgent(BaseAgent):
             - country: the university's country — scope ALL salary and employer data to this
             - study_level: always "undergraduate"
 
+            Tool usage rules:
+            - Use tavily_search for general queries only. Never pass site: prefixed queries
+              to tavily_search — time filtering is not honoured for site: searches and results
+              will be stale.
+            - To retrieve content from a specific URL (e.g. a job board page or salary survey),
+              call fetch_page with that URL directly.
+
             You must not research careers for a different country than deps.context.country.
         """.strip()
 
@@ -84,13 +96,13 @@ class CareerAgent(BaseAgent):
 
     def reset(self) -> None:
         """Reset per-request state. Called by ResearchHandler before each request."""
-        self._calls_made[0] = 0
+        self._calls_made = 0
 
     # ── Core handler ─────────────────────────────────────────────────────────
 
     async def handle(self, message, deps: Deps) -> None:
         """Run career research and fire CareerResearchCompletedMessage."""
-        self._calls_made[0] = 0   # reset counter on each run
+        self._calls_made = 0
 
         logger.info(
             "career_agent | starting — university=%r course=%r country=%r",
@@ -106,13 +118,12 @@ class CareerAgent(BaseAgent):
             timestamp=datetime.now().isoformat(),
         ))
 
-        task_brief = (
-            f"University: {deps.context.university_name}\n"
-            f"Course: {deps.context.intended_course}\n"
-            f"Country: {deps.context.country}\n"
-            f"Study level: {deps.context.study_level}\n\n"
-            "Research graduate career paths, salary ranges in local currency, "
-            "and live job market demand. Scope all findings to the country above."
+        task_brief = (f"""
+            University: {deps.context.university_name}
+            Course: {deps.context.intended_course}
+            Country: {deps.context.country}
+            Study level: {deps.context.study_level}
+            """
         )
 
         try:
@@ -137,8 +148,6 @@ class CareerAgent(BaseAgent):
                 triggered_by="career_agent",
                 timestamp=datetime.now().isoformat(),
             ))
-            # Still fire the completed message so the pipeline does not stall.
-            # board.career remains None — downstream agents handle this.
 
         await deps.hub.publish(CareerResearchCompletedMessage(
             triggered_by="career_agent",

@@ -9,16 +9,9 @@ from pydantic_ai import RunContext
 
 from core.deps import Deps
 from mcps.fetch_client import fetch_client
+from schemas.fetch_result import FetchResult
 
 logger = logging.getLogger("fetch_tool")
-
-
-@dataclass
-class FetchResult:
-    url:     str
-    content: str         # page content as markdown-formatted text
-    status:  str         # "ok" | "error"
-    error:   str | None  # error message if status == "error", else None
 
 
 async def fetch_page(ctx: RunContext[Deps], url: str) -> str:

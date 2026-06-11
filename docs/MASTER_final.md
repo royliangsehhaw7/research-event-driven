@@ -1718,14 +1718,14 @@ verifiable. No stage is purely structural.
 |---|---|---|
 | 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
 | 1a | MessageHub (closure pattern), Blackboard, Deps (hub + board + context only — no tool clients), all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
-| 1b | `mcp/fetch_client.py` (singleton with `get_fetch_server()` / `close_fetch_server()`). `tools/` — `search_tool.py` (module-level TavilyClient, `days=730`), `fetch_tool.py` (calls `get_fetch_server()`), `ddg_tool.py` (module-level DDGS + date filter). `ResearchHandler.startup()` warms up Fetch MCP. | Real searches confirmed against university targets. Date filter verified for all tools. Fetch MCP server starts cleanly. |
+| 1b | `mcps/fetch_client.py` (singleton with `get_fetch_server()` / `close_fetch_server()`). `tools/` — `search_tool.py` (module-level TavilyClient, `days=730`), `fetch_tool.py` (calls `get_fetch_server()`), `ddg_tool.py` (module-level DDGS + date filter). `ResearchHandler.startup()` warms up Fetch MCP. | Real searches confirmed against university targets. Date filter verified for all tools. Fetch MCP server starts cleanly. |
 | 1c | `CareerAgent` end-to-end — pydantic-ai Agent with `tavily_search` + `fetch_page` tools, budget-aware closure, `subscribe()` + `get_instruction()`, `handle()` resets `_calls_made` | `board.career` populated from real data via CLI |
 | 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same tool set as CareerAgent (Tavily + Fetch), same pattern | `board.background`, `board.rankings`, `board.program` populated via CLI |
-| 1e | EmployabilityAgent + AccommodationAgent + NewsAgent — all three use Tavily + Fetch only. NewsAgent sets confidence: "low" when news results are sparse | board.employability, board.accommodation, board.news populated from a single pipeline run |
+| 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` — all three use Tavily + Fetch only. NewsAgent sets confidence: "low" when news results are sparse | board.employability, board.accommodation, board.news populated from a single pipeline run |
 | 1f | `ForumAgent` — Tavily + Fetch, highest budget, strict scope rules across 5 confirmed forum sources | `board.forum` populated via CLI — TSR, StudentCrowd, WhatUni, Quora, Reddit snippets via Tavily confirmed |
 | 2a | `ScoringAgent` + quorum gate — no tools, reads blackboard only, asyncio.Lock | `board.score` populated after all 7 section agents complete — lock verified, partial results handled |
 | 2b | `AlternativesAgent` (Tavily + Fetch) + `ReportGenerator` (Jinja2, no LLM) | `score.json` and `report.md` generated from CLI for real university |
-| 2c | Chainlit UI Mode 1 + Mode 2 + `ConversationAgent` (no tools, reads blackboard) | Full pipeline from UI with live progress, follow-up questions answered |
+| 2c | `Chainlit` UI Mode 1 + Mode 2 + `ConversationAgent` (no tools, reads blackboard) | Full pipeline from UI with live progress, follow-up questions answered |
 | 3a | Report quality pass — template, confidence flags, comparison script | Side-by-side `score.json` comparison working |
 | 3b | Edge case hardening | All failure scenarios handled without crash |
 

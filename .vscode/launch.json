@@ -2,10 +2,16 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Debug Test File from Root",
+            "name": "Python: Debug Career Agent Tests",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "module": "pytest",
+            "args": [
+                "tests/1c/test_career_agent_returns_results.py",
+                "--asyncio-mode=auto",
+                "-s",
+                "-v"
+            ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {

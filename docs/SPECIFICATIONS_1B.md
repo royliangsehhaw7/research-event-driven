@@ -197,6 +197,47 @@ pytest-asyncio
 
 ---
 
+
+## 1b.0 Schemas for Search and Fetch tools
+
+`SearchResult` and `SearchReponse` are return types used by `tavily_search`
+
+```python
+# schemas/search_result
+from dataclasses import dataclass
+
+@dataclass
+class SearchResult:
+    """A single result returned by Tavily."""
+    url:     str
+    title:   str
+    content: str          # snippet or full content depending on search_depth
+    score:   float        # Tavily relevance score — higher is better
+    date:    str | None   # published date string, or None if unavailable
+
+@dataclass
+class SearchResponse:
+    """Wrapper around the full Tavily response."""
+    query:   str
+    results: list[SearchResult]
+    answer:  str | None   # Tavily's synthesised answer, if requested
+```
+
+'FetchResult' is the data return tyype for `fetch_page`
+
+```python
+# schemas\fetch_result.py
+from dataclasses import dataclass
+
+@dataclass
+class FetchResult:
+    url:     str
+    content: str         # page content as markdown-formatted text
+    status:  str         # "ok" | "error"
+    error:   str | None  # error message if status == "error", else None
+```
+
+
 ## 1b.1 tools/search_tool.py — Tavily Wrapper
 A module-level _client singleton and tavily_search tool function.
 days=730 is always set — it cannot be overridden by the caller. This is
@@ -218,6 +259,7 @@ from pydantic_ai import RunContext
 from tavily import TavilyClient
 
 from core.deps import Deps
+from schemas.search_result import SearchResponse, SearchResult
 
 load_dotenv()
 
@@ -226,30 +268,38 @@ logger = logging.getLogger("search_tool")
 _client = TavilyClient(api_key=_os.environ["TAVILY_API_KEY"])
 
 
-async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
-    """Search the web via Tavily. days=730 always enforced.
-    Never register this directly on an agent — agents wrap it via
-    _make_search_tool() to add budget enforcement."""
-    raw = _client.search(query=query, max_results=5, days=730)
+async def tavily_search(ctx: RunContext[Deps], query: str, max_results: int = 5) -> SearchResponse:
+    """
+    Search the web via Tavily. time_range='year' always enforced.
+    """
+
+    raw = _client.search(query=query, max_results=max_results, time_range="year")
+
     logger.debug("search_tool | query=%r results=%d", query, len(raw.get("results", [])))
-    return _json.dumps({
-        "query": query,
-        "results": [
-            {
-                "url": r.get("url", ""),
-                "title": r.get("title", ""),
-                "content": r.get("content", ""),
-                "score": float(r.get("score", 0.0)),
-                "date": r.get("published_date"),
-            }
-            for r in raw.get("results", [])
-        ],
-    })
+    
+    # Map the raw API results into your strict dataclass models
+    results_list = [
+        SearchResult(
+            url=r.get("url", ""),
+            title=r.get("title", ""),
+            content=r.get("content", ""),
+            score=float(r.get("score", 0.0)),
+            date=r.get("published_date"),
+        )
+        # Safely handle an empty results list if Tavily returns nothing
+        for r in raw.get("results", []) or [] 
+    ]
+    
+    # Return the structural object directly
+    return SearchResponse(
+        query=query,
+        results=results_list,
+        answer=raw.get("answer"),
+    )
 ```
 
-**Why** days=730 cannot be overridden: a caller that passes days=365
-would silently break the 2-year filter contract. By not exposing days
-as a parameter, the contract is enforced at the type level.
+**Why** time_range=year cannot be overridden: a caller that passes days=365
+would silently break the 1-year filter contract. 
 
 **Why** the _client singleton reads from os.environ directly: load_dotenv()
 is called at module top. The singleton is created at import time — if the key
@@ -261,11 +311,6 @@ Wrapping it in a project-defined class adds no value and splits a single
 responsibility across two classes. The tool file is pure infrastructure —
 one client, one function.
 
-**Why** no search_tool_factory.py: budget enforcement is an agent concern,
-not a tool concern. Each agent wraps tavily_search in a _make_search_tool()
-method that closes over self._calls_made and self._tool_budget. This keeps
-tool files as pure infrastructure.
-
 ---
 
 ## 1b.2 `tools/fetch_tool.py` — Fetch MCP Wrapper
@@ -274,7 +319,7 @@ tool files as pure infrastructure.
 URL fetching. It delegates to the `FetchClient` singleton in `mcp/fetch_client.py`
 — it has no knowledge of how the MCP server was started or managed.
 
-The `FetchResult` dataclass is used internally and returned by `fetch_page` as
+The `FetchResult` dataclass from schemas and returned by `fetch_page` as
 a JSON string for the LLM to read.
 
 ```python
@@ -289,16 +334,9 @@ from pydantic_ai import RunContext
 
 from core.deps import Deps
 from mcp.fetch_client import fetch_client
+from schemas.fetch_result import FetchResult
 
 logger = logging.getLogger("fetch_tool")
-
-
-@dataclass
-class FetchResult:
-    url:     str
-    content: str         # page content as markdown-formatted text
-    status:  str         # "ok" | "error"
-    error:   str | None  # error message if status == "error", else None
 
 
 async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
@@ -989,7 +1027,8 @@ Fix: the test reloads the module after deleting the env var. Confirm
 
 - [ ] Tavily API key obtained from https://app.tavily.com — added to `.env`
 - [ ] `pip install tavily-python ddgs mcp mcp-server-fetch` confirmed clean (or `uv` installed if using `uvx` invocation)
-- [ ] `schemas/search.py` — `SearchResult` and `SearchResponse` dataclasses defined
+- [ ] `schemas/search_result.py` — `SearchResult` and `SearchResponse` dataclasses defined
+- [ ] `schemas/fetch_result.py` — `FetchResult` dataclasses defined
 - [ ] `tools/search_tool.py` — `tavily_search` function and `_client` singleton implemented, `days=730` enforced, no wrapper class
 - [ ] `tools/fetch_tool.py` — `fetch_page` function implemented, delegates to `fetch_client` singleton, never raises
 - [ ] `tools/ddg_tool.py` — `DuckDuckGoTool` implemented with rate-limit retry, module-level `_client` singleton

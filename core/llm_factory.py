@@ -37,11 +37,11 @@ def get_model(env_key: str):
         )
 
     # pydantic-ai OpenAI-compatible provider
-    from pydantic_ai.models.openai import OpenAIModel
+    from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
 
     provider = OpenAIProvider(
         base_url=base_url,
         api_key=api_key,
     )
-    return OpenAIModel(model_name=model_string, provider=provider)
+    return OpenAIChatModel(model_name=model_string, provider=provider)

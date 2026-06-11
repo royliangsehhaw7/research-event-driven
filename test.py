@@ -1,10 +1,9 @@
 import asyncio
-from tools.tavily_tool import TavilySearchTool
+from tools.search_tool import tavily_search
 
 # 1. Keep it as a normal async function for debugging
 async def debug_tavily() -> None:
-    tool = TavilySearchTool()
-    response = await tool.search(
+    response = await tavily_search.search(
         "University of Manchester Computer Science undergraduate",
         max_results=3,
     )
