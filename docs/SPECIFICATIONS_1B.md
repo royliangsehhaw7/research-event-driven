@@ -197,15 +197,13 @@ pytest-asyncio
 
 ---
 
-## 1b.1 tools/search_tool.py — Tavily Wrapper and Module-Level Tool Function
-TavilySearchTool wraps the Tavily client. Its single enforced behaviour:
+## 1b.1 tools/search_tool.py — Tavily Wrapper
+A module-level _client singleton and tavily_search tool function.
 days=730 is always set — it cannot be overridden by the caller. This is
-the mechanism that enforces the 2-year data filter system-wide. Any agent
-that calls this wrapper gets filtered results automatically.
+the mechanism that enforces the 2-year data filter system-wide.
 
-Below the class, a module-level tavily_search function and _client
-singleton are added to the same file. This is what agents import and wrap
-with their budget closure. It is never called directly from agent files.
+Agents import tavily_search and wrap it in _make_search_tool() to add
+budget enforcement. tavily_search is never registered on an agent directly.
 
 ```python
 # tools/search_tool.py
@@ -213,9 +211,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
-import os
 import os as _os
-from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from pydantic_ai import RunContext
@@ -223,131 +219,30 @@ from tavily import TavilyClient
 
 from core.deps import Deps
 
+load_dotenv()
+
 logger = logging.getLogger("search_tool")
 
-
-@dataclass
-class SearchResult:
-    """A single result returned by Tavily."""
-    url:     str
-    title:   str
-    content: str          # snippet or full content depending on search_depth
-    score:   float        # Tavily relevance score — higher is better
-    date:    str | None   # published date string, or None if unavailable
-
-
-@dataclass
-class SearchResponse:
-    """Wrapper around the full Tavily response."""
-    query:   str
-    results: list[SearchResult]
-    answer:  str | None   # Tavily's synthesised answer, if requested
-
-
-class TavilySearchTool:
-    """Tavily search wrapper. Enforces days=730 on every call.
-
-    One instance is shared across all agents that use it.
-    Created by ResearchHandler at startup and passed via Deps.
-
-    Usage:
-        response = await tool.search("Computer Science jobs UK 2024")
-        for result in response.results:
-            print(result.url, result.content)
-    """
-
-    def __init__(self, api_key: str | None = None) -> None:
-        load_dotenv()
-        key = api_key or os.getenv("TAVILY_API_KEY")
-        if not key:
-            raise EnvironmentError(
-                "TAVILY_API_KEY not set. Check your .env file. "
-                "Get a key at https://app.tavily.com"
-            )
-        self._client = TavilyClient(api_key=key)
-        logger.info("search_tool | TavilySearchTool initialised")
-
-    async def search(
-        self,
-        query: str,
-        max_results: int = 5,
-        search_depth: str = "basic",
-        include_answer: bool = False,
-    ) -> SearchResponse:
-        """Run a Tavily search. days=730 is always set — cannot be overridden.
-
-        Args:
-            query:          The search query string.
-            max_results:    Number of results to return. Default 5, max 10.
-            search_depth:   "basic" (fast, snippets) or "advanced" (slower, full content).
-                            Use "advanced" only when the agent needs full page text,
-                            not just snippets.
-            include_answer: If True, Tavily synthesises an answer from results.
-                            Costs additional credits. Default False.
-
-        Returns:
-            SearchResponse with results list and optional answer.
-
-        Raises:
-            RuntimeError: if the Tavily API returns an error.
-        """
-        try:
-            raw = self._client.search(
-                query=query,
-                max_results=min(max_results, 10),
-                search_depth=search_depth,
-                include_answer=include_answer,
-                days=730,          # ENFORCED — 2-year filter — never remove this
-            )
-        except Exception as exc:
-            logger.error("search_tool | Tavily error for query %r: %s", query, exc)
-            raise RuntimeError(f"Tavily search failed: {exc}") from exc
-
-        results = [
-            SearchResult(
-                url=r.get("url", ""),
-                title=r.get("title", ""),
-                content=r.get("content", ""),
-                score=float(r.get("score", 0.0)),
-                date=r.get("published_date"),
-            )
-            for r in raw.get("results", [])
-        ]
-
-        logger.debug(
-            "search_tool | query=%r results=%d", query, len(results)
-        )
-
-        return SearchResponse(
-            query=query,
-            results=results,
-            answer=raw.get("answer"),
-        )
-
-
-# ── Module-level singleton and tool function ──────────────────────────────────
-# Agents import tavily_search and wrap it in _make_search_tool() to add
-# budget enforcement. tavily_search is never registered on an agent directly.
-
-_client = TavilySearchTool(api_key=_os.environ["TAVILY_API_KEY"])
+_client = TavilyClient(api_key=_os.environ["TAVILY_API_KEY"])
 
 
 async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
-    """Bare Tavily search. days=730 always enforced.
+    """Search the web via Tavily. days=730 always enforced.
     Never register this directly on an agent — agents wrap it via
     _make_search_tool() to add budget enforcement."""
-    response = await _client.search(query, max_results=5)
+    raw = _client.search(query=query, max_results=5, days=730)
+    logger.debug("search_tool | query=%r results=%d", query, len(raw.get("results", [])))
     return _json.dumps({
-        "query": response.query,
+        "query": query,
         "results": [
             {
-                "url": r.url,
-                "title": r.title,
-                "content": r.content,
-                "score": r.score,
-                "date": r.date,
+                "url": r.get("url", ""),
+                "title": r.get("title", ""),
+                "content": r.get("content", ""),
+                "score": float(r.get("score", 0.0)),
+                "date": r.get("published_date"),
             }
-            for r in response.results
+            for r in raw.get("results", [])
         ],
     })
 ```
@@ -356,24 +251,20 @@ async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
 would silently break the 2-year filter contract. By not exposing days
 as a parameter, the contract is enforced at the type level.
 
-**Why** min(max_results, 10): Tavily's maximum per call is 10. Clamping
-prevents a silent API error if an agent requests more.
-
-**Why** search_depth is a parameter: most queries use "basic" (fast,
-returns snippets). ProgramAgent and EmployabilityAgent may use "advanced"
-to get full page content when a snippet is not enough. The choice is left to
-the agent, not hardcoded.
-
 **Why** the _client singleton reads from os.environ directly: load_dotenv()
-must be called in main.py before any tool module is imported. The singleton
-is created at import time — if the key is missing it raises immediately, which
-is the correct failure mode (fast fail at startup, not mid-request).
+is called at module top. The singleton is created at import time — if the key
+is missing it raises immediately, which is the correct failure mode (fast fail
+at startup, not mid-request).
 
-**Why** no search_tool_factory.py: budget enforcement is an agent concern, not
-a tool concern. Each agent wraps tavily_search in a _make_search_tool() method
-that closes over self._calls_made and self._tool_budget. This keeps tool files
-as pure infrastructure and avoids the list[int] mutable-ref workaround entirely —
-the closure captures self, which is already mutable.
+**Why** no wrapper class: TavilyClient from tavily-python is the client.
+Wrapping it in a project-defined class adds no value and splits a single
+responsibility across two classes. The tool file is pure infrastructure —
+one client, one function.
+
+**Why** no search_tool_factory.py: budget enforcement is an agent concern,
+not a tool concern. Each agent wraps tavily_search in a _make_search_tool()
+method that closes over self._calls_made and self._tool_budget. This keeps
+tool files as pure infrastructure.
 
 ---
 
@@ -884,59 +775,57 @@ async def test_search_tool_increments_counter() -> None:
 # ── Tavily ────────────────────────────────────────────────────────────────────
 
 def test_tavily_imports_cleanly() -> None:
-    from tools.search_tool import TavilySearchTool, SearchResult, SearchResponse
-    assert TavilySearchTool
-    assert SearchResult
-    assert SearchResponse
+    from tools.search_tool import tavily_search
+    assert tavily_search
 
 
 def test_tavily_initialises_with_env_key() -> None:
-    from tools.search_tool import TavilySearchTool
-    tool = TavilySearchTool()
-    assert tool is not None
+    from tools.search_tool import _client
+    assert _client is not None
 
 
 def test_tavily_raises_on_missing_key(monkeypatch) -> None:
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     from tools import search_tool
     import importlib
-    importlib.reload(search_tool)
-    with pytest.raises(EnvironmentError, match="TAVILY_API_KEY"):
-        search_tool.TavilySearchTool(api_key=None)
+    with pytest.raises(KeyError):
+        importlib.reload(search_tool)
 
 
 @pytest.mark.asyncio
 async def test_tavily_returns_results_for_known_query() -> None:
-    from tools.search_tool import TavilySearchTool
-    tool = TavilySearchTool()
-    response = await tool.search(
-        "University of Manchester Computer Science undergraduate",
-        max_results=3,
-    )
-    assert response.query == "University of Manchester Computer Science undergraduate"
-    assert len(response.results) > 0, "Expected at least 1 result"
-    for r in response.results:
-        assert r.url.startswith("http"), f"Result URL malformed: {r.url}"
-        assert len(r.content) > 0, "Expected non-empty content"
+    from tools.search_tool import tavily_search
+    from unittest.mock import MagicMock
+    ctx = MagicMock()
+    raw = await tavily_search(ctx, "University of Manchester Computer Science undergraduate")
+    import json
+    result = json.loads(raw)
+    assert result["query"] == "University of Manchester Computer Science undergraduate"
+    assert len(result["results"]) > 0
+    for r in result["results"]:
+        assert r["url"].startswith("http"), f"Result URL malformed: {r['url']}"
+        assert len(r["content"]) > 0, "Expected non-empty content"
 
 
 @pytest.mark.asyncio
 async def test_tavily_site_query_returns_results() -> None:
     """Confirm site: queries work — used by ForumAgent as fallback."""
-    from tools.search_tool import TavilySearchTool
-    tool = TavilySearchTool()
-    response = await tool.search(
-        "site:thestudentroom.co.uk University of Manchester Computer Science",
-        max_results=3,
-    )
-    # site: queries sometimes return 0 results — that is valid behaviour
-    # We only assert the call does not raise
-    assert response.results is not None
+    from tools.search_tool import tavily_search
+    from unittest.mock import MagicMock
+    import json
+    ctx = MagicMock()
+    raw = await tavily_search(ctx, "site:thestudentroom.co.uk University of Manchester Computer Science")
+    result = json.loads(raw)
+    assert result["results"] is not None
+
+
 @pytest.mark.asyncio
 async def test_tavily_forum_sources_accessible() -> None:
     """Confirm all 5 forum site: query targets return results via Tavily."""
-    from tools.search_tool import TavilySearchTool
-    tool = TavilySearchTool()
+    from tools.search_tool import tavily_search
+    from unittest.mock import MagicMock
+    import json
+    ctx = MagicMock()
     sources = [
         "site:thestudentroom.co.uk University of Manchester Computer Science",
         "site:studentcrowd.com University of Manchester Computer Science",
@@ -945,9 +834,10 @@ async def test_tavily_forum_sources_accessible() -> None:
         "site:reddit.com University of Manchester Computer Science",
     ]
     for query in sources:
-        response = await tool.search(query, max_results=3)
-        # site: queries may return 0 for low-coverage sources — assert no raise
-        assert response.results is not None, f"None results for: {query}"
+        raw = await tavily_search(ctx, query)
+        result = json.loads(raw)
+        assert result["results"] is not None, f"None results for: {query}"
+
 
 
 # ── DuckDuckGo ────────────────────────────────────────────────────────────────
@@ -1099,7 +989,8 @@ Fix: the test reloads the module after deleting the env var. Confirm
 
 - [ ] Tavily API key obtained from https://app.tavily.com — added to `.env`
 - [ ] `pip install tavily-python ddgs mcp mcp-server-fetch` confirmed clean (or `uv` installed if using `uvx` invocation)
-- [ ] `tools/search_tool.py` — `TavilySearchTool` implemented with `days=730` enforced, `tavily_search` module-level function and `_client` singleton added
+- [ ] `schemas/search.py` — `SearchResult` and `SearchResponse` dataclasses defined
+- [ ] `tools/search_tool.py` — `tavily_search` function and `_client` singleton implemented, `days=730` enforced, no wrapper class
 - [ ] `tools/fetch_tool.py` — `fetch_page` function implemented, delegates to `fetch_client` singleton, never raises
 - [ ] `tools/ddg_tool.py` — `DuckDuckGoTool` implemented with rate-limit retry, module-level `_client` singleton
 - [ ] `mcp/fetch_client.py` — `FetchClient` singleton implemented with `startup()`, `shutdown()`, `call_tool()`

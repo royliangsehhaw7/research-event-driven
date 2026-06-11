@@ -30,7 +30,7 @@ class BaseAgent(ABC):
     def reset(self) -> None:
         """Called before each request's subscribe loop. No-op by default.
         Subclasses that carry per-request state (e.g. a _fired flag) override this."""
-        pass
+        ...
 
 
     @abstractmethod
