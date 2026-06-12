@@ -20,6 +20,7 @@ class FetchClient:
     def __init__(self) -> None:
         self._session: ClientSession | None = None
         self._exit_stack = None
+        
 
     async def startup(self) -> None:
         """Start the MCP fetch server subprocess and open a session."""
@@ -40,6 +41,7 @@ class FetchClient:
         await self._session.initialize()
         logger.info("fetch_client | MCP fetch server started")
 
+
     async def shutdown(self) -> None:
         """Stop the MCP fetch server subprocess."""
         if self._exit_stack:
@@ -47,6 +49,7 @@ class FetchClient:
             self._session = None
             self._exit_stack = None
             logger.info("fetch_client | MCP fetch server stopped")
+
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Call a tool on the running MCP fetch server.
@@ -73,6 +76,7 @@ class FetchClient:
             for block in result.content
             if hasattr(block, "text")
         ]
+
         return "\n".join(texts)
 
 
