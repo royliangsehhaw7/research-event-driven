@@ -1,18 +1,18 @@
 # services/research_handler.py — Stage 1c (CareerAgent only)
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 from pathlib import Path
 
+from core.logger import logger
 from core.blackboard import Blackboard
 from core.deps import Deps, ResearchContext
 from core.message_hub import MessageHub
 from core.skill_loader import scan_skills_dir, SkillMeta
+
 from agents.career_agent import CareerAgent
 from schemas.messages.research_requested import ResearchRequestedMessage
 
-logger = logging.getLogger("research_handler")
 
 RESEARCH_AGENT_KEYS = {
     "background", "rankings", "program",
@@ -23,22 +23,14 @@ RESEARCH_AGENT_KEYS = {
 class ResearchHandler:
     def __init__(self) -> None:
         skills = scan_skills_dir(Path("skills"))
+        career_skill = skills.get("career")
 
-        def _get(key: str):
-            skill = skills.get(key)
-            if skill is None:
-                logger.warning(
-                    "research_handler | no SKILL.md for %r — agent uses base prompt", key
-                )
-            return skill
-
-        career_skill = _get("career")
         self._career_agent = CareerAgent(
             instructions=career_skill.instructions if career_skill else "",
             tool_budget=career_skill.tool_budget if career_skill else 6,
         )
 
-        logger.info("research_handler | CareerAgent constructed")
+        logger.info("-- research_handler | CareerAgent constructed")
 
     async def handle_request(
         self,

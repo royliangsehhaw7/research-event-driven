@@ -1,7 +1,6 @@
 # tools/search_tool.py
 from __future__ import annotations
 
-import logging
 import os as _os
 
 from dotenv import load_dotenv
@@ -9,12 +8,10 @@ from pydantic_ai import RunContext
 from tavily import TavilyClient
 
 from core.deps import Deps
-# Import your actual dataclass schemas
+from core.logger import logger
 from schemas.search_result import SearchResponse, SearchResult  
 
 load_dotenv()
-
-logger = logging.getLogger("search_tool")
 
 _client = TavilyClient(api_key=_os.environ["TAVILY_API_KEY"])
 
@@ -26,7 +23,7 @@ async def tavily_search(ctx: RunContext[Deps], query: str, max_results: int = 5)
 
     raw = _client.search(query=query, max_results=max_results, time_range="year")
 
-    logger.debug("search_tool | query=%r results=%d", query, len(raw.get("results", [])))
+    logger.warning("search_tool | query=%r results=%d", query, len(raw.get("results", [])))
     
     # Map the raw API results into your strict dataclass models
     results_list = [

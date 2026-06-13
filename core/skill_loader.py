@@ -109,9 +109,11 @@ def scan_skills_dir(skills_dir: Path) -> dict[str, SkillMeta]:
     for subdir in sorted(skills_dir.iterdir()):
         if not subdir.is_dir():
             continue
+        
         skill_file = subdir / "SKILL.md"
         if not skill_file.exists():
             continue
+        
         skill = load_skill(skill_file)
         if skill is None:
             continue
@@ -121,6 +123,7 @@ def scan_skills_dir(skills_dir: Path) -> dict[str, SkillMeta]:
                 skill.key, skill_file,
             )
             continue
+
         result[skill.key] = skill
 
     return result

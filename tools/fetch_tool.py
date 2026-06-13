@@ -2,16 +2,14 @@
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass
 
 from pydantic_ai import RunContext
 
 from core.deps import Deps
+from core.logger import logger
 from mcps.fetch_client import fetch_client
 from schemas.fetch_result import FetchResult
-
-logger = logging.getLogger("fetch_tool")
 
 
 async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
@@ -30,13 +28,15 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
         Never raises — returns status "error" on failure so the agent
         can note the failure and continue.
     """
+
     try:
         raw = await fetch_client.call_tool("fetch", {
             "url": url,
             "max_length": 50000,   # characters — enough for a full catalog page
         })
         result = FetchResult(url=url, content=str(raw), status="ok", error=None)
-        logger.debug("fetch_tool | fetched %r — %d chars", url, len(result.content))
+        logger.warning("fetch_tool | fetched %r — %d chars", url, len(result.content))
+
     except Exception as exc:
         logger.error("fetch_tool | fetch failed for %r: %s", url, exc)
         result = FetchResult(url=url, content="", status="error", error=str(exc))
