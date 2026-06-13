@@ -134,26 +134,26 @@ never silently omits a section.
 
 | Tool | Kind | Role | API Key Required |
 |---|---|---|---|
-| **Tavily** | Python client | Primary search — all agents. Key feature: `days=730` date filter | `TAVILY_API_KEY` |
-| **Fetch MCP** | MCP server | Direct URL fetch for university catalog pages, rankings pages | None — open |
-| **DuckDuckGo Search** | Python client | NewsAgent fallback when Tavily misses news. No key, no quota | None — no key needed |
+| **Tavily** | Python client | Primary search — career paths, salary, forum, news, rankings | `TAVILY_API_KEY` |
+| **Fetch MCP** | MCP server | Direct URL fetch — catalog pages, salary surveys | None |
+| **Adzuna** | REST API | Live job postings — UK and Australia | `ADZUNA_APP_ID` + `ADZUNA_APP_KEY` |
+| **MyCareersFuture** | REST API | Live job postings — Singapore only | None — public API |
+| **DuckDuckGo** | Python client | NewsAgent fallback — no key, no quota | None |
 >[!WARNING]
 > DDG will NOT be wired up first as it does NOT filter by dates
 >
 
-**Fetch MCP is the only MCP server in the stack.** Tavily and DuckDuckGo are
-plain Python client libraries — no MCP protocol involved.
-The MCP server connection for Fetch lives in `mcp/fetch_client.py` as a
-managed singleton. The pydantic-ai tool function that wraps it lives in
-`tools/fetch_tool.py`. These are kept separate — one file, one responsibility.
+**Fetch MCP is the only MCP server in the stack.** Tavily, Adzuna, MyCareersFuture,
+and DuckDuckGo are plain Python/HTTP clients — no MCP protocol involved.
+The MCP server connection for Fetch lives in `mcps/fetch_client.py` as a managed
+singleton. The pydantic-ai tool function that wraps it lives in `tools/fetch_tool.py`.
 
-**Why these tools:**
-Tavily handles all general search including `site:thestudentroom.co.uk`,
-`site:studentcrowd.com`, `site:whatuni.com`, `site:quora.com`, and
-`site:reddit.com` queries. ForumAgent uses `site:` queries across multiple
-confirmed-accessible public student forums — no separate Reddit API client is
-required. DuckDuckGo replaces SerpAPI as a zero-cost news fallback with no
-monthly quota.
+**Why dedicated job posting tools:** Tavily cannot reliably retrieve live job
+postings — job boards (Indeed, Reed, LinkedIn) block fetch-based access and
+Tavily's `site:` queries do not honour `time_range` filtering for job boards.
+Adzuna (UK + AU) and MyCareersFuture (SG) are purpose-built APIs returning
+structured, dated postings. They replace Tavily for the job posting snapshot
+in CareerAgent only — Tavily remains the primary tool for all other research.
 
 ### LLM Provider
 
@@ -1583,17 +1583,20 @@ university_research/
 │   │   ├── report_ready.py         carries file_paths[]
 │   │   └── progress_update.py      carries status + message
 │   │
-│   └── outputs/                    rich LLM outputs written to blackboard
-│       ├── career_output.py
-│       ├── background_output.py
-│       ├── rankings_output.py
-│       ├── program_output.py
-│       ├── employability_output.py
-│       ├── accommodation_output.py
-│       ├── news_output.py
-│       ├── forum_output.py
-│       ├── scoring_output.py
-│       └── alternatives_output.py
+│   ├── outputs/                    rich LLM outputs written to cblackboard
+│   │   ├── career_output.py
+│   │   ├── background_output.py
+│   │   ├── rankings_output.py
+│   │   ├── program_output.py
+│   │   ├── employability_output.py
+│   │   ├── accommodation_output.py
+│   │   ├── news_output.py
+│   │   ├── forum_output.py
+│   │   ├── scoring_output.py
+│   │   └── alternatives_output.py
+│   ├── search_result.py            SearchResult, SearchResponse
+│   ├── fetch_result.py             FetchResult
+│   └── job_posting.py              JobPosting, JobPostingsResponse — shared schema for Adzuna + MCF
 │
 ├── agents/
 │   ├── base_agent.py               ABC: subscribe(), get_instruction(), reset()
@@ -1611,8 +1614,10 @@ university_research/
 │
 ├── tools/
 │   ├── search_tool.py              tavily_search — module-level TavilyClient singleton
-│   ├── fetch_tool.py               fetch_page — calls fetch_client.call_tool() from mcp/fetch_client.py
-│   └── ddg_tool.py                 ddg_search — module-level DDGS singleton (NewsAgent)
+│   ├── fetch_tool.py               fetch_page — calls fetch_client singleton, never raises
+│   ├── ddg_tool.py                 ddg_search — module-level DDGS singleton, date-filtered (NewsAgent only)
+│   ├── adzuna_tool.py              adzuna_jobs — httpx REST, UK + AU, routes by deps.context.country
+│   └── mcf_tool.py                 mcf_jobs — httpx REST, Singapore only, no auth required
 │
 ├── report/
 │   ├── generator.py                deterministic Jinja2 renderer, no LLM
@@ -1718,7 +1723,7 @@ verifiable. No stage is purely structural.
 |---|---|---|
 | 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
 | 1a | MessageHub (closure pattern), Blackboard, Deps (hub + board + context only — no tool clients), all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
-| 1b | `mcp/fetch_client.py` (singleton with `get_fetch_server()` / `close_fetch_server()`). `tools/` — `search_tool.py` (module-level TavilyClient, `days=730`), `fetch_tool.py` (calls `get_fetch_server()`), `ddg_tool.py` (module-level DDGS + date filter). `ResearchHandler.startup()` warms up Fetch MCP. | Real searches confirmed against university targets. Date filter verified for all tools. Fetch MCP server starts cleanly. |
+| 1b | `mcps/fetch_client.py` singleton. `tools/` — `search_tool.py`, `fetch_tool.py`, `ddg_tool.py` (unchanged from original). `tools/adzuna_tool.py` (UK + AU job postings via Adzuna REST). `tools/mcf_tool.py` (SG job postings via MyCareersFuture public API). `schemas/job_posting.py` shared normalised schema. `ResearchHandler.startup()` warms Fetch MCP. | Real job postings confirmed for UK, AU, SG. All 5 tools pass live tests. 26 tests pass. |
 | 1c | `CareerAgent` end-to-end — pydantic-ai Agent with `tavily_search` + `fetch_page` tools, budget-aware closure, `subscribe()` + `get_instruction()`, `handle()` resets `_calls_made` | `board.career` populated from real data via CLI |
 | 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same tool set as CareerAgent (Tavily + Fetch), same pattern | `board.background`, `board.rankings`, `board.program` populated via CLI |
 | 1e | EmployabilityAgent + AccommodationAgent + NewsAgent — all three use Tavily + Fetch only. NewsAgent sets confidence: "low" when news results are sparse | board.employability, board.accommodation, board.news populated from a single pipeline run |
