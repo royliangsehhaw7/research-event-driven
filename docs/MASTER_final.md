@@ -134,7 +134,7 @@ never silently omits a section.
 
 | Tool | Kind | Role | API Key Required |
 |---|---|---|---|
-| **Tavily** | Python client | Primary search — career paths, salary, forum, news, rankings | `TAVILY_API_KEY` |
+| **Tavily** | Python client (`AsyncTavilyClient`) | Primary search — career paths, salary, forum, news, rankings | `TAVILY_API_KEY` |
 | **Fetch MCP** | MCP server | Direct URL fetch — catalog pages, salary surveys | None |
 | **Adzuna** | REST API | Live job postings — UK and Australia | `ADZUNA_APP_ID` + `ADZUNA_APP_KEY` |
 | **MyCareersFuture** | REST API | Live job postings — Singapore only | None — public API |
@@ -143,6 +143,13 @@ never silently omits a section.
 > DDG will NOT be wired up first as it does NOT filter by dates
 >
 
+**Tavily client note:** the singleton in `tools/search_tool.py` is an
+`AsyncTavilyClient`, not the synchronous `TavilyClient`. Section agents run
+concurrently via `asyncio.gather()` from Stage 1d onward — a synchronous
+`TavilyClient.search()` call would block the entire event loop for its
+duration, serialising every agent's work. `AsyncTavilyClient` is built on
+`httpx.AsyncClient`; one shared module-level instance is safe and intended to
+be used concurrently by multiple agents.
 **Fetch MCP is the only MCP server in the stack.** Tavily, Adzuna, MyCareersFuture,
 and DuckDuckGo are plain Python/HTTP clients — no MCP protocol involved.
 The MCP server connection for Fetch lives in `mcps/fetch_client.py` as a managed
@@ -1020,9 +1027,9 @@ mcp/
 └── fetch_client.py         Fetch MCP server — singleton lifecycle management
 
 tools/
-├── search_tool.py          tavily_search — module-level TavilyClient singleton
+├── search_tool.py          tavily_search — module-level AsyncTavilyClient singleton (async, concurrency-safe)
 ├── fetch_tool.py           fetch_page — calls fetch singleton from mcp/fetch_client.py
-└── ddg_tool.py             ddg_search — module-level DDGS singleton
+└── ddg_tool.py             ddg_search — module-level DDGS singleton, calls via asyncio.to_thread — NOT registered on any agent
 ```
 
 Tavily and DuckDuckGo are plain Python client libraries — no MCP
@@ -1120,6 +1127,20 @@ One file. All state on the instance. `tools/fetch_tool.py` imports `fetch_client
 and calls `call_tool()` — it has no knowledge of the lifecycle. The app entry
 point calls `startup()` and `shutdown()`.
 
+**Is the singleton still right under `asyncio.gather()`?** Yes — and it's the
+one tool wrapper that was already concurrency-safe by construction. From
+Stage 1d onward several section agents call `fetch_page` concurrently. The
+MCP transport is JSON-RPC over stdio: each `call_tool()` request carries a
+unique ID, and the session's read-loop dispatches each response back to the
+coroutine that's awaiting it. That means multiple agents can `await
+fetch_client.call_tool(...)` at the same time on the *same* underlying
+subprocess/session — requests are multiplexed, not serialised. One subprocess
+for the whole run is also cheaper than spawning `mcp-server-fetch` per agent
+or per call. Contrast this with Tavily: `TavilyClient.search()` is a
+synchronous call with no concurrency story, which is why that client needed
+to change to `AsyncTavilyClient` (see Section 3) — `fetch_client` needed no
+equivalent change.
+
 ### 8.4 Tool budget enforcement
 
 `tool_budget` from SKILL.md is passed to each agent constructor and stored as
@@ -1188,11 +1209,11 @@ blackboard. `tool_budget: 0` in their SKILL.md makes this explicit.
 ```python
 import json
 import os
-from tavily import TavilyClient
+from tavily import AsyncTavilyClient
 from pydantic_ai import RunContext
 from core.deps import Deps
 
-_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+_client = AsyncTavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
 
 async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
@@ -1202,6 +1223,12 @@ async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
     results = await _client.search(query, days=730, max_results=5)
     return json.dumps(results)
 ```
+
+> `AsyncTavilyClient` (not `TavilyClient`) — `tavily_search` is called
+> concurrently by multiple section agents via `asyncio.gather()`. The
+> synchronous client would block the event loop for the duration of each
+> call; `AsyncTavilyClient` is built on `httpx.AsyncClient` and a single
+> shared instance is safe under concurrent `await`.
 
 **`tools/fetch_tool.py`**
 
@@ -1223,8 +1250,16 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
 
 **`tools/ddg_tool.py`**
 
+> Not registered on any agent (see Section 13 and the warning below). Fixed
+> here anyway: `DDGS().text(...)` is synchronous (`requests`-based, no async
+> client exists in `ddgs`). Calling it directly from an `async def` would block
+> the event loop, the same issue `tavily_search` had with `TavilyClient`. The
+> fix is `asyncio.to_thread(...)`, which runs the blocking call in a worker
+> thread.
+
 ```python
 import json
+import asyncio
 from datetime import datetime, timedelta
 from dateutil.parser import parse as parse_date
 from ddgs import DDGS
@@ -1241,7 +1276,7 @@ async def ddg_search(ctx: RunContext[Deps], query: str) -> str:
     CURRENTLY NOT WIRED TO ANY AGENTS
     """
     cutoff = datetime.now() - timedelta(days=730)
-    raw = _client.text(query, max_results=10)
+    raw = await asyncio.to_thread(_client.text, query, max_results=10)
     items = []
     for r in raw:
         date_str = r.get("date", "")
@@ -1613,9 +1648,9 @@ university_research/
 │   └── conversation_agent.py       reads blackboard, no tools
 │
 ├── tools/
-│   ├── search_tool.py              tavily_search — module-level TavilyClient singleton
+│   ├── search_tool.py              tavily_search — module-level AsyncTavilyClient singleton (async, concurrency-safe)
 │   ├── fetch_tool.py               fetch_page — calls fetch_client singleton, never raises
-│   ├── ddg_tool.py                 ddg_search — module-level DDGS singleton, date-filtered (NewsAgent only)
+│   ├── ddg_tool.py                 ddg_search — module-level DDGS singleton, calls via asyncio.to_thread — NOT registered on any agent
 │   ├── adzuna_tool.py              adzuna_jobs — httpx REST, UK + AU, routes by deps.context.country
 │   └── mcf_tool.py                 mcf_jobs — httpx REST, Singapore only, no auth required
 │
@@ -1666,6 +1701,18 @@ arrives before startup, `fetch_tool.py` raises `RuntimeError` immediately.
 These clients read from `os.environ` when their modules are imported.
 If `.env` is not loaded before the modules are imported, they will raise
 `KeyError`. Always call `load_dotenv()` before any tool module is imported.
+
+**Synchronous tool clients block the event loop under `asyncio.gather()`**
+`asyncio.gather()` runs all section agents concurrently on one event loop.
+A tool function declared `async def` that calls a *synchronous* client
+underneath (e.g. plain `TavilyClient.search()`, or `DDGS().text()`) blocks
+that loop for the full duration of the call — it doesn't run "in the
+background", it stalls every other agent's `await`s too. `search_tool.py`
+uses `AsyncTavilyClient` for this reason. `ddg_tool.py` has no async client
+available, so it wraps the blocking call in `asyncio.to_thread(...)`. Fetch
+MCP's `ClientSession.call_tool()` is natively async and needs no such wrapper.
+When adding a new tool client, check whether its underlying library ships an
+async variant before assuming `async def` alone makes it concurrency-safe.
 
 **Skills load before agents are constructed**
 `scan_skills_dir()` must complete before any agent constructor is called.
@@ -1723,7 +1770,7 @@ verifiable. No stage is purely structural.
 |---|---|---|
 | 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
 | 1a | MessageHub (closure pattern), Blackboard, Deps (hub + board + context only — no tool clients), all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
-| 1b | `mcps/fetch_client.py` singleton. `tools/` — `search_tool.py`, `fetch_tool.py`, `ddg_tool.py` (unchanged from original). `tools/adzuna_tool.py` (UK + AU job postings via Adzuna REST). `tools/mcf_tool.py` (SG job postings via MyCareersFuture public API). `schemas/job_posting.py` shared normalised schema. `ResearchHandler.startup()` warms Fetch MCP. | Real job postings confirmed for UK, AU, SG. All 5 tools pass live tests. 26 tests pass. |
+| 1b | `mcps/fetch_client.py` singleton (kept — concurrent `call_tool()` is safe, multiplexed by request ID over one shared stdio session). `tools/search_tool.py` uses `AsyncTavilyClient` + `await` (was sync `TavilyClient` — would block the loop under `asyncio.gather()`). `tools/fetch_tool.py` unchanged. `tools/ddg_tool.py` calls `DDGS().text()` via `asyncio.to_thread` for the same reason — still NOT registered on any agent (date filtering unreliable, see Section 13). `tools/adzuna_tool.py` (UK + AU job postings via Adzuna REST). `tools/mcf_tool.py` (SG job postings via MyCareersFuture public API). `schemas/job_posting.py` shared normalised schema. `ResearchHandler.startup()` warms Fetch MCP. | Real job postings confirmed for UK, AU, SG. All 5 tools pass live tests. 26 tests pass. |
 | 1c | `CareerAgent` end-to-end — pydantic-ai Agent with `tavily_search` + `fetch_page` tools, budget-aware closure, `subscribe()` + `get_instruction()`, `handle()` resets `_calls_made` | `board.career` populated from real data via CLI |
 | 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same tool set as CareerAgent (Tavily + Fetch), same pattern | `board.background`, `board.rankings`, `board.program` populated via CLI |
 | 1e | EmployabilityAgent + AccommodationAgent + NewsAgent — all three use Tavily + Fetch only. NewsAgent sets confidence: "low" when news results are sparse | board.employability, board.accommodation, board.news populated from a single pipeline run |
