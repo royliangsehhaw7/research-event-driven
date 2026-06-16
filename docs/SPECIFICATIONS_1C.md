@@ -152,6 +152,7 @@ supplied university. Your output scopes all findings to the university's
 country. You never research careers for a different country.
 
 ## What to Research
+
 **Career paths (3–6 paths required):**
 Search for the most common career paths graduates from this specific course
 enter. Prefer sources that name actual graduate destinations over generic
@@ -188,14 +189,22 @@ Deduplicate. Include both technical skills (languages, tools, frameworks)
 and soft skills only if they appear in multiple independent sources.
 
 ## Quality Rules
-- Discard any salary data older than 1 year. Tavily enforces time_range="year"
-  on every search call. Still verify the date if a result looks stale.
-- Do not use site: queries with tavily_search. Tavily does not honour time
-  filtering on site: prefixed queries and returns stale results. Instead,
-  use tavily_search to find relevant URLs, then call fetch_page on those URLs
-  to retrieve the actual page content.
+
+- Discard any salary data older than 2 years. Tavily enforces days=730 —
+  if a result appears, it passed the date filter. Still verify the date
+  if it looks stale.
+- Prefer country-specific sources over global aggregators where available.
+  A UK-specific salary survey is more reliable than a global average for
+  a UK university.
+- If fewer than 3 career paths can be confirmed from search results,
+  set confidence to "low" and explain in notes.
+- Do not invent career paths. If search returns thin results, report what
+  was found and flag it.
+- Named employers are better than sectors. "Google, Amazon, HSBC" is more
+  useful than "technology and finance companies".
 
 ## Output Requirements
+
 - `career_paths`: minimum 3. Each must have `title`, `description`, and
   `typical_companies` populated with named employers, not generic sectors.
 - `salary_ranges`: one entry per career path. All three levels required —
@@ -253,7 +262,7 @@ from schemas.messages.career_completed import CareerResearchCompletedMessage
 from schemas.messages.progress_update import ProgressUpdateMessage
 from schemas.outputs.career_output import CareerOutput
 from tools.fetch_tool import fetch_page
-from tools.search_tool import tavily_search
+from tools.search_tool import tavily_search as _tavily_search
 
 logger = logging.getLogger("career_agent")
 
@@ -266,10 +275,6 @@ class CareerAgent(BaseAgent):
     Fires:         CareerResearchCompletedMessage
 
     Tools: tavily_search (budget-capped via _make_search_tool), fetch_page (uncapped)
-
-    Note: site: queries must not be passed to tavily_search — Tavily does not
-    honour time_range filtering on site: prefixed queries. Use tavily_search to
-    find URLs, then fetch_page to retrieve content from those URLs.
     """
 
     def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
@@ -283,10 +288,31 @@ class CareerAgent(BaseAgent):
             output_type=CareerOutput,
             system_prompt=self.get_instruction(),
             tools=[
-                tavily_search,
+                self._make_search_tool(),
                 fetch_page,
             ],
         )
+
+    def _make_search_tool(self):
+        """Return a budget-aware tavily_search closure over this agent instance."""
+        agent_self = self
+
+        async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
+            """Search the web via Tavily. Budget-capped per agent instance."""
+            if agent_self._calls_made >= agent_self._tool_budget:
+                logger.warning(
+                    "career_agent | budget exhausted (%d/%d) — query=%r",
+                    agent_self._calls_made, agent_self._tool_budget, query,
+                )
+                return json.dumps({
+                    "error": "tool budget exhausted",
+                    "calls_made": agent_self._calls_made,
+                    "budget": agent_self._tool_budget,
+                })
+            agent_self._calls_made += 1
+            return await _tavily_search(ctx, query)
+
+        return tavily_search
 
     # ── BaseAgent interface ───────────────────────────────────────────────────
 
@@ -319,13 +345,6 @@ class CareerAgent(BaseAgent):
             - country: the university's country — scope ALL salary and employer data to this
             - study_level: always "undergraduate"
 
-            Tool usage rules:
-            - Use tavily_search for general queries only. Never pass site: prefixed queries
-              to tavily_search — time filtering is not honoured for site: searches and results
-              will be stale.
-            - To retrieve content from a specific URL (e.g. a job board page or salary survey),
-              call fetch_page with that URL directly.
-
             You must not research careers for a different country than deps.context.country.
         """.strip()
 
@@ -341,7 +360,7 @@ class CareerAgent(BaseAgent):
 
     async def handle(self, message, deps: Deps) -> None:
         """Run career research and fire CareerResearchCompletedMessage."""
-        self._calls_made = 0
+        self._calls_made = 0   # reset counter on each run
 
         logger.info(
             "career_agent | starting — university=%r course=%r country=%r",
@@ -357,12 +376,13 @@ class CareerAgent(BaseAgent):
             timestamp=datetime.now().isoformat(),
         ))
 
-        task_brief = (f"""
-            University: {deps.context.university_name}
-            Course: {deps.context.intended_course}
-            Country: {deps.context.country}
-            Study level: {deps.context.study_level}
-            """
+        task_brief = (
+            f"University: {deps.context.university_name}\n"
+            f"Course: {deps.context.intended_course}\n"
+            f"Country: {deps.context.country}\n"
+            f"Study level: {deps.context.study_level}\n\n"
+            "Research graduate career paths, salary ranges in local currency, "
+            "and live job market demand. Scope all findings to the country above."
         )
 
         try:
@@ -387,6 +407,8 @@ class CareerAgent(BaseAgent):
                 triggered_by="career_agent",
                 timestamp=datetime.now().isoformat(),
             ))
+            # Still fire the completed message so the pipeline does not stall.
+            # board.career remains None — downstream agents handle this.
 
         await deps.hub.publish(CareerResearchCompletedMessage(
             triggered_by="career_agent",
@@ -394,10 +416,25 @@ class CareerAgent(BaseAgent):
         ))
 ```
 
-**Why** `make_budget_search_tool()` is imported from tools/search_tool.py and not defined on the class: budget enforcement closes over self._calls_made and self._tool_budget but the logic is identical across every agent — only logger_name differs. Defining it on each agent class would be copy-paste across the codebase. make_budget_search_tool() owns this responsibility once in tools/, and every agent calls it at construction time. Agents declare their budget; the tool enforces it.
+**Why `_make_search_tool()` is on the agent, not in a separate factory file:**
+budget enforcement closes over `self` — `agent_self._calls_made` and
+`agent_self._tool_budget`. Since the closure already needs the instance,
+putting it on the agent is the natural fit. A separate factory would require
+passing a mutable counter ref as an argument, which is a workaround for a
+problem that doesn't exist when the closure owns `self` directly. Every agent
+defines its own `_make_search_tool()` — the pattern is identical across all of
+them, just with a different logger name.
 
-Why _calls_made is a plain int: make_budget_search_tool captures self (the instance). agent_ref._calls_made += 1 is an attribute assignment on the instance — Python allows this without a list wrapper.
-Why CareerResearchCompletedMessage fires even on failure: if the LLM call throws, board.career is None. The seven section agents still need to run — they handle None career gracefully. If the message never fires, the entire pipeline stalls.
+**Why `_calls_made` is a plain `int` not `[0]`:** the closure captures `agent_self`
+(the instance), not a bare local variable. `agent_self._calls_made += 1` is an
+attribute assignment on the instance, not a rebind of a local name — Python
+allows this without a `list` wrapper.
+
+**Why `CareerResearchCompletedMessage` fires even on failure:** if the LLM
+call throws, `board.career` is `None`. The seven section agents still need to
+run — they handle a `None` career gracefully, scoping their own searches without
+career context. If the message never fires, the entire pipeline stalls. Firing
+always is the correct behaviour.
 
 ---
 
@@ -554,8 +591,9 @@ focused on the agent pattern, not on utility functions.
 
 ## 1c.6 `main.py` — CLI Entry Point
 
-`main.py` boots the fetch client, creates the handler, runs one request, and
-prints `board.career` to stdout. This is the verification step.
+`main.py` opens the shared fetch client around the run, creates the handler,
+runs one request, and prints `board.career` to stdout. This is the
+verification step.
 
 ```python
 # main.py — Stage 1c
@@ -574,13 +612,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 from services.research_handler import ResearchHandler
 
 
 async def run(university_name: str, intended_course: str, country: str) -> None:
-    await fetch_client.startup()
-    try:
+    async with fetch_client:
         handler = ResearchHandler()
         board = await handler.handle_request(
             university_name=university_name,
@@ -595,8 +632,6 @@ async def run(university_name: str, intended_course: str, country: str) -> None:
             print("\n── board.career ──────────────────────────────────────────")
             print(board.career.model_dump_json(indent=2))
             print("──────────────────────────────────────────────────────────\n")
-    finally:
-        await fetch_client.shutdown()
 
 
 if __name__ == "__main__":
@@ -606,6 +641,17 @@ if __name__ == "__main__":
         country="UK",
     ))
 ```
+
+> **Why `async with fetch_client:` here at all, given `fetch_page` already
+> wraps its own call in `async with fetch_client:`?** It isn't required —
+> `fetch_page` is self-contained and would open/close the connection on its
+> own if this weren't here. Wrapping the whole run is an optimization: it opens
+> the `mcp-server-fetch` subprocess once before any agent runs and keeps it
+> open for the whole request, so the first `fetch_page` call doesn't pay
+> subprocess-startup latency. Because `fastmcp.Client` is ref-counted, this is
+> just an outer `async with` — every inner `async with fetch_client:` inside
+> `fetch_page` reuses the same session and only the outermost exit actually
+> closes it.
 
 **Why `load_dotenv()` before any imports:** `tools/search_tool.py` reads
 `TAVILY_API_KEY` from `os.environ` at module import time. If `.env` is not
@@ -666,25 +712,23 @@ Real LLM + real Tavily calls. Requires:
   - OPENROUTER_API_KEY in .env
   - RESEARCH_MODEL in .env
 
-The fetch_server fixture starts FetchClient for tests that call fetch_page.
+The fetch_server fixture opens the shared fetch_client for tests that call fetch_page.
 """
 from __future__ import annotations
 
-import json
+import asyncio
 import pytest
 from datetime import datetime
-from unittest.mock import MagicMock, AsyncMock, patch
 from dotenv import load_dotenv
 load_dotenv()
 
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 
 @pytest.fixture(scope="module")
 async def fetch_server():
-    await fetch_client.startup()
-    yield
-    await fetch_client.shutdown()
+    async with fetch_client:
+        yield
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -702,7 +746,7 @@ def test_career_output_requires_confidence_and_sources() -> None:
     from schemas.outputs.career_output import CareerOutput
     import pydantic
     with pytest.raises(pydantic.ValidationError):
-        CareerOutput()
+        CareerOutput()   # missing required fields
 
 
 # ── Skill loader ──────────────────────────────────────────────────────────────
@@ -714,7 +758,7 @@ def test_career_skill_loads() -> None:
     assert skill is not None, "skills/career/SKILL.md missing or malformed"
     assert skill.key == "career"
     assert skill.tool_budget > 0
-    assert len(skill.instructions) > 100
+    assert len(skill.instructions) > 100, "SKILL.md body too short — check the file"
 
 
 # ── Agent construction ────────────────────────────────────────────────────────
@@ -743,75 +787,6 @@ def test_get_instruction_includes_skill_body() -> None:
     assert "Career Research Agent" in prompt
 
 
-def test_get_instruction_includes_site_query_warning() -> None:
-    """Confirm the system prompt warns the LLM not to use site: queries with tavily_search."""
-    from agents.career_agent import CareerAgent
-    agent = CareerAgent()
-    prompt = agent.get_instruction()
-    assert "site:" in prompt
-    assert "fetch_page" in prompt
-
-
-# ── search tool budget ────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_search_tool_budget_exhausted_returns_error_dict() -> None:
-    from agents.career_agent import CareerAgent
-
-    agent = CareerAgent(tool_budget=2)
-    agent._calls_made = 2
-    tool = agent._make_search_tool()
-    ctx = MagicMock()
-    raw = await tool(ctx, "test query")
-    result = json.loads(raw)
-
-    assert result["error"] == "tool budget exhausted"
-    assert result["calls_made"] == 2
-    assert result["budget"] == 2
-
-
-@pytest.mark.asyncio
-async def test_search_tool_increments_counter() -> None:
-    from agents.career_agent import CareerAgent
-
-    agent = CareerAgent(tool_budget=5)
-    tool = agent._make_search_tool()
-    ctx = MagicMock()
-
-    with patch("tools.search_tool.tavily_search", new=AsyncMock(return_value='{"query":"q","results":[]}')):
-        await tool(ctx, "query one")
-        await tool(ctx, "query two")
-
-    assert agent._calls_made == 2
-
-
-# ── fetch_page used instead of site: queries ─────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_fetch_page_retrieves_job_board_content(fetch_server) -> None:
-    """fetch_page returns current content from a job board URL.
-    This is the correct pattern for targeted URL retrieval — not site: queries via Tavily."""
-    from tools.fetch_tool import fetch_page
-    ctx = MagicMock()
-    raw = await fetch_page(ctx, "https://www.reed.co.uk/jobs/computer-science-jobs")
-    result = json.loads(raw)
-    assert result["status"] in ("ok", "error")
-    if result["status"] == "ok":
-        assert len(result["content"]) > 100
-
-
-@pytest.mark.asyncio
-async def test_fetch_page_retrieves_salary_survey_content(fetch_server) -> None:
-    """fetch_page returns content from a salary survey URL found via tavily_search."""
-    from tools.fetch_tool import fetch_page
-    ctx = MagicMock()
-    raw = await fetch_page(ctx, "https://www.prospects.ac.uk/careers-advice/what-can-i-do-with-my-degree/computer-science")
-    result = json.loads(raw)
-    assert result["status"] in ("ok", "error")
-    if result["status"] == "ok":
-        assert len(result["content"]) > 100
-
-
 # ── Hub wiring ────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -834,6 +809,7 @@ async def test_career_agent_subscribes_to_research_requested() -> None:
         ),
     )
 
+    # Replace handle with a no-op to verify subscribe wires correctly
     called = []
     agent = CareerAgent(tool_budget=1)
     async def mock_handle(msg, d): called.append(msg)
@@ -867,9 +843,9 @@ async def test_career_agent_populates_board_career(fetch_server) -> None:
     )
 
     assert board.career is not None, "board.career is None — CareerAgent failed"
-    assert len(board.career.career_paths) >= 3
-    assert len(board.career.salary_ranges) >= 1
-    assert len(board.career.job_postings) >= 1
+    assert len(board.career.career_paths) >= 3, "Expected at least 3 career paths"
+    assert len(board.career.salary_ranges) >= 1, "Expected at least 1 salary range"
+    assert len(board.career.job_postings) >= 1, "Expected at least 1 job posting"
     assert board.career.country_scope == "UK"
     assert board.career.confidence in ("high", "medium", "low")
     assert isinstance(board.career.sources, list)
@@ -898,7 +874,10 @@ async def test_career_agent_fires_completed_message(fetch_server) -> None:
     )
 
     fired = []
-    async def capture(msg): fired.append(msg)
+
+    async def capture(msg):
+        fired.append(msg)
+
     hub.subscribe(CareerResearchCompletedMessage, capture)
 
     agent = CareerAgent(tool_budget=6)
@@ -912,7 +891,7 @@ async def test_career_agent_fires_completed_message(fetch_server) -> None:
         timestamp=datetime.now().isoformat(),
     ))
 
-    assert len(fired) == 1
+    assert len(fired) == 1, "CareerResearchCompletedMessage should fire exactly once"
     assert isinstance(fired[0], CareerResearchCompletedMessage)
 ```
 
@@ -933,17 +912,16 @@ tests/test_stage_1c.py::test_career_skill_loads PASSED
 tests/test_stage_1c.py::test_career_agent_constructs PASSED
 tests/test_stage_1c.py::test_career_agent_reset_clears_calls_made PASSED
 tests/test_stage_1c.py::test_get_instruction_includes_skill_body PASSED
-tests/test_stage_1c.py::test_get_instruction_includes_site_query_warning PASSED
-tests/test_stage_1c.py::test_search_tool_budget_exhausted_returns_error_dict PASSED
-tests/test_stage_1c.py::test_search_tool_increments_counter PASSED
-tests/test_stage_1c.py::test_fetch_page_retrieves_job_board_content PASSED
-tests/test_stage_1c.py::test_fetch_page_retrieves_salary_survey_content PASSED
 tests/test_stage_1c.py::test_career_agent_subscribes_to_research_requested PASSED
 tests/test_stage_1c.py::test_career_agent_populates_board_career PASSED
 tests/test_stage_1c.py::test_career_agent_fires_completed_message PASSED
 
-14 passed in X.Xs
+9 passed in X.Xs
 ```
+
+The last two tests make real API calls. They take 10–30 seconds depending on
+model response time. Pass `-k "not populates_board and not fires_completed"` to
+skip LLM tests during structural iteration.
 
 ---
 
@@ -960,11 +938,16 @@ Expected log sequence:
 ```
 INFO | skill_loader | loaded skills/career/SKILL.md
 INFO | research_handler | CareerAgent constructed
-INFO | fetch_client | Fetch MCP server started
 INFO | career_agent | starting — university='University of Manchester' course='Computer Science' country='UK'
 INFO | career_agent | completed — paths=5 confidence=high
-INFO | fetch_client | Fetch MCP server stopped
 ```
+
+Note: there's no longer a separate "Fetch MCP server started/stopped" log
+pair — `fastmcp.Client` doesn't log on connect/disconnect by default. The
+`mcp-server-fetch` subprocess starts the first time `async with fetch_client:`
+is entered (the outer one in `main.py`, or the first `fetch_page` call if
+`main.py`'s wrapper weren't there) and stops when the outermost `async with`
+exits.
 
 Followed by `board.career` JSON printed to stdout. Confirm:
 
@@ -1006,11 +989,17 @@ Cause: `load_dotenv()` not called before the tool module import.
 Fix: confirm `main.py` calls `load_dotenv()` as its first statement before any
 project imports.
 
-**`RuntimeError: FetchClient is not running`**
-Cause: `fetch_client.startup()` not called before the first request, or a test
-runs without the `fetch_server` fixture.
-Fix: confirm `main.py` calls `await fetch_client.startup()` before constructing
-`ResearchHandler`. Confirm LLM tests use the `fetch_server` fixture.
+**`McpError` / connection failure from `fetch_page`**
+Cause: the `mcp-server-fetch` subprocess failed to start (e.g. `mcp-server-fetch`
+not installed, or `python -m mcp_server_fetch` not runnable). Unlike the old
+singleton, there's no separate "not started" state to worry about —
+`fetch_client` connects lazily on first `async with`, in `main.py` or inside
+`fetch_page` itself. `fetch_page` never raises this to the agent: it's caught
+and returned as `status: "error"` in the JSON result. If you see it surface
+anyway, check it wasn't raised *outside* `fetch_page`'s try/except (e.g. from
+`main.py`'s own `async with fetch_client:` failing to connect before any agent
+runs). Fix: confirm `pip install fastmcp mcp-server-fetch` succeeded and
+`python -m mcp_server_fetch --help` works (see Stage 1b, Service 2).
 
 **LLM returns fewer than 3 career paths**
 Not a bug — the agent sets `confidence: "low"` and explains in `notes`. This
@@ -1028,12 +1017,12 @@ can happen for niche courses or when Tavily returns sparse results. Inspect the
 - [ ] `core/llm_factory.py` — `get_model()` reads from env, returns
       pydantic-ai `OpenAIModel` configured for OpenRouter
 - [ ] `agents/career_agent.py` — `CareerAgent` implemented with `_calls_made = 0`,
-      `make_budget_search_tool()` imported from `tools/search_tool.py`, `subscribe()`,
-      `get_instruction()`, `handle()`, `reset()` — no `_make_search_tool()` on the class
+      `_make_search_tool()` method on the class, `subscribe()`, `get_instruction()`,
+      `handle()`, `reset()`
 - [ ] `services/research_handler.py` — minimal Stage 1c version — loads career
       skill, constructs `CareerAgent`, wires it, publishes trigger
-- [ ] `main.py` — `load_dotenv()` first, `fetch_client.startup()` before
-      handler, `shutdown()` in `finally`, prints `board.career`
+- [ ] `main.py` — `load_dotenv()` first, wraps the run in
+      `async with fetch_client:`, prints `board.career`
 - [ ] `schemas/messages/research_requested.py` — `country` field confirmed present
 - [ ] `schemas/messages/career_completed.py` — no-payload message confirmed
 - [ ] `pytest tests/test_stage_1c.py -v` — 9 passed

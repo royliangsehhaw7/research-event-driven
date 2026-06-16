@@ -28,7 +28,7 @@ you are debugging agent logic, not tool plumbing.
 | `fetch_page` | `tools/fetch_tool.py` | All section agents | Direct URL fetch — catalog pages, salary surveys |
 | `ddg_search` | `tools/ddg_tool.py` | NewsAgent fallback only | Zero cost, no key, no quota |
 | `adzuna_jobs` | `tools/adzuna_tool.py` | CareerAgent (UK + AU) | Structured live job postings with salary data |
-| `mycareersfuture_jobs` | `tools/mcf_tool.py` | CareerAgent (SG) | Singapore government job API — no auth required |
+| `mcf_jobs` | `tools/mcf_tool.py` | CareerAgent (SG) | Singapore government job API — no auth required |
 
 **Why separate job posting tools instead of Tavily:**
 Tavily cannot reliably retrieve live job postings — job boards (Indeed, Reed,
@@ -36,6 +36,14 @@ LinkedIn) block fetch-based access and Tavily's `site:` queries do not honour
 `time_range` filtering. Adzuna and MyCareersFuture are purpose-built APIs that
 return structured, dated job data directly. They replace Tavily for the job
 posting snapshot only — Tavily remains the primary tool for all other research.
+
+**How CareerAgent selects which job tool to call:**
+Both `adzuna_jobs` and `mcf_jobs` are registered on `CareerAgent` at construction
+time. The LLM reads `deps.context.country` and selects the correct tool based on
+the docstrings — `adzuna_jobs` for UK and Australia, `mcf_jobs` for Singapore.
+Each tool returns an error in `JobPostingsResponse.error` if called for a country
+it does not support — this is a safety net only, not the routing mechanism. The
+routing is done by the LLM via the tool docstrings and the CareerAgent SKILL.md.
 
 ---
 
@@ -90,7 +98,7 @@ a salary survey — rather than search for it.
 **Install:**
 
 ```bash
-pip install mcp mcp-server-fetch
+pip install fastmcp mcp-server-fetch
 ```
 
 Confirm the server is available:
@@ -99,14 +107,11 @@ Confirm the server is available:
 python -m mcp_server_fetch --help
 ```
 
-If that command fails, switch to the `uvx` invocation. Update
-`StdioServerParameters` in `mcps/fetch_client.py`:
+If that command fails, switch to the `uvx` invocation. Update the
+`StdioTransport` in `mcps/fetch_client.py`:
 
 ```python
-server_params = StdioServerParameters(
-    command="uvx",
-    args=["mcp-server-fetch"],
-)
+StdioTransport(command="uvx", args=["mcp-server-fetch"])
 ```
 
 And install `uv`:
@@ -167,19 +172,19 @@ ADZUNA_APP_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 **Install:**
 
-```bash
-pip install requests
-```
-
 Adzuna has no official Python client — the wrapper calls the REST API directly
 via `httpx` (already a pydantic-ai dependency). No additional package needed.
 
-**Country codes used in this project:**
+**Country codes and currencies used in this project:**
 
-| Country | Adzuna country code |
-|---|---|
-| UK | `gb` |
-| Australia | `au` |
+| `deps.context.country` | Adzuna country code | Currency |
+|---|---|---|
+| `UK` | `gb` | `GBP` |
+| `Australia` | `au` | `AUD` |
+
+These mappings live in `_COUNTRY_MAP` in `adzuna_tool.py` as a single dict of
+`country → (adzuna_code, currency)` tuples. Adding a new country means adding
+one entry to that dict — nowhere else.
 
 ---
 
@@ -203,17 +208,21 @@ already present.
 
 ```bash
 # .env — full contents after Stage 1b
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+
+RESEARCH_MODEL=nvidia/nemotron-3-super-120b-a12b:free
+SCORING_MODEL=nvidia/nemotron-3-super-120b-a12b:free
+CONVERSATION_MODEL=nvidia/nemotron-3-super-120b-a12b:free
+
 TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ADZUNA_APP_ID=xxxxxxxx
 ADZUNA_APP_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ADZUNA_URL=https://api.adzuna.com/v1/api/jobs
 
-OPENROUTER_API_KEY=sk-or-...
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+MCF_URL=https://api.mycareersfuture.gov.sg/v2
 
-RESEARCH_MODEL=openrouter/google/gemini-2.5-pro
-SCORING_MODEL=openrouter/google/gemini-2.5-pro
-CONVERSATION_MODEL=openrouter/google/gemini-2.5-flash
 ```
 
 ---
@@ -229,7 +238,7 @@ python-dotenv
 tavily-python
 ddgs
 httpx
-mcp
+fastmcp
 mcp-server-fetch
 jinja2
 pytest
@@ -266,14 +275,14 @@ CONVERSATION_MODEL=openrouter/google/gemini-2.5-flash
 
 ```
 ├── mcps/
-│   └── fetch_client.py             Fetch MCP singleton — startup() / shutdown() / call_tool()
+│   └── fetch_client.py             Fetch MCP — module-level fastmcp.Client (reentrant, ref-counted, shared)
 │
 ├── tools/
-│   ├── search_tool.py              tavily_search — module-level TavilyClient singleton
-│   ├── fetch_tool.py               fetch_page — calls fetch_client singleton
-│   ├── ddg_tool.py                 ddg_search — module-level DDGS singleton (NewsAgent only)
-│   ├── adzuna_tool.py              adzuna_jobs — httpx REST calls, UK + AU job postings
-│   └── mcf_tool.py                 mcf_jobs — httpx REST calls, SG job postings (no auth)
+│   ├── search_tool.py              tavily_search — module-level AsyncTavilyClient singleton (async, concurrency-safe)
+│   ├── fetch_tool.py               fetch_page — calls fetch_client.call_tool(), never raises
+│   ├── ddg_tool.py                 ddg_search — module-level DDGS singleton, calls via asyncio.to_thread (NOT registered on any agent)
+│   ├── adzuna_tool.py              adzuna_jobs — httpx REST, UK + AU, routes by _COUNTRY_MAP
+│   └── mcf_tool.py                 mcf_jobs — httpx REST, SG only, no auth
 │
 ├── schemas/
 │   ├── search_result.py            SearchResult, SearchResponse
@@ -344,7 +353,7 @@ class JobPosting:
     salary_max:     float | None    # in local currency, annual
     currency:       str             # ISO code — GBP, AUD, SGD
     date_posted:    str             # ISO date string YYYY-MM-DD or as returned
-    skills:         list[str]       # extracted from description or tags
+    skills:         list[str]       # tags from the API response; empty list if none provided
     source_url:     str             # direct link to the posting
     source:         str             # "adzuna" or "mycareersfuture"
 
@@ -359,75 +368,86 @@ class JobPostingsResponse:
     error:          str | None = None
 ```
 
-**Why a shared schema:** CareerAgent is written once and routes to either
-Adzuna or MCF based on `deps.context.country`. Both tools return
-`JobPostingsResponse` — the agent code has no country-specific branching
-beyond the tool selection itself.
+**Why a shared schema:** CareerAgent is written once and registers both
+`adzuna_jobs` and `mcf_jobs`. The LLM selects the correct tool based on
+`deps.context.country`. Both tools return `JobPostingsResponse` — the agent
+code has no country-specific branching beyond the tool selection itself.
+
+**`skills` field:** populated from structured API data only — tags or skill
+arrays returned directly by the API. Adzuna returns no structured skill tags,
+so `skills` is always `[]` for Adzuna postings. MCF returns a `skills` array;
+extract names from it. No keyword scanning of description text — the LLM reads
+the full `description` field and extracts what it needs.
 
 ---
 
-## 1b.1 `mcps/fetch_client.py` — unchanged from original
+## 1b.1 `mcps/fetch_client.py` — shared `fastmcp.Client`, no custom lifecycle code
+
+> **Shared instance — still needed, still recommended, even under `asyncio.gather()`.**
+> From Stage 1d onward, multiple section agents call `fetch_page` concurrently.
+> Two things make a single shared `fastmcp.Client` both safe and the right
+> design here:
+>
+> 1. **One subprocess for the whole pipeline run.** `mcp-server-fetch` is a
+>    separate OS process started via the client's stdio transport. Spawning a
+>    fresh subprocess per agent (or per call) would add real startup latency to
+>    every `fetch_page` call and leave orphaned processes if shutdown isn't
+>    handled per-instance. One process, started once, reused for the run, is
+>    both faster and simpler to clean up.
+> 2. **`fastmcp.Client` is a reentrant, ref-counted async context manager that
+>    is safe for concurrent calls.** `async with fetch_client:` can be entered
+>    from multiple places — each `__aenter__` increments an internal counter
+>    and reuses the existing session; the underlying connection only closes
+>    once the matching number of `__aexit__`s have run. Concurrent
+>    `await fetch_client.call_tool(...)` calls on that one session are
+>    multiplexed by request ID, same as raw MCP JSON-RPC. This is a different
+>    situation from the Tavily client: `TavilyClient.search()` blocks the whole
+>    event loop because it's a synchronous HTTP call with no concurrency story
+>    at all, whereas `fastmcp.Client.call_tool()` is natively async and built
+>    for concurrent in-flight requests.
+>
+> Net effect: `fetch_client` is a single module-level `fastmcp.Client`, entered
+> once with `async with fetch_client:` around the pipeline run (Stage 1c+).
+> `fastmcp` provides the reentrancy/ref-counting and subprocess lifecycle —
+> there is no custom `FetchClient` class, no manual `startup()`/`shutdown()`,
+> and no manual `ClientSession`/`stdio_client` plumbing. This is the one tool
+> wrapper that was already concurrency-safe by construction; now the library
+> handles it directly.
 
 ```python
 # mcps/fetch_client.py
 from __future__ import annotations
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from fastmcp import Client
+from fastmcp.client.transports import StdioTransport
 
-from core.logger import logger
-
-
-class FetchClient:
-    """Singleton wrapper around the Fetch MCP subprocess.
-
-    Lifecycle:
-        startup()  — call once at application boot before any request
-        shutdown() — call once at application exit in a finally block
-        call_tool() — call per fetch request
-
-    Never instantiate directly outside this module. Use the module-level
-    `fetch_client` singleton.
-    """
-
-    def __init__(self) -> None:
-        self._session: ClientSession | None = None
-        self._context = None
-
-    async def startup(self) -> None:
-        server_params = StdioServerParameters(
-            command="python",
-            args=["-m", "mcp_server_fetch"],
-        )
-        self._context = stdio_client(server_params)
-        read, write = await self._context.__aenter__()
-        self._session = ClientSession(read, write)
-        await self._session.__aenter__()
-        await self._session.initialize()
-        logger.info("fetch_client | MCP fetch server started")
-
-    async def shutdown(self) -> None:
-        if self._session:
-            await self._session.__aexit__(None, None, None)
-        if self._context:
-            await self._context.__aexit__(None, None, None)
-        logger.info("fetch_client | MCP fetch server stopped")
-
-    async def call_tool(self, tool_name: str, arguments: dict) -> object:
-        if not self._session:
-            raise RuntimeError(
-                "FetchClient not started. Call fetch_client.startup() at boot."
-            )
-        result = await self._session.call_tool(tool_name, arguments)
-        return result.content
-
-
-fetch_client = FetchClient()
+# Single shared client for the Fetch MCP server. Import this instance
+# everywhere `fetch_page` needs it — do not construct a new Client.
+#
+# Lifecycle: entered once via `async with fetch_client:` around the pipeline
+# run (see main.py). Re-entrant and ref-counted, so it's safe for multiple
+# agents to also enter/exit it concurrently if needed — fastmcp keeps the
+# subprocess and session alive until the last exit.
+fetch_client = Client(
+    StdioTransport(command="python", args=["-m", "mcp_server_fetch"])
+)
 ```
 
 ---
 
-## 1b.2 `tools/search_tool.py` — unchanged from original
+## 1b.2 `tools/search_tool.py` — uses `AsyncTavilyClient`
+
+> **Why async, not the plain `TavilyClient`:** `tavily_search` is registered on
+> every section agent, and Stage 1d onward fires all section agents concurrently
+> via `asyncio.gather()`. The synchronous `TavilyClient.search(...)` is a
+> blocking `requests` call — if the module-level client were a `TavilyClient`,
+> each concurrent agent's search would block the entire event loop for its full
+> duration, serialising every agent's work (including unrelated `fetch_page` and
+> LLM calls on other agents). `tavily-python` ships `AsyncTavilyClient`, built on
+> `httpx.AsyncClient`, specifically for this case. A single shared
+> `AsyncTavilyClient` instance is safe to use concurrently — `httpx.AsyncClient`
+> maintains its own connection pool and is designed to be shared across
+> coroutines on the same event loop.
 
 ```python
 # tools/search_tool.py
@@ -437,7 +457,7 @@ import os
 
 from dotenv import load_dotenv
 from pydantic_ai import RunContext
-from tavily import TavilyClient
+from tavily import AsyncTavilyClient
 
 from core.deps import Deps
 from core.logger import logger
@@ -445,7 +465,7 @@ from schemas.search_result import SearchResponse, SearchResult
 
 load_dotenv()
 
-_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+_client = AsyncTavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
 
 async def tavily_search(
@@ -467,7 +487,7 @@ async def tavily_search(
         SearchResponse with results list. Never raises — empty results
         list returned on failure.
     """
-    raw = _client.search(query=query, max_results=max_results, time_range="year")
+    raw = await _client.search(query=query, max_results=max_results, time_range="year")
     logger.warning("search_tool | query=%r results=%d", query, len(raw.get("results", [])))
 
     results_list = [
@@ -490,7 +510,7 @@ async def tavily_search(
 
 ---
 
-## 1b.3 `tools/fetch_tool.py` — unchanged from original
+## 1b.3 `tools/fetch_tool.py` — calls the shared `fastmcp.Client`
 
 ```python
 # tools/fetch_tool.py
@@ -498,6 +518,7 @@ from __future__ import annotations
 
 import json
 
+from mcp.types import TextContent
 from pydantic_ai import RunContext
 
 from core.deps import Deps
@@ -525,11 +546,16 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
         Never raises — returns status "error" on failure.
     """
     try:
-        raw = await fetch_client.call_tool("fetch", {
-            "url": url,
-            "max_length": 50000,
-        })
-        result = FetchResult(url=url, content=str(raw), status="ok", error=None)
+        async with fetch_client:
+            raw = await fetch_client.call_tool("fetch", {
+                "url": url,
+                "max_length": 50000,
+            })
+
+        content = "".join(
+            block.text for block in raw.content if isinstance(block, TextContent)
+        )
+        result = FetchResult(url=url, content=content, status="ok", error=None)
         logger.info("fetch_tool | fetched %r — %d chars", url, len(result.content))
 
     except Exception as exc:
@@ -544,9 +570,30 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
     })
 ```
 
+> **`async with fetch_client:` inside the wrapper, every call.** `fastmcp.Client`
+> is reentrant and ref-counted (see 1b.1), so entering it here is cheap if the
+> connection is already open elsewhere (e.g. a pipeline-level
+> `async with fetch_client:` in `main.py`) — it just increments the counter and
+> reuses the session. If nothing else has opened it yet, this call opens the
+> subprocess on first use and keeps it open as long as any caller is inside the
+> `async with` block. Either way `fetch_page` is self-contained and safe to call
+> from any agent without depending on `main.py` having run a separate
+> `startup()` step first.
+
 ---
 
-## 1b.4 `tools/ddg_tool.py` — unchanged from original
+## 1b.4 `tools/ddg_tool.py` — date filtering unchanged, calls made non-blocking
+
+> **Not wired to any agent (per MASTER §13) — `ddg_search` stays unregistered
+> because post-call date filtering is unreliable, not because of this fix.**
+> This change is independent and worth making now anyway: `ddgs.DDGS().text(...)`
+> is a synchronous, blocking call (built on `requests`/`primp`, not `httpx`).
+> `ddg_search` is declared `async def`, so as written it would block the event
+> loop for its full duration — the same problem as the original `TavilyClient`.
+> `ddgs` has no async client, so the fix is `asyncio.to_thread(...)`, which runs
+> the blocking call in a worker thread and lets the event loop continue. This
+> keeps `ddg_tool.py` correct and ready to register the moment a reliable date
+> filter exists, without leaving a latent concurrency bug for whoever wires it up.
 
 ```python
 # tools/ddg_tool.py
@@ -588,6 +635,10 @@ async def ddg_search(
 ) -> DDGResponse:
     """Search via DuckDuckGo. NewsAgent fallback only.
 
+    NOT CURRENTLY REGISTERED ON ANY AGENT — see MASTER §13. Date filtering
+    on missing/unparseable dates is insufficient on its own; this function
+    is retained for future use once a reliable date-filtering solution exists.
+
     Results are date-filtered to the last 2 years before returning.
     Results with no parseable date are excluded — do not rely on the LLM
     to discard old results.
@@ -600,11 +651,11 @@ async def ddg_search(
         DDGResponse with filtered results list. Never raises.
     """
     try:
-        raw = _client.text(query, max_results=max_results * 2)
+        raw = await asyncio.to_thread(_client.text, query, max_results=max_results * 2)
     except Exception:
         await asyncio.sleep(3.0)
         try:
-            raw = _client.text(query, max_results=max_results * 2)
+            raw = await asyncio.to_thread(_client.text, query, max_results=max_results * 2)
         except Exception as exc:
             logger.error("ddg_tool | failed after retry: %s", exc)
             return DDGResponse(query=query, results=[])
@@ -644,7 +695,6 @@ async def ddg_search(
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 
 import httpx
 from dotenv import load_dotenv
@@ -660,26 +710,14 @@ _APP_ID  = os.environ["ADZUNA_APP_ID"]
 _APP_KEY = os.environ["ADZUNA_APP_KEY"]
 _BASE    = "https://api.adzuna.com/v1/api/jobs"
 
-# Maps deps.context.country to Adzuna country codes
-_COUNTRY_MAP: dict[str, str] = {
-    "UK":        "gb",
-    "Australia": "au",
+# Single source of truth for country routing.
+# Key:   the exact string value of deps.context.country for supported countries.
+# Value: (adzuna_country_code, iso_currency_code)
+# To add a new country: add one entry here. Nothing else changes.
+_COUNTRY_MAP: dict[str, tuple[str, str]] = {
+    "UK":        ("gb", "GBP"),
+    "Australia": ("au", "AUD"),
 }
-
-
-def _extract_skills(description: str) -> list[str]:
-    """Naive keyword extraction from job description.
-
-    Looks for common technical skill tokens. Returns deduplicated list.
-    Kept simple — the LLM will further analyse the full description.
-    """
-    SKILL_TOKENS = {
-        "python", "java", "javascript", "typescript", "sql", "aws", "azure",
-        "gcp", "docker", "kubernetes", "react", "node", "machine learning",
-        "data analysis", "communication", "agile", "git", "linux",
-    }
-    desc_lower = description.lower()
-    return [s for s in SKILL_TOKENS if s in desc_lower]
 
 
 async def adzuna_jobs(
@@ -689,9 +727,8 @@ async def adzuna_jobs(
 ) -> JobPostingsResponse:
     """Search live job postings via Adzuna API. UK and Australia only.
 
-    Routes automatically to the correct Adzuna country endpoint based on
-    deps.context.country. Do not call this tool for Singapore — use
-    mcf_jobs instead.
+    Call this tool when deps.context.country is "UK" or "Australia".
+    Do not call this tool for Singapore — use mcf_jobs instead.
 
     Args:
         query:       job search query (e.g. "software engineer graduate")
@@ -702,24 +739,27 @@ async def adzuna_jobs(
         returns error field on failure so the agent can continue.
     """
     country = ctx.deps.context.country
-    adzuna_code = _COUNTRY_MAP.get(country)
+    mapping = _COUNTRY_MAP.get(country)
 
-    if not adzuna_code:
+    if not mapping:
         return JobPostingsResponse(
             query=query,
             country=country,
             total_found=0,
-            error=f"adzuna_jobs does not support country={country!r}. Use mcf_jobs for Singapore.",
+            error=(
+                f"adzuna_jobs does not support country={country!r}. "
+                f"Supported: {list(_COUNTRY_MAP)}. Use mcf_jobs for Singapore."
+            ),
         )
 
-    currency = "GBP" if adzuna_code == "gb" else "AUD"
+    adzuna_code, currency = mapping
 
     params = {
-        "app_id":          _APP_ID,
-        "app_key":         _APP_KEY,
+        "app_id":           _APP_ID,
+        "app_key":          _APP_KEY,
         "results_per_page": min(max_results, 50),
-        "what":            query,
-        "content-type":    "application/json",
+        "what":             query,
+        "content-type":     "application/json",
     }
 
     url = f"{_BASE}/{adzuna_code}/search/1"
@@ -740,7 +780,6 @@ async def adzuna_jobs(
     postings = []
 
     for job in data.get("results", []):
-        description = job.get("description", "")
         salary_min = job.get("salary_min")
         salary_max = job.get("salary_max")
 
@@ -748,12 +787,12 @@ async def adzuna_jobs(
             title=       job.get("title", ""),
             company=     job.get("company", {}).get("display_name", ""),
             location=    job.get("location", {}).get("display_name", ""),
-            description= description,
+            description= job.get("description", ""),
             salary_min=  float(salary_min) if salary_min else None,
             salary_max=  float(salary_max) if salary_max else None,
             currency=    currency,
             date_posted= job.get("created", ""),
-            skills=      _extract_skills(description),
+            skills=      [],   # Adzuna returns no structured skill tags; LLM reads description
             source_url=  job.get("redirect_url", ""),
             source=      "adzuna",
         ))
@@ -790,7 +829,11 @@ _BASE = "https://api.mycareersfuture.gov.sg/v2"
 
 
 def _extract_skills(posting: dict) -> list[str]:
-    """Extract skill names from MCF skills array."""
+    """Extract skill names from the MCF skills array in the API response.
+
+    MCF returns a structured skills array — extract names from it directly.
+    No description scanning.
+    """
     return [
         s.get("skill", "")
         for s in posting.get("skills", [])
@@ -816,8 +859,10 @@ async def mcf_jobs(
 ) -> JobPostingsResponse:
     """Search live job postings via MyCareersFuture API. Singapore only.
 
-    Uses the Singapore government public job portal API. No authentication
-    required. Do not call this tool for UK or Australia — use adzuna_jobs.
+    Call this tool when deps.context.country is "Singapore".
+    Do not call this tool for UK or Australia — use adzuna_jobs instead.
+
+    No authentication required — this is a public government API.
 
     Args:
         query:       job search query (e.g. "software engineer computer science")
@@ -834,13 +879,16 @@ async def mcf_jobs(
             query=query,
             country=country,
             total_found=0,
-            error=f"mcf_jobs only supports Singapore. For {country!r} use adzuna_jobs.",
+            error=(
+                f"mcf_jobs only supports Singapore. "
+                f"country={country!r} is not supported. Use adzuna_jobs for UK and Australia."
+            ),
         )
 
     params = {
-        "search":   query,
-        "limit":    min(max_results, 100),
-        "offset":   0,
+        "search":  query,
+        "limit":   min(max_results, 100),
+        "offset":  0,
     }
 
     try:
@@ -864,7 +912,7 @@ async def mcf_jobs(
         postings.append(JobPosting(
             title=       job.get("title", ""),
             company=     job.get("postedCompany", {}).get("name", ""),
-            location=    "Singapore",
+            location=    job.get("location", {}).get("oneLineAddress", "Singapore"),
             description= job.get("description", ""),
             salary_min=  salary_min,
             salary_max=  salary_max,
@@ -900,28 +948,78 @@ new tools. These are drop-in replacements — only the listed sections change.
 ```markdown
 | Tool | Kind | Role | API Key Required |
 |---|---|---|---|
-| **Tavily** | Python client | Primary search — career paths, salary, forum, news, rankings | `TAVILY_API_KEY` |
+| **Tavily** | Python client (`AsyncTavilyClient`) | Primary search — career paths, salary, forum, news, rankings | `TAVILY_API_KEY` |
 | **Fetch MCP** | MCP server | Direct URL fetch — catalog pages, salary surveys | None |
 | **Adzuna** | REST API | Live job postings — UK and Australia | `ADZUNA_APP_ID` + `ADZUNA_APP_KEY` |
 | **MyCareersFuture** | REST API | Live job postings — Singapore only | None — public API |
-| **DuckDuckGo** | Python client | NewsAgent fallback — no key, no quota | None |
+| **DuckDuckGo** | Python client | NewsAgent fallback — no key, no quota — **not yet registered on any agent** | None |
 ```
+
+> **Tavily client note:** `AsyncTavilyClient`, not `TavilyClient`. Section agents
+> run concurrently via `asyncio.gather()` from Stage 1d onward; the synchronous
+> client would block the event loop on every search. `AsyncTavilyClient` is
+> built on `httpx.AsyncClient` and a single module-level instance is safe to
+> share across concurrent agents.
+
+### Section 8.6 — Tool-to-agent mapping (replace entire table and note)
+
+```markdown
+| Tool | career | background | rankings | program | employability | accommodation | news | forum | alternatives | scoring | conversation |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `tavily_search` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | |
+| `fetch_page` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | |
+| `adzuna_jobs` | ✓ | | | | | | | | | | |
+| `mcf_jobs` | ✓ | | | | | | | | | | |
+| `ddg_search` | | | | | | | | | | | |
+
+`adzuna_jobs` and `mcf_jobs` are both registered on `CareerAgent`. The LLM
+selects which to call based on `deps.context.country` and the tool docstrings.
+`scoring` and `conversation` have no tools — they work entirely from the
+blackboard. `tool_budget: 0` in their SKILL.md makes this explicit.
+
+```
+>[!WARNING] DuckDuckGo Search NOT wired
+>Due to the inability to specify a date range for selection and filtering
+
+
+### Section 8.8 — How tools attach to agents (replace CareerAgent constructor only)
+
+```python
+# CareerAgent — Tavily + Fetch + Adzuna + MCF
+# Both job posting tools are registered. The LLM selects the correct one
+# based on deps.context.country and the tool docstrings.
+class CareerAgent(BaseAgent):
+    def __init__(self, instructions: str, tool_budget: int) -> None:
+        super().__init__(instructions=instructions)
+        self._tool_budget = tool_budget
+        self._calls_made  = 0
+        self._agent = Agent(
+            model=get_model("RESEARCH_MODEL"),
+            deps_type=Deps,
+            output_type=CareerOutput,
+            tools=[self._make_search_tool(), fetch_page, adzuna_jobs, mcf_jobs],
+        )
+```
+
+`adzuna_jobs` and `mcf_jobs` are not wrapped in `_make_search_tool()` — they
+are direct REST calls, not searches, and do not count against `tool_budget`.
+Register them directly, the same way `fetch_page` is registered.
 
 ### Section 12 — File Tree (replace `tools/` block)
 
 ```
 ├── tools/
-│   ├── search_tool.py      tavily_search — module-level TavilyClient singleton
-│   ├── fetch_tool.py       fetch_page — calls fetch_client singleton, never raises
-│   ├── ddg_tool.py         ddg_search — module-level DDGS singleton, date-filtered
-│   ├── adzuna_tool.py      adzuna_jobs — httpx REST, UK + AU, JobPostingsResponse
-│   └── mcf_tool.py         mcf_jobs — httpx REST, SG only, JobPostingsResponse
+│   ├── search_tool.py      tavily_search — module-level AsyncTavilyClient singleton, await search()
+│   ├── fetch_tool.py       fetch_page — calls shared fastmcp.Client fetch_client, never raises
+│   ├── ddg_tool.py         ddg_search — module-level DDGS singleton, date-filtered, calls via asyncio.to_thread — NOT registered on any agent
+│   ├── adzuna_tool.py      adzuna_jobs — httpx REST, UK + AU, _COUNTRY_MAP routes code + currency
+│   └── mcf_tool.py         mcf_jobs — httpx REST, SG only, no auth, skills from API tags
 ```
 
 ### Section 14 — Development Stage Summary (replace 1b row)
 
 ```
-| 1b | Fetch MCP client singleton. search_tool, fetch_tool, ddg_tool (unchanged). adzuna_tool (UK+AU job postings via Adzuna REST API). mcf_tool (SG job postings via MyCareersFuture public API). schemas/job_posting.py shared schema. ResearchHandler.startup() warms Fetch MCP. | Real job postings confirmed for UK, AU, SG targets. All 5 tools pass live tests. |
+| 1b | Fetch MCP client is a shared `fastmcp.Client` (reentrant, ref-counted — concurrent `call_tool()` is safe by design, requests multiplexed by id over one shared session). search_tool now uses AsyncTavilyClient + await (was sync TavilyClient — would block the loop under asyncio.gather), fetch_tool calls fetch_client via `async with`, ddg_tool calls DDGS via asyncio.to_thread (still NOT registered on any agent — date filtering remains unreliable). adzuna_tool (UK+AU job postings via Adzuna REST, _COUNTRY_MAP for code + currency). mcf_tool (SG job postings via MyCareersFuture public API, skills from API tags). schemas/job_posting.py shared schema. CareerAgent updated to register adzuna_jobs + mcf_jobs. main.py opens fetch_client once around the pipeline run. | Real job postings confirmed for UK, AU, SG. All 5 tools pass live tests. 26 tests pass. |
 ```
 
 ---
@@ -959,9 +1057,8 @@ async def fetch_server():
     """Start the Fetch MCP server once for all fetch tests."""
     from mcps.fetch_client import fetch_client
     try:
-        await fetch_client.startup()
-        yield fetch_client
-        await fetch_client.shutdown()
+        async with fetch_client:
+            yield fetch_client
     except Exception as exc:
         pytest.skip(f"Fetch MCP server not available: {exc}")
 
@@ -1070,7 +1167,8 @@ def test_fetch_imports_cleanly() -> None:
     assert FetchResult
 
 
-def test_fetch_client_singleton_is_same_instance() -> None:
+def test_fetch_client_is_shared_module_instance() -> None:
+    """Importing fetch_client anywhere returns the same fastmcp.Client instance."""
     from mcps.fetch_client import fetch_client as a
     from mcps.fetch_client import fetch_client as b
     assert a is b
@@ -1118,11 +1216,12 @@ def test_job_posting_instantiates() -> None:
         salary_max=45000.0,
         currency="GBP",
         date_posted="2025-01-15",
-        skills=["python", "aws"],
+        skills=[],
         source_url="https://example.com/job/1",
         source="adzuna",
     )
     assert posting.currency == "GBP"
+    assert posting.skills == []
     response = JobPostingsResponse(
         query="software engineer",
         country="UK",
@@ -1145,6 +1244,17 @@ def test_adzuna_initialises_with_env_keys() -> None:
     assert adzuna_tool._APP_KEY
 
 
+def test_adzuna_country_map_structure() -> None:
+    """_COUNTRY_MAP must map country name to (code, currency) — no separate currency logic."""
+    from tools import adzuna_tool
+    for country, mapping in adzuna_tool._COUNTRY_MAP.items():
+        assert isinstance(mapping, tuple), f"{country} value must be a tuple"
+        assert len(mapping) == 2, f"{country} tuple must be (code, currency)"
+        code, currency = mapping
+        assert isinstance(code, str) and code.islower(), f"{country} code must be lowercase str"
+        assert isinstance(currency, str) and currency.isupper(), f"{country} currency must be uppercase str"
+
+
 @pytest.mark.asyncio
 async def test_adzuna_returns_uk_postings() -> None:
     from tools.adzuna_tool import adzuna_jobs
@@ -1159,6 +1269,7 @@ async def test_adzuna_returns_uk_postings() -> None:
         assert p.currency == "GBP"
         assert p.title
         assert p.source_url.startswith("http")
+        assert p.skills == []   # Adzuna returns no structured skill tags
 
 
 @pytest.mark.asyncio
@@ -1171,6 +1282,7 @@ async def test_adzuna_returns_australia_postings() -> None:
     assert len(response.postings) > 0
     for p in response.postings:
         assert p.currency == "AUD"
+        assert p.skills == []
 
 
 @pytest.mark.asyncio
@@ -1219,6 +1331,7 @@ async def test_mcf_returns_singapore_postings() -> None:
         assert p.currency == "SGD"
         assert p.title
         assert p.source_url.startswith("https://www.mycareersfuture.gov.sg")
+        assert isinstance(p.skills, list)   # may be empty but must be a list
 
 
 @pytest.mark.asyncio
@@ -1243,6 +1356,7 @@ async def test_mcf_postings_have_required_fields() -> None:
         assert p.title, "Posting missing title"
         assert p.currency == "SGD"
         assert p.source_url, "Posting missing source_url"
+        assert isinstance(p.skills, list)
 ```
 
 ---
@@ -1267,13 +1381,14 @@ tests/test_stage_1b.py::test_ddg_search_returns_results PASSED
 tests/test_stage_1b.py::test_ddg_returns_empty_on_nonsense_query PASSED
 tests/test_stage_1b.py::test_ddg_date_filter_excludes_old_results PASSED
 tests/test_stage_1b.py::test_fetch_imports_cleanly PASSED
-tests/test_stage_1b.py::test_fetch_client_singleton_is_same_instance PASSED
+tests/test_stage_1b.py::test_fetch_client_is_shared_module_instance PASSED
 tests/test_stage_1b.py::test_fetch_returns_content_for_known_url PASSED
 tests/test_stage_1b.py::test_fetch_returns_error_for_bad_url PASSED
 tests/test_stage_1b.py::test_job_posting_schema_imports PASSED
 tests/test_stage_1b.py::test_job_posting_instantiates PASSED
 tests/test_stage_1b.py::test_adzuna_imports_cleanly PASSED
 tests/test_stage_1b.py::test_adzuna_initialises_with_env_keys PASSED
+tests/test_stage_1b.py::test_adzuna_country_map_structure PASSED
 tests/test_stage_1b.py::test_adzuna_returns_uk_postings PASSED
 tests/test_stage_1b.py::test_adzuna_returns_australia_postings PASSED
 tests/test_stage_1b.py::test_adzuna_rejects_singapore PASSED
@@ -1283,7 +1398,7 @@ tests/test_stage_1b.py::test_mcf_returns_singapore_postings PASSED
 tests/test_stage_1b.py::test_mcf_rejects_non_singapore PASSED
 tests/test_stage_1b.py::test_mcf_postings_have_required_fields PASSED
 
-26 passed in X.Xs
+27 passed in X.Xs
 ```
 
 Fetch tests may SKIP if MCP server is not installed — this is acceptable.
@@ -1307,6 +1422,11 @@ Cause: MyCareersFuture API base URL may have changed. Verify at
 https://api.mycareersfuture.gov.sg/v2/jobs?search=engineer&limit=1 in a
 browser. If the URL structure has changed, update `_BASE` in `mcf_tool.py`.
 
+**`test_adzuna_country_map_structure FAILED`**
+Cause: `_COUNTRY_MAP` values are not `(code, currency)` tuples. Each value
+must be a tuple of exactly two strings — lowercase country code, uppercase
+currency code.
+
 **`RatelimitException` from DuckDuckGo**
 Same as original spec — the wrapper retries once with 3s delay. Run DDG
 tests in isolation if needed: `pytest tests/test_stage_1b.py -k ddg -v`.
@@ -1325,18 +1445,20 @@ after the env var is deleted.
 - [ ] Tavily API key in `.env` — confirmed working
 - [ ] Adzuna `app_id` and `app_key` in `.env` — confirmed working
 - [ ] MyCareersFuture — no key needed, confirmed reachable
-- [ ] `pip install tavily-python ddgs httpx mcp mcp-server-fetch` clean
+- [ ] `pip install tavily-python ddgs httpx fastmcp mcp-server-fetch` clean
 - [ ] `schemas/search_result.py` — `SearchResult`, `SearchResponse` defined
 - [ ] `schemas/fetch_result.py` — `FetchResult` defined
 - [ ] `schemas/job_posting.py` — `JobPosting`, `JobPostingsResponse` defined (NEW)
-- [ ] `mcps/fetch_client.py` — singleton with `startup()`, `shutdown()`, `call_tool()`
-- [ ] `tools/search_tool.py` — `tavily_search`, `days=730` enforced
-- [ ] `tools/fetch_tool.py` — `fetch_page`, never raises, docstring warns off job board URLs
-- [ ] `tools/ddg_tool.py` — `ddg_search`, date filter applied before return
-- [ ] `tools/adzuna_tool.py` — `adzuna_jobs`, UK + AU, routes by `deps.context.country` (NEW)
-- [ ] `tools/mcf_tool.py` — `mcf_jobs`, Singapore only, no auth (NEW)
-- [ ] `main.py` — `fetch_client.startup()` before pipeline, `shutdown()` in `finally`
-- [ ] `pytest tests/test_stage_1b.py -v` — 26 passed (fetch may SKIP)
+- [ ] `mcps/fetch_client.py` — single module-level `fastmcp.Client` (no custom class, no manual `startup()`/`shutdown()`) — reentrant and ref-counted, concurrent `call_tool()` calls are safe (session multiplexes by request ID)
+- [ ] `tools/search_tool.py` — `tavily_search` uses `AsyncTavilyClient` (not `TavilyClient`), `days=730`/`time_range="year"` enforced, `await _client.search(...)`
+- [ ] `tools/fetch_tool.py` — `fetch_page`, never raises, docstring warns off job board URLs, calls `fetch_client` via `async with`
+- [ ] `tools/ddg_tool.py` — `ddg_search`, date filter applied before return, `_client.text(...)` called via `asyncio.to_thread` — still NOT registered on any agent
+- [ ] `tools/adzuna_tool.py` — `adzuna_jobs`, `_COUNTRY_MAP` maps country → `(code, currency)`, `skills=[]` (NEW)
+- [ ] `tools/mcf_tool.py` — `mcf_jobs`, Singapore only, no auth, skills from API tags, location from API (NEW)
+- [ ] MASTER section 8.6 updated — `adzuna_jobs` and `mcf_jobs` rows added with ✓ on career only
+- [ ] MASTER section 8.8 updated — `CareerAgent` registers `adzuna_jobs` and `mcf_jobs`
+- [ ] `main.py` — wraps the pipeline run in `async with fetch_client:` (optional — `fetch_page` also self-manages via its own `async with`)
+- [ ] `pytest tests/test_stage_1b.py -v` — 27 passed (fetch may SKIP)
 - [ ] Stage 1a tests still pass: `pytest tests/test_stage_1a.py -v`
 
 ---
