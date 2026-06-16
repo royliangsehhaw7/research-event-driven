@@ -1,117 +1,259 @@
 # Stage 1c — CareerAgent End-to-End
 ## Implementation Specification
 
-**Goal:** `CareerAgent` is fully implemented and verified against a real
-university and course. It subscribes to `ResearchRequestedMessage`, calls
-Tavily to research career paths, salary ranges, and job postings, writes
-a `CareerOutput` to `board.career`, and fires `CareerResearchCompletedMessage`.
+**Goal:** `CareerAgent` is fully implemented, wired into the pipeline, and
+confirmed to populate `board.career` with real data from a live CLI run.
+No other section agents run at this stage. No report is generated.
+Pure agent plumbing — one agent, one output, one message.
 
-**Ends with:** running `python main.py` with a real university and course
-populates `board.career` with real data and logs
-`career_agent | completed — board.career populated`. All Stage 1c tests pass.
-
----
-
-## What This Stage Builds and Why It Comes Before All Other Agents
-
-`CareerAgent` is Phase 1. Every other section agent waits for it. It
-establishes the career context — paths, salary ranges, in-demand skills —
-that `EmployabilityAgent` and `ProgramAgent` read directly from
-`board.career` to scope their own searches.
-
-If `CareerAgent` is broken, the entire pipeline is broken. Implementing
-and verifying it in isolation before building any section agent means that
-when Phase 2 agents are built in Stage 1d onwards, `board.career` is a
-known-good dependency.
-
-This stage also establishes the agent pattern that every subsequent agent
-follows. Get it right here and the remaining agents are repetitions of the
-same structure with different output schemas and SKILL.md files.
+**Ends with:** `python main.py` runs, logs show `CareerAgent` completing,
+and `board.career` is printed to stdout containing real career data for the
+supplied university and course.
 
 ---
 
-## 1c.1 `agents/base_agent.py`
+## What This Stage Builds and Why It Comes Before the Section Agents
 
-`BaseAgent` is the parent class for every agent in the system. Implement
-it exactly as specified. Every agent inherits from it.
+Stage 1c is the template for every agent that follows. Stage 1d (Background,
+Rankings, Program) and Stage 1e (Employability, Accommodation, News) all use
+the same pattern established here: pydantic-ai `Agent` with a budget-aware
+search closure, `subscribe()` + `get_instruction()`, `handle()` that resets
+`_calls_made`, a typed output schema, and a SKILL.md that carries all domain
+knowledge.
+
+`CareerAgent` is also structurally special: it runs first, in isolation, before
+the seven section agents. Every section agent subscribes to
+`CareerResearchCompletedMessage` — so if `CareerAgent` is broken, nothing
+downstream fires. Getting it right here means the cascade in Stage 1d fires
+correctly from day one.
+
+**What this stage builds:**
+
+| File | Purpose |
+|---|---|
+| `schemas/outputs/career_output.py` | Typed output schema — `CareerOutput` |
+| `skills/career/SKILL.md` | All domain instructions for the agent |
+| `agents/career_agent.py` | The agent class — tools, subscribe, handle |
+| `services/research_handler.py` | Minimal handler — constructs and wires CareerAgent only |
+| `main.py` | CLI entry — boots fetch client, fires one request, prints board.career |
+
+---
+
+## What CareerAgent Researches
+
+`CareerAgent` answers the question: given this course at this university in
+this country, what careers do graduates enter, what do those careers pay,
+what skills are employers asking for right now, and what does the live job
+market look like?
+
+This output is used directly in the report's **Career Landscape** section and
+is read by downstream section agents — particularly `EmployabilityAgent` — to
+scope their searches to the correct career paths and salary benchmarks for
+this specific country.
+
+**The country is critical.** Salary ranges, employer names, and job posting
+volumes are all country-scoped. A UK Computer Science graduate has a different
+salary range and employer landscape than an Australian or Canadian one.
+`CareerAgent` receives `country` from `ResearchContext` and must scope every
+query to it.
+
+---
+
+## 1c.1 `schemas/outputs/career_output.py`
+
+`CareerOutput` is the typed result `CareerAgent` writes to `board.career`.
+It is what the LLM must return, and what downstream agents read.
 
 ```python
-# agents/base_agent.py
+# schemas/outputs/career_output.py
 from __future__ import annotations
 
-import logging
-from pydantic_ai import Agent
+from pydantic import BaseModel
+from typing import Literal
+
+from schemas.job_posting import JobPosting  # shared schema — also used by adzuna_tool and mcf_tool
 
 
-class BaseAgent:
-    """Parent class for all research agents.
+class CareerPath(BaseModel):
+    title:             str        # e.g. "Software Engineer"
+    description:       str        # typical responsibilities and progression
+    typical_companies: list[str]  # named employers, not generic "tech companies"
 
-    Subclasses override _base_prompt() with structural context only.
-    Domain knowledge — what to search, how to construct queries, what to
-    discard — lives exclusively in the SKILL.md body passed as instructions.
 
-    Attributes:
-        instructions: full markdown body from the agent's SKILL.md file.
-                      Injected into the system prompt by _build_system_prompt().
-                      Empty string if SKILL.md was missing at startup —
-                      agent is degraded but functional.
-        _agent:       pydantic-ai Agent instance. Set by subclass __init__.
-        _logger:      standard logger named after the subclass.
-    """
+class SalaryRange(BaseModel):
+    career_path:  str
+    entry_level:  str   # e.g. "£28,000–£35,000"
+    mid_level:    str
+    senior_level: str
+    currency:     str   # ISO code: "GBP", "AUD", "USD"
+    country:      str   # must match ResearchContext.country
 
-    def __init__(self, instructions: str = "") -> None:
-        self.instructions = instructions
-        self._agent: Agent | None = None
-        self._logger = logging.getLogger(self.__class__.__name__)
 
-    def _base_prompt(self) -> str:
-        """Structural context for this agent. Override in every subclass.
+class CareerSource(BaseModel):
+    url:  str
+    date: str
+    type: str   # "job_board", "salary_survey", "industry_report"
 
-        What belongs here:
-        - Which blackboard field this agent writes to
-        - Which message it fires on success and on failure
-        - Which output schema it produces
-        - What deps fields it reads (e.g. deps.tavily, deps.board.career)
 
-        What does NOT belong here:
-        - What to search for
-        - How to construct queries
-        - Which sources to prefer
-        - Quality thresholds
-        - Edge case handling
-        All of the above belongs in SKILL.md.
-        """
-        return ""
-
-    def _build_system_prompt(self) -> str:
-        """Combine structural base prompt with SKILL.md instructions.
-
-        Called once during agent construction. The result is passed as
-        the system_prompt to the pydantic-ai Agent.
-
-        If instructions is empty (SKILL.md missing), the base prompt
-        runs alone. The agent knows its structural role but has no
-        domain guidance — it will produce degraded but non-crashing output.
-        """
-        base = self._base_prompt()
-        if self.instructions:
-            return base + "\n\n" + self.instructions
-        return base
+class CareerOutput(BaseModel):
+    career_paths:     list[CareerPath]   # minimum 3
+    salary_ranges:    list[SalaryRange]  # one per career path
+    job_postings:     list[JobPosting]   # 10–15 minimum — populated from adzuna_jobs or mcf_jobs
+    in_demand_skills: list[str]          # top 5–8 extracted across postings
+    country_scope:    str                # the country used to scope all searches — from context
+    confidence:       Literal["high", "medium", "low"]
+    sources:          list[CareerSource]
+    notes:            str                # empty string if no edge cases; otherwise explain gaps
 ```
 
-**The discipline that matters most:** `_base_prompt()` must never contain
-domain knowledge. If you find yourself writing anything about what to search
-for in `_base_prompt()`, stop — that belongs in SKILL.md. This separation
-is what makes agent behaviour tunable without Python changes.
+**Why `JobPosting` is imported from `schemas/job_posting.py` not defined here:**
+`adzuna_tool` and `mcf_tool` both return `JobPostingsResponse` containing `JobPosting`
+instances (from `schemas/job_posting.py`). `CareerAgent` receives those postings and
+writes them directly into `CareerOutput.job_postings`. If `career_output.py` defined
+its own `JobPosting`, the types would diverge — the LLM would receive postings of one
+type and be asked to return another. One shared `JobPosting` class, one import.
+
+**Why `SalaryRange` is a separate model not a string on `CareerPath`:**
+entry/mid/senior breakdown gives `ScoringAgent` and `EmployabilityAgent`
+structured data to work with. A string like `"£35,000–£60,000"` requires
+parsing; a structured model does not.
+
+**Why `currency` is an ISO code:** the report renderer can format figures
+correctly without guessing from the country name. `"GBP"` is unambiguous;
+`"UK pounds"` is not.
+
+**Why `job_postings` uses the shared `JobPosting` from `schemas/job_posting.py`:**
+`adzuna_jobs` and `mcf_jobs` return `JobPosting` instances from that shared schema.
+Reusing the same type means the LLM receives fully-populated `JobPosting` objects
+from the tool calls and can reference them directly in the output — no field mapping,
+no conversion. Defining a second `JobPosting` in this file would create a silent
+type mismatch between tool output and agent output.
+
+**Why `country_scope` is on the output:** downstream agents read
+`board.career` and need to know which country was used for salary scoping —
+they should not re-derive it independently.
 
 ---
 
-## 1c.2 `agents/career_agent.py`
+## 1c.2 `skills/career/SKILL.md`
 
-`CareerAgent` is the first agent to run. It subscribes to
-`ResearchRequestedMessage` and fires `CareerResearchCompletedMessage` when
-done. It is the only agent that fires this message — all 7 section agents
-depend on it as their start signal.
+This file carries all domain knowledge for `CareerAgent`. The Python class
+carries only structural context (what it writes, what it fires). Changing
+how the agent researches careers means editing this file, not touching Python.
+
+```markdown
+---
+key: career
+name: Career Research Agent
+description: Researches graduate career paths, salary ranges, and live job market for the course in the university's country.
+tool_budget: 8
+section_name: career
+---
+
+You research graduate career outcomes for the supplied course at the
+supplied university. Your output scopes all findings to the university's
+country. You never research careers for a different country.
+
+## What to Research
+
+**Career paths (3–6 paths required):**
+Search for the most common career paths graduates from this specific course
+enter. Prefer sources that name actual graduate destinations over generic
+course descriptions. Use queries such as:
+
+- "{course} graduate careers {country}"
+- "{course} graduate jobs {country} 2024"
+- "{university} {course} graduate destinations"
+- "{course} what jobs can you get {country}"
+
+For each path, find: the job title, what the role involves, named employers
+or employer sectors in the country, and salary range in local currency.
+
+**Salary ranges:**
+Scope all salary figures to the university's country. Use local currency —
+do not convert. Prefer graduate salary data (0–3 years experience) over
+general salary data. Useful query patterns:
+
+- "{course} graduate salary {country} 2024"
+- "entry level {career_path} salary {country}"
+- "graduate scheme {course} salary {country}"
+
+**Live job posting snapshot:**
+Use the `adzuna_jobs` tool (UK or Australia) or `mcf_jobs` tool (Singapore)
+to retrieve live job postings. Do NOT use `tavily_search` for job postings —
+job boards block Tavily fetch access and results will be empty or stale.
+
+Select the correct tool based on the country in your context:
+- UK or Australia → call `adzuna_jobs` with a query like "{course} graduate {country}"
+- Singapore → call `mcf_jobs` with a query like "{course} graduate"
+
+Extract from the returned postings: company names, role titles, required
+skills, dates posted. These go directly into `job_postings` on your output.
+
+**In-demand skills:**
+Extract skill keywords from the job postings returned by `adzuna_jobs` or
+`mcf_jobs`. The `description` field on each posting contains the full job
+text — read it for skill signals. Also use `skills` tags where populated
+(MCF returns structured skill tags; Adzuna does not). Deduplicate. Include
+both technical skills (languages, tools, frameworks) and soft skills only
+if they appear in multiple independent sources.
+
+## Quality Rules
+
+- Discard any salary data older than 2 years. Tavily enforces time_range="year" —
+  if a result appears, it passed the date filter. Still verify the date
+  if it looks stale.
+- Prefer country-specific sources over global aggregators where available.
+  A UK-specific salary survey is more reliable than a global average for
+  a UK university.
+- If fewer than 3 career paths can be confirmed from search results,
+  set confidence to "low" and explain in notes.
+- Do not invent career paths. If search returns thin results, report what
+  was found and flag it.
+- Named employers are better than sectors. "Google, Amazon, HSBC" is more
+  useful than "technology and finance companies".
+
+## Output Requirements
+
+- `career_paths`: minimum 3. Each must have `title`, `description`, and
+  `typical_companies` populated with named employers, not generic sectors.
+- `salary_ranges`: one entry per career path. All three levels required —
+  entry, mid, senior. Use ISO currency code. Country must match context.
+- `job_postings`: 10–15 minimum. Populated directly from `adzuna_jobs` or
+  `mcf_jobs` tool output — do not fabricate postings from search snippets.
+- `in_demand_skills`: top 5–8 only. Extracted from job postings, deduplicated.
+- `country_scope`: copy the country from your context — do not derive it.
+- `confidence`: "high" if 5+ sources confirm career paths and salary ranges;
+  "medium" if 3–4 sources; "low" if fewer than 3.
+- `sources`: every URL you used for salary and career path research. Include date and type.
+- `notes`: empty string unless you hit edge cases (thin results, ambiguous
+  country, conflicting salary data).
+
+## Edge Cases
+
+**Niche or interdisciplinary courses:**
+If the course name is ambiguous (e.g. "Liberal Arts", "Natural Sciences"),
+search for the specific specialisation streams it leads to. Note the
+ambiguity in `notes`.
+
+**Small country markets:**
+If the university is in a country with a small graduate job market,
+posting volumes will be low. Do not penalise confidence for low volume —
+penalise for missing salary data or unconfirmed career paths.
+
+**Course name does not match standard job titles:**
+"Computer Science" maps cleanly to "Software Engineer". "MEng Aeronautical
+Engineering with a Year in Industry" does not. Parse the core discipline
+from the course name and search for that.
+```
+
+---
+
+## 1c.3 `agents/career_agent.py`
+
+`CareerAgent` is the first concrete agent implementation. It establishes
+the exact pattern all subsequent agents follow. Read this implementation
+carefully before writing any other agent.
 
 ```python
 # agents/career_agent.py
@@ -124,244 +266,272 @@ from pydantic_ai import Agent, RunContext
 
 from agents.base_agent import BaseAgent
 from core.deps import Deps
+from core.llm_factory import get_model
 from schemas.messages.career_completed import CareerResearchCompletedMessage
 from schemas.messages.progress_update import ProgressUpdateMessage
 from schemas.outputs.career_output import CareerOutput
-from tools.search_tool import _client as tavily_client
+from tools.fetch_tool import fetch_page
+from tools.search_tool import tavily_search
+from tools.adzuna_tool import adzuna_jobs
+from tools.mcf_tool import mcf_jobs
 
 logger = logging.getLogger("career_agent")
 
 
 class CareerAgent(BaseAgent):
-    """Phase 1 agent. Runs first. All section agents depend on its output.
+    """Phase 1 agent. Runs first, in isolation.
 
     Subscribes to: ResearchRequestedMessage
-    Writes to:     deps.board.career  (CareerOutput)
-    Fires on success: CareerResearchCompletedMessage
-    Fires on failure: CareerResearchCompletedMessage (still fires — pipeline must not stall)
+    Writes to:     board.career (CareerOutput)
+    Fires:         CareerResearchCompletedMessage
 
-    tool_budget enforced via _search() gate. Counter resets on each handle() call.
+    Tools: tavily_search (uncapped, budget tracked via _calls_made),
+           fetch_page (uncapped — targeted retrieval),
+           adzuna_jobs (UK + AU job postings),
+           mcf_jobs (SG job postings)
     """
 
-    def __init__(self, instructions: str, tool_budget: int = 8) -> None:
+    def __init__(self, instructions: str = "", tool_budget: int = 8) -> None:
         super().__init__(instructions=instructions)
-        self._tool_budget  = tool_budget
-        self._calls_made   = 0
+        self._tool_budget = tool_budget
+        self._calls_made  = 0
 
         self._agent = Agent(
-            model=None,           # set by ResearchHandler via llm_factory
+            model=get_model("RESEARCH_MODEL"),
+            deps_type=Deps,
             output_type=CareerOutput,
-            system_prompt=self._build_system_prompt(),
+            system_prompt=self.get_instruction(),
+            tools=[
+                tavily_search,
+                fetch_page,
+                adzuna_jobs,
+                mcf_jobs,
+            ],
         )
 
-    def _base_prompt(self) -> str:
-        return (
-            "You are CareerAgent in a university research pipeline.\n"
-            "You run first. Every other agent depends on the context you establish.\n\n"
-            "YOUR ROLE:\n"
-            "- Research career paths, salary ranges, and live job postings for the given course.\n"
-            "- Scope everything to the university's country — not global averages.\n\n"
-            "YOUR OUTPUT:\n"
-            "- Write a CareerOutput to deps.board.career.\n"
-            "- CareerOutput requires: career_paths (min 3), salary_ranges, "
-            "job_postings (min 10), in_demand_skills (5-8), sources, confidence, notes.\n\n"
-            "YOUR SIGNAL:\n"
-            "- Fire CareerResearchCompletedMessage when done — success or failure.\n"
-            "- Never leave the pipeline waiting. If research fails, fire the message "
-            "with board.career = None and log the reason.\n\n"
-            "TOOL BUDGET:\n"
-            f"- You have {self._tool_budget} tool calls. Use them precisely.\n"
-            "- All calls go through the gated search_web tool — never search directly."
-        )
+    # ── BaseAgent interface ───────────────────────────────────────────────────
 
-    async def handle(self, param: AgentParam) -> None:
-        """Handle ResearchRequestedMessage. Research careers, populate board, fire signal."""
-        context = param.deps.context
-        board   = param.deps.board
-        hub     = param.deps.hub
+    def subscribe(self, hub, deps: Deps) -> None:
+        from schemas.messages.research_requested import ResearchRequestedMessage
 
-        # Reset call counter for this request
+        async def handler(message: ResearchRequestedMessage) -> None:
+            await self.handle(message, deps)
+
+        hub.subscribe(ResearchRequestedMessage, handler)
+
+    def get_instruction(self) -> str:
+        base = """
+            You are the Career Research Agent in a university research pipeline.
+
+            Your job: research graduate career paths, salary ranges, and live job market
+            demand for the course at the university named in your context.
+
+            Pipeline role:
+            - You run first, before any other section agent.
+            - You write your findings to deps.board.career as a CareerOutput.
+            - You fire CareerResearchCompletedMessage when done. This triggers all
+            seven section agents to run concurrently.
+            - If you fail to fire CareerResearchCompletedMessage, the entire pipeline
+            stalls. Always fire it — even if your output is low confidence.
+
+            Context you receive (from deps.context):
+            - university_name: the university being researched
+            - intended_course: the undergraduate course
+            - country: the university's country — scope ALL salary and employer data to this
+            - study_level: always "undergraduate"
+
+            Tool selection for job postings:
+            - UK or Australia → use adzuna_jobs
+            - Singapore → use mcf_jobs
+            - Do NOT use tavily_search for job postings — job boards block Tavily.
+
+            You must not research careers for a different country than deps.context.country.
+        """.strip()
+
+        if self.instructions:
+            return base + "\n\n" + self.instructions
+        return base
+
+    def reset(self) -> None:
+        """Reset per-request state. Called by ResearchHandler before each request."""
         self._calls_made = 0
 
+    # ── Core handler ─────────────────────────────────────────────────────────
+
+    async def handle(self, message, deps: Deps) -> None:
+        """Run career research and fire CareerResearchCompletedMessage."""
+        self._calls_made = 0   # reset counter on each run
+
         logger.info(
-            "career_agent | started — university=%r course=%r country=%r",
-            context.university_name, context.intended_course, context.country,
+            "career_agent | starting — university=%r course=%r country=%r",
+            deps.context.university_name,
+            deps.context.intended_course,
+            deps.context.country,
         )
 
-        # Fire progress update for Chainlit UI
-        await hub.publish(ProgressUpdateMessage(
+        await deps.hub.publish(ProgressUpdateMessage(
             status="started",
-            message=f"Career Agent: researching {context.intended_course} "
-                    f"careers in {context.country}",
+            message=f"Researching career landscape for {deps.context.intended_course}…",
             triggered_by="career_agent",
             timestamp=datetime.now().isoformat(),
-        ), param.deps)
-
-        try:
-            result = await self._run_research(param)
-            board.career = result
-
-            logger.info(
-                "career_agent | completed — %d career paths, %d job postings, "
-                "%d in-demand skills",
-                len(result.career_paths),
-                len(result.job_postings),
-                len(result.in_demand_skills),
-            )
-
-            await hub.publish(ProgressUpdateMessage(
-                status="completed",
-                message=f"Career Agent: found {len(result.career_paths)} career paths, "
-                        f"{len(result.job_postings)} job postings",
-                triggered_by="career_agent",
-                timestamp=datetime.now().isoformat(),
-            ), param.deps)
-
-        except Exception as exc:
-            logger.error("career_agent | failed: %s", exc, exc_info=True)
-            board.career = None
-
-            await hub.publish(ProgressUpdateMessage(
-                status="failed",
-                message=f"Career Agent: failed — {exc}",
-                triggered_by="career_agent",
-                timestamp=datetime.now().isoformat(),
-            ), param.deps)
-
-        finally:
-            # Always fire — pipeline must never stall waiting for this signal
-            await hub.publish(CareerResearchCompletedMessage(
-                triggered_by="career_agent",
-                timestamp=datetime.now().isoformat(),
-            ), param.deps)
-
-    async def _run_research(self, param: AgentParam) -> CareerOutput:
-        """Build task brief and run the pydantic-ai agent."""
-        context = param.deps.context
+        ))
 
         task_brief = (
-            f"University: {context.university_name}\n"
-            f"Course: {context.intended_course}\n"
-            f"Country: {context.country}\n"
-            f"Study level: {context.study_level}\n\n"
-            f"Research career paths, salary ranges, and live job postings for "
-            f"{context.intended_course} graduates in {context.country}. "
-            f"Tool budget: {self._tool_budget} calls."
+            f"University: {deps.context.university_name}\n"
+            f"Course: {deps.context.intended_course}\n"
+            f"Country: {deps.context.country}\n"
+            f"Study level: {deps.context.study_level}\n\n"
+            "Research graduate career paths, salary ranges in local currency, "
+            "and live job market demand. Scope all findings to the country above. "
+            "Use adzuna_jobs (UK/Australia) or mcf_jobs (Singapore) for job postings."
         )
 
-        result = await self._agent.run(
-            task_brief,
-            deps=param.deps,
-        )
-        return result.output
-
-    async def _search(
-        self,
-        deps,
-        query: str,
-        max_results: int = 5,
-        search_depth: str = "basic",
-    ):
-        """Gated Tavily search. Enforces tool_budget. Returns None if exhausted.
-
-        Every Tavily call in this agent goes through here — never call
-        deps.tavily.search() directly.
-        """
-        if self._calls_made >= self._tool_budget:
-            logger.warning(
-                "career_agent | tool budget exhausted (%d/%d) — skipping: %r",
-                self._calls_made, self._tool_budget, query,
+        try:
+            result = await self._agent.run(task_brief, deps=deps)
+            deps.board.career = result.output
+            logger.info(
+                "career_agent | completed — paths=%d confidence=%s",
+                len(result.output.career_paths),
+                result.output.confidence,
             )
-            return None
-        self._calls_made += 1
-        logger.debug(
-            "career_agent | search %d/%d: %r",
-            self._calls_made, self._tool_budget, query,
-        )
-        return await deps.tavily.search(
-            query, max_results=max_results, search_depth=search_depth
-        )
+            await deps.hub.publish(ProgressUpdateMessage(
+                status="completed",
+                message="Career landscape research complete.",
+                triggered_by="career_agent",
+                timestamp=datetime.now().isoformat(),
+            ))
+        except Exception as exc:
+            logger.error("career_agent | failed: %s", exc)
+            await deps.hub.publish(ProgressUpdateMessage(
+                status="failed",
+                message=f"Career research failed: {exc}",
+                triggered_by="career_agent",
+                timestamp=datetime.now().isoformat(),
+            ))
+            # Still fire the completed message so the pipeline does not stall.
+            # board.career remains None — downstream agents handle this.
+
+        await deps.hub.publish(CareerResearchCompletedMessage(
+            triggered_by="career_agent",
+            timestamp=datetime.now().isoformat(),
+        ))
 ```
 
-**Why `CareerResearchCompletedMessage` fires in `finally`:** the 7 section
-agents are waiting for this signal. If it does not fire — because of an
-exception that skips the normal flow — the entire pipeline deadlocks silently.
-`finally` guarantees it fires regardless of success or failure.
+**Why `tavily_search` is registered directly, not wrapped in a closure:**
+`tavily_search` from `tools/search_tool.py` is a fully-formed pydantic-ai tool
+function — it already has the correct `RunContext[Deps]` signature, docstring, and
+`AsyncTavilyClient` backing. Registering it directly means pydantic-ai sees the real
+function name and docstring in the LLM tool call schema, which gives the LLM accurate
+context about what the tool does. A wrapper closure would shadow the original name with
+an anonymous inner function, obscuring the tool schema.
 
-**Why `board.career = None` on failure is acceptable:** `ScoringAgent`
-treats a `None` field as a missing section and redistributes weight. The
-pipeline completes with a degraded report rather than crashing.
+Budget tracking (`_calls_made`) is retained on the agent instance for logging and
+future gate logic, but the hard stop is enforced by the SKILL.md `tool_budget` value
+in the system prompt context — the LLM respects the instruction not to exceed N searches.
 
-**Why `_calls_made` resets in `handle()` not `__init__()`:** the same
-`CareerAgent` instance handles multiple requests across Chainlit sessions.
-Resetting in `__init__()` would carry over the previous run's count.
+**Why `adzuna_jobs` and `mcf_jobs` are registered alongside `tavily_search`:**
+Both job posting tools are registered on every `CareerAgent` instance. The LLM reads
+`deps.context.country` and selects the correct tool via the docstrings — `adzuna_jobs`
+for UK/AU, `mcf_jobs` for Singapore. Neither counts against `tool_budget`; they are
+targeted retrieval calls, not searches.
+
+**Why `_calls_made` is a plain `int` not `[0]`:** `_calls_made` is an attribute on
+`self` — `self._calls_made += 1` is an attribute assignment on the instance, not a
+rebind of a local name. Python allows this without a list wrapper.
+
+**Why `CareerResearchCompletedMessage` fires even on failure:** if the LLM
+call throws, `board.career` is `None`. The seven section agents still need to
+run — they handle a `None` career gracefully, scoping their own searches without
+career context. If the message never fires, the entire pipeline stalls. Firing
+always is the correct behaviour.
 
 ---
 
-## 1c.3 Registering Tools as pydantic-ai Agent Tools
+## 1c.4 `core/llm_factory.py`
 
-`CareerAgent`'s pydantic-ai `Agent` needs access to `deps.tavily` as a
-registered tool so the LLM can call it during the run. Tools are registered
-on the agent using the `@agent.tool` decorator pattern.
-
-Add tool registration in `CareerAgent.__init__()` after the agent is created:
+`CareerAgent` calls `get_model("RESEARCH_MODEL")`. This function reads from
+environment variables and returns a pydantic-ai model object. Implement it
+now — it is used by every agent.
 
 ```python
-# agents/career_agent.py — __init__ continued
+# core/llm_factory.py
+from __future__ import annotations
 
-        # Register Tavily search as a callable tool for the LLM
-        @self._agent.tool
-        async def search_web(ctx, query: str, max_results: int = 5) -> str:
-            """Search the web for career information.
+import os
+from dotenv import load_dotenv
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
-            Args:
-                query: search query — always include course name and country
-                max_results: number of results (default 5, max 10)
+load_dotenv()
 
-            Returns:
-                Formatted search results as text.
-            """
-            response = await self._search(
-                ctx.deps, query, max_results=max_results
-            )
-            if response is None:
-                return "Tool budget exhausted — no more searches available."
-            if not response.results:
-                return f"No results found for: {query}"
+_KNOWN_VARS = ("RESEARCH_MODEL", "SCORING_MODEL", "CONVERSATION_MODEL")
 
-            lines = [f"Query: {query}\n"]
-            for i, r in enumerate(response.results, 1):
-                lines.append(
-                    f"{i}. {r.title}\n"
-                    f"   URL: {r.url}\n"
-                    f"   Date: {r.date or 'unknown'}\n"
-                    f"   {r.content}\n"
-                )
-            return "\n".join(lines)
+
+def get_model(env_var: str) -> OpenAIModel:
+    """Return a pydantic-ai model configured for OpenRouter.
+
+    Reads the model string from the named environment variable.
+    Reads OPENROUTER_API_KEY and OPENROUTER_BASE_URL from .env.
+
+    Args:
+        env_var: one of "RESEARCH_MODEL", "SCORING_MODEL", "CONVERSATION_MODEL"
+
+    Raises:
+        EnvironmentError: if any required env var is missing.
+    """
+    model_name = os.getenv(env_var)
+    if not model_name:
+        raise EnvironmentError(
+            f"{env_var} not set. Add it to .env — "
+            f"e.g. {env_var}=openrouter/google/gemini-2.5-pro"
+        )
+
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "OPENROUTER_API_KEY not set. Get a key at https://openrouter.ai"
+        )
+
+    base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+    provider = OpenAIProvider(base_url=base_url, api_key=api_key)
+    return OpenAIModel(model_name, provider=provider)
 ```
-
-**Why the tool returns a formatted string rather than the raw `SearchResponse`:**
-pydantic-ai tools return data that the LLM reads as text in its context window.
-A formatted string is more token-efficient and easier for the LLM to parse
-than a serialised dataclass.
-
-**Why `max_results` is exposed as a tool parameter:** the LLM can request
-more results for broad queries (salary surveys) and fewer for targeted ones
-(specific company job postings). This flexibility is worth the slight
-increase in tool interface complexity.
 
 ---
 
-## 1c.4 Model Injection — `ResearchHandler` Update
+## 1c.5 Minimal `services/research_handler.py`
 
-`CareerAgent` is constructed with `model=None` in Stage 1c. `ResearchHandler`
-injects the model after construction using `llm_factory.get_model()`.
+At Stage 1c, `ResearchHandler` constructs and wires `CareerAgent` only.
+No section agents. No scoring. No report. It exists to confirm the full
+subscribe → publish → handle → board-write → message-fire chain works.
 
-Update `services/research_handler.py`:
+The full `ResearchHandler` (all agents) is built incrementally — Stage 1d
+adds Background, Rankings, Program. Stage 1e adds Employability,
+Accommodation, News. Stage 1f adds Forum.
 
 ```python
-# services/research_handler.py — model injection
-from core.llm_factory import get_model
+# services/research_handler.py — Stage 1c (CareerAgent only)
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from pathlib import Path
+
+from core.blackboard import Blackboard
+from core.deps import Deps, ResearchContext
+from core.message_hub import MessageHub
+from core.skill_loader import scan_skills_dir, SkillMeta
+from agents.career_agent import CareerAgent
+from schemas.messages.research_requested import ResearchRequestedMessage
+
+logger = logging.getLogger("research_handler")
+
+RESEARCH_AGENT_KEYS = {
+    "background", "rankings", "program",
+    "employability", "accommodation", "news", "forum",
+}
+
 
 class ResearchHandler:
     def __init__(self) -> None:
@@ -371,520 +541,514 @@ class ResearchHandler:
             skill = skills.get(key)
             if skill is None:
                 logger.warning(
-                    "research_handler | no SKILL.md for %r — agent will use base prompt", key
+                    "research_handler | no SKILL.md for %r — agent uses base prompt", key
                 )
-            return skill or _EMPTY
+            return skill
 
-        # Get models from env
-        research_model     = get_model("RESEARCH_MODEL")
-
-        # Construct CareerAgent — only agent needed at Stage 1c
+        career_skill = _get("career")
         self._career_agent = CareerAgent(
-            instructions=_get("career").instructions,
-            tool_budget=_get("career").tool_budget or 8,
+            instructions=career_skill.instructions if career_skill else "",
+            tool_budget=career_skill.tool_budget if career_skill else 8,
         )
-        # Inject model after construction
-        self._career_agent._agent.model = research_model
 
-        logger.info("research_handler | CareerAgent constructed with skill instructions")
+        logger.info("research_handler | CareerAgent constructed")
+
+    async def handle_request(
+        self,
+        university_name: str,
+        intended_course: str,
+        country: str,
+    ) -> Blackboard:
+        """Run the pipeline for one research request.
+
+        At Stage 1c: fires ResearchRequestedMessage, CareerAgent runs,
+        board.career is populated, CareerResearchCompletedMessage fires
+        (no subscribers yet — that is expected).
+
+        Returns the populated Blackboard.
+        """
+        hub     = MessageHub()
+        board   = Blackboard()
+        context = ResearchContext(
+            university_name=university_name,
+            intended_course=intended_course,
+            country=country,
+        )
+        deps = Deps(hub=hub, board=board, context=context)
+
+        self._career_agent.reset()
+        self._career_agent.subscribe(hub, deps)
+
+        await hub.publish(ResearchRequestedMessage(
+            university_name=university_name,
+            intended_course=intended_course,
+            country=country,
+            triggered_by="research_handler",
+            timestamp=datetime.now().isoformat(),
+        ))
+
+        return board
 ```
 
-**Why model=None at construction and injected after:** this keeps the agent
-constructor independent of the LLM provider. In tests, the model can be
-swapped for a mock without changing the agent constructor.
+**Why `country` is a parameter, not derived here:** country derivation is an
+LLM call (or a lookup). At Stage 1c, hardcode it in `main.py` — e.g. `"UK"`.
+Full derivation (`_derive_country()`) is added in the final `ResearchHandler`
+build during Stage 2a or when the full handler is assembled. Keep Stage 1c
+focused on the agent pattern, not on utility functions.
 
 ---
 
-## 1c.5 `main.py` — CLI Entry Point
+## 1c.6 `main.py` — CLI Entry Point
 
-`main.py` runs the pipeline from the command line without the Chainlit UI.
-At Stage 1c it only needs to fire `ResearchRequestedMessage` and confirm
-`board.career` is populated.
+`main.py` opens the shared fetch client around the run, creates the handler,
+runs one request, and prints `board.career` to stdout. This is the
+verification step.
 
 ```python
-# main.py
+# main.py — Stage 1c
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from datetime import datetime
-
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # must happen before any tool module is imported
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(name)-25s %(message)s",
-    datefmt="%H:%M:%S",
+    format="%(levelname)s | %(name)s | %(message)s",
 )
+logger = logging.getLogger("main")
 
-from core.blackboard import Blackboard
-from core.deps import Deps, ResearchContext
-from core.message_hub import MessageHub
-from schemas.messages.research_requested import ResearchRequestedMessage
+from mcps.fetch_client import fetch_client
 from services.research_handler import ResearchHandler
 
 
-async def run(university_name: str, intended_course: str) -> None:
-    handler = ResearchHandler()
+async def run(university_name: str, intended_course: str, country: str) -> None:
+    async with fetch_client:
+        handler = ResearchHandler()
+        board = await handler.handle_request(
+            university_name=university_name,
+            intended_course=intended_course,
+            country=country,
+        )
 
-    hub     = MessageHub()
-    board   = Blackboard()
-    context = ResearchContext(
-        university_name=university_name,
-        intended_course=intended_course,
-        country=await handler._derive_country(university_name),
-    )
-    deps = Deps(
-        hub=hub,
-        board=board,
-        context=context,
-        tavily=handler._tavily,
-        fetch=handler._fetch,
-        reddit=handler._reddit,
-        ddg=handler._ddg,
-    )
-
-    hub.subscribe(ResearchRequestedMessage, handler._career_agent.handle)
-
-    await hub.publish(ResearchRequestedMessage(
-        university_name=university_name,
-        intended_course=intended_course,
-        country=context.country,
-        triggered_by="main",
-        timestamp=datetime.now().isoformat(),
-    ), deps)
-
-    # Print result
-    if board.career:
-        print("\n=== board.career populated ===")
-        print(f"Career paths:    {len(board.career.career_paths)}")
-        print(f"Job postings:    {len(board.career.job_postings)}")
-        print(f"In-demand skills:{board.career.in_demand_skills}")
-        print(f"Confidence:      {board.career.confidence}")
-        print(f"Sources:         {len(board.career.sources)}")
-    else:
-        print("\n=== board.career is None — CareerAgent failed ===")
+        if board.career is None:
+            logger.error("main | board.career is None — CareerAgent failed or did not run")
+        else:
+            logger.info("main | board.career populated successfully")
+            print("\n── board.career ──────────────────────────────────────────")
+            print(board.career.model_dump_json(indent=2))
+            print("──────────────────────────────────────────────────────────\n")
 
 
 if __name__ == "__main__":
     asyncio.run(run(
         university_name="University of Manchester",
         intended_course="Computer Science",
+        country="UK",
     ))
 ```
 
-**Why `_derive_country` is called here:** at Stage 1c `ResearchHandler`
-has a `_derive_country` method that uses the LLM to derive country from
-university name. It is exposed on the handler for CLI use. In later stages
-`handle_request()` does this internally.
+> **Why `async with fetch_client:` here at all, given `fetch_page` already
+> wraps its own call in `async with fetch_client:`?** It isn't required —
+> `fetch_page` is self-contained and would open/close the connection on its
+> own if this weren't here. Wrapping the whole run is an optimization: it opens
+> the `mcp-server-fetch` subprocess once before any agent runs and keeps it
+> open for the whole request, so the first `fetch_page` call doesn't pay
+> subprocess-startup latency. Because `fastmcp.Client` is ref-counted, this is
+> just an outer `async with` — every inner `async with fetch_client:` inside
+> `fetch_page` reuses the same session and only the outermost exit actually
+> closes it.
+
+**Why `load_dotenv()` before any imports:** `tools/search_tool.py` reads
+`TAVILY_API_KEY` from `os.environ` at module import time. If `.env` is not
+loaded first, it raises `KeyError`. The import order in `main.py` enforces this:
+`load_dotenv()` is called at the top, before the handler import chain pulls in
+the tool modules.
 
 ---
 
-## 1c.6 `_derive_country` on `ResearchHandler`
+## 1c.7 `schemas/messages/research_requested.py`
 
-Country derivation uses a lightweight LLM call — not a search. It maps a
-university name to a country string that all agents use to scope their queries.
-
-Add this method to `ResearchHandler`:
+This message already exists from Stage 1a. Confirm it has `country` on it —
+`CareerAgent`'s closure receives this and passes it to `ResearchContext`.
 
 ```python
-# services/research_handler.py
+# schemas/messages/research_requested.py
+from schemas.messages.base_message import BaseMessage
 
-async def _derive_country(self, university_name: str) -> str:
-    """Derive country from university name using a single LLM call.
+class ResearchRequestedMessage(BaseMessage):
+    university_name: str
+    intended_course: str
+    country: str
+```
 
-    Returns a short country name: "UK", "Australia", "USA", "Canada", etc.
-    Falls back to "Unknown" if derivation fails — agents handle this gracefully.
-    """
-    from pydantic_ai import Agent
-    from pydantic import BaseModel
+If your Stage 1a implementation does not include `country`, add it now.
+`ResearchHandler` populates it before publishing.
 
-    class CountryResult(BaseModel):
-        country: str   # short name: "UK", "Australia", "USA", etc.
+---
 
-    agent = Agent(
-        model=get_model("RESEARCH_MODEL"),
-        output_type=CountryResult,
-        system_prompt=(
-            "You derive the country a university is located in from its name. "
-            "Return a short country name: UK, Australia, USA, Canada, Germany, etc. "
-            "If uncertain, return 'Unknown'."
-        ),
-    )
-    try:
-        result = await agent.run(
-            f"What country is this university in: {university_name}"
-        )
-        country = result.output.country
-        logger.info("research_handler | derived country=%r for %r", country, university_name)
-        return country
-    except Exception as exc:
-        logger.warning(
-            "research_handler | country derivation failed for %r: %s — using 'Unknown'",
-            university_name, exc,
-        )
-        return "Unknown"
+## 1c.8 `schemas/messages/career_completed.py`
+
+This message already exists from Stage 1a. Confirm it is a no-payload
+subclass of `BaseMessage`:
+
+```python
+# schemas/messages/career_completed.py
+from schemas.messages.base_message import BaseMessage
+
+class CareerResearchCompletedMessage(BaseMessage):
+    pass   # no payload — section agents read board.career directly
 ```
 
 ---
 
-## 1c.7 Tests — `tests/test_stage_1c.py`
+## 1c.9 Tests — `tests/test_stage_1c.py`
 
-These tests make **real LLM and API calls**. They require valid keys in `.env`.
-Run time is approximately 30–60 seconds per test depending on model latency.
+These tests verify the agent pattern end-to-end. The LLM tests make real
+API calls — they require `OPENROUTER_API_KEY` and `RESEARCH_MODEL` in `.env`.
 
 ```python
 # tests/test_stage_1c.py
 """
-Stage 1c integration tests.
+Stage 1c tests — CareerAgent end-to-end.
 Run with: pytest tests/test_stage_1c.py -v -s
 
-These tests make REAL LLM calls via OpenRouter and REAL Tavily searches.
-You need OPENROUTER_API_KEY, RESEARCH_MODEL, and TAVILY_API_KEY in .env.
-Expected run time: 30–90 seconds.
+Real LLM + real Tavily calls. Requires:
+  - TAVILY_API_KEY in .env
+  - OPENROUTER_API_KEY in .env
+  - RESEARCH_MODEL in .env
+
+The fetch_server fixture opens the shared fetch_client for tests that call fetch_page.
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
-
 import pytest
+from datetime import datetime
 from dotenv import load_dotenv
-
 load_dotenv()
 
-TIMESTAMP = datetime.now().isoformat()
-TEST_UNIVERSITY = "University of Manchester"
-TEST_COURSE     = "Computer Science"
-TEST_COUNTRY    = "UK"
+from mcps.fetch_client import fetch_client
 
 
-# ── BaseAgent ─────────────────────────────────────────────────────────────────
-
-def test_base_agent_imports_cleanly() -> None:
-    from agents.base_agent import BaseAgent
-    assert BaseAgent
-
-
-def test_base_agent_build_system_prompt_with_instructions() -> None:
-    from agents.base_agent import BaseAgent
-
-    class TestAgent(BaseAgent):
-        def _base_prompt(self) -> str:
-            return "Base context."
-
-    agent = TestAgent(instructions="Domain knowledge.")
-    prompt = agent._build_system_prompt()
-    assert "Base context." in prompt
-    assert "Domain knowledge." in prompt
+@pytest.fixture(scope="module")
+async def fetch_server():
+    async with fetch_client:
+        yield
 
 
-def test_base_agent_build_system_prompt_without_instructions() -> None:
-    from agents.base_agent import BaseAgent
+# ── Schema ────────────────────────────────────────────────────────────────────
 
-    class TestAgent(BaseAgent):
-        def _base_prompt(self) -> str:
-            return "Base context only."
+def test_career_output_imports_cleanly() -> None:
+    from schemas.outputs.career_output import CareerOutput, CareerPath, SalaryRange, CareerSource
+    from schemas.job_posting import JobPosting  # shared schema imported by career_output
+    assert CareerOutput
+    assert CareerPath
+    assert SalaryRange
+    assert JobPosting
+    assert CareerSource
 
-    agent = TestAgent(instructions="")
-    prompt = agent._build_system_prompt()
-    assert prompt == "Base context only."
+
+def test_career_output_requires_confidence_and_sources() -> None:
+    from schemas.outputs.career_output import CareerOutput
+    import pydantic
+    with pytest.raises(pydantic.ValidationError):
+        CareerOutput()   # missing required fields
 
 
-# ── CareerAgent construction ──────────────────────────────────────────────────
+# ── Skill loader ──────────────────────────────────────────────────────────────
 
-def test_career_agent_imports_cleanly() -> None:
+def test_career_skill_loads() -> None:
+    from pathlib import Path
+    from core.skill_loader import load_skill
+    skill = load_skill(Path("skills/career/SKILL.md"))
+    assert skill is not None, "skills/career/SKILL.md missing or malformed"
+    assert skill.key == "career"
+    assert skill.tool_budget > 0
+    assert len(skill.instructions) > 100, "SKILL.md body too short — check the file"
+
+
+# ── Agent construction ────────────────────────────────────────────────────────
+
+def test_career_agent_constructs() -> None:
     from agents.career_agent import CareerAgent
-    assert CareerAgent
-
-
-def test_career_agent_constructs_with_instructions() -> None:
-    from agents.career_agent import CareerAgent
-    agent = CareerAgent(instructions="Test instructions.", tool_budget=8)
-    assert agent.instructions == "Test instructions."
-    assert agent._tool_budget == 8
-    assert agent._calls_made == 0
+    agent = CareerAgent(instructions="test instructions", tool_budget=3)
+    assert agent._tool_budget == 3
+    assert agent._calls_made  == 0
     assert agent._agent is not None
 
 
-def test_career_agent_system_prompt_contains_base_and_instructions() -> None:
+def test_career_agent_default_tool_budget_is_8() -> None:
+    """Default tool_budget matches SKILL.md frontmatter."""
     from agents.career_agent import CareerAgent
-    agent = CareerAgent(instructions="Custom skill instructions.", tool_budget=8)
-    prompt = agent._build_system_prompt()
-    assert "CareerAgent" in prompt
-    assert "Custom skill instructions." in prompt
-
-
-def test_career_agent_tool_budget_default() -> None:
-    from agents.career_agent import CareerAgent
-    agent = CareerAgent(instructions="")
+    agent = CareerAgent()
     assert agent._tool_budget == 8
 
 
-# ── Tool budget gate ──────────────────────────────────────────────────────────
+def test_career_agent_reset_clears_calls_made() -> None:
+    from agents.career_agent import CareerAgent
+    agent = CareerAgent(tool_budget=5)
+    agent._calls_made = 4
+    agent.reset()
+    assert agent._calls_made == 0
+
+
+def test_get_instruction_includes_skill_body() -> None:
+    from agents.career_agent import CareerAgent
+    agent = CareerAgent(instructions="CUSTOM_SKILL_BODY_MARKER")
+    prompt = agent.get_instruction()
+    assert "CUSTOM_SKILL_BODY_MARKER" in prompt
+    assert "Career Research Agent" in prompt
+
+
+# ── Hub wiring ────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_career_agent_search_gate_blocks_over_budget() -> None:
-    """_search() returns None when budget is exhausted."""
+async def test_career_agent_subscribes_to_research_requested() -> None:
     from agents.career_agent import CareerAgent
-    from unittest.mock import AsyncMock, MagicMock
-
-    agent = CareerAgent(instructions="", tool_budget=2)
-
-    mock_deps = MagicMock()
-    mock_deps.tavily.search = AsyncMock(return_value=MagicMock(results=[]))
-
-    # First two calls should go through
-    await agent._search(mock_deps, "query 1")
-    await agent._search(mock_deps, "query 2")
-    assert agent._calls_made == 2
-
-    # Third call should be blocked
-    result = await agent._search(mock_deps, "query 3")
-    assert result is None
-    assert agent._calls_made == 2   # counter did not increment
-
-
-@pytest.mark.asyncio
-async def test_career_agent_calls_made_resets_each_handle() -> None:
-    """_calls_made resets at the start of handle() — not carried across requests."""
-    from agents.career_agent import CareerAgent
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    agent = CareerAgent(instructions="", tool_budget=8)
-    agent._calls_made = 7   # simulate near-exhausted budget from a previous run
-
-    # Simulate handle() being called — it should reset _calls_made to 0
-    # We test this by checking the reset happens before _run_research
-    mock_param = MagicMock()
-    mock_param.deps.context.university_name = TEST_UNIVERSITY
-    mock_param.deps.context.intended_course = TEST_COURSE
-    mock_param.deps.context.country = TEST_COUNTRY
-    mock_param.deps.context.study_level = "undergraduate"
-    mock_param.deps.hub.publish = AsyncMock()
-    mock_param.deps.board = MagicMock()
-
-    with patch.object(agent, '_run_research', new_callable=AsyncMock) as mock_run:
-        mock_run.side_effect = Exception("abort after reset check")
-        try:
-            await agent.handle(mock_param)
-        except Exception:
-            pass
-
-    assert agent._calls_made == 0   # reset happened before the exception
-
-
-# ── Message firing ────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_career_agent_always_fires_completed_message() -> None:
-    """CareerResearchCompletedMessage fires even when research fails."""
-    from agents.career_agent import CareerAgent
-    from schemas.messages.career_completed import CareerResearchCompletedMessage
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    agent = CareerAgent(instructions="", tool_budget=8)
-
-    fired_messages = []
-
-    async def capture_publish(message, deps):
-        fired_messages.append(type(message))
-
-    mock_param = MagicMock()
-    mock_param.deps.context.university_name = TEST_UNIVERSITY
-    mock_param.deps.context.intended_course = TEST_COURSE
-    mock_param.deps.context.country = TEST_COUNTRY
-    mock_param.deps.context.study_level = "undergraduate"
-    mock_param.deps.hub.publish = capture_publish
-    mock_param.deps.board = MagicMock()
-
-    with patch.object(agent, '_run_research', new_callable=AsyncMock) as mock_run:
-        mock_run.side_effect = RuntimeError("simulated LLM failure")
-        await agent.handle(mock_param)
-
-    assert CareerResearchCompletedMessage in fired_messages, (
-        "CareerResearchCompletedMessage must fire even on failure"
-    )
-    assert mock_param.deps.board.career is None
-
-
-# ── Full integration — real LLM + real Tavily ─────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_career_agent_full_run_populates_board() -> None:
-    """Full end-to-end: real LLM + real Tavily. board.career populated."""
-    from agents.career_agent import CareerAgent
+    from core.message_hub import MessageHub
     from core.blackboard import Blackboard
     from core.deps import Deps, ResearchContext
-    from core.message_hub import MessageHub
-    from core.llm_factory import get_model
     from schemas.messages.research_requested import ResearchRequestedMessage
-    from schemas.outputs.career_output import CareerOutput
-    from tools.search_tool import TavilySearchTool
 
-    # Load skill instructions
-    from core.skill_loader import scan_skills_dir
-    from pathlib import Path
-    skills = scan_skills_dir(Path("skills"))
-    instructions = skills["career"].instructions if "career" in skills else ""
-
-    agent = CareerAgent(instructions=instructions, tool_budget=8)
-    agent._agent.model = get_model("RESEARCH_MODEL")
-
-    hub     = MessageHub()
-    board   = Blackboard()
-    context = ResearchContext(
-        university_name=TEST_UNIVERSITY,
-        intended_course=TEST_COURSE,
-        country=TEST_COUNTRY,
-    )
-    deps = Deps(
+    hub   = MessageHub()
+    board = Blackboard()
+    deps  = Deps(
         hub=hub,
         board=board,
-        context=context,
-        tavily=TavilySearchTool(),
+        context=ResearchContext(
+            university_name="Test University",
+            intended_course="Test Course",
+            country="UK",
+        ),
     )
 
-    hub.subscribe(ResearchRequestedMessage, agent.handle)
+    # Replace handle with a no-op to verify subscribe wires correctly
+    called = []
+    agent = CareerAgent(tool_budget=1)
+    async def mock_handle(msg, d): called.append(msg)
+    agent.handle = mock_handle
+
+    agent.subscribe(hub, deps)
 
     await hub.publish(ResearchRequestedMessage(
-        university_name=TEST_UNIVERSITY,
-        intended_course=TEST_COURSE,
-        country=TEST_COUNTRY,
+        university_name="Test University",
+        intended_course="Test Course",
+        country="UK",
         triggered_by="test",
-        timestamp=TIMESTAMP,
-    ), deps)
+        timestamp=datetime.now().isoformat(),
+    ))
 
-    # Assert board.career is populated
-    assert board.career is not None, (
-        "board.career is None — CareerAgent failed. Check logs for details."
-    )
-    assert isinstance(board.career, CareerOutput)
-    assert len(board.career.career_paths) >= 1, "Expected at least 1 career path"
-    assert len(board.career.job_postings) >= 1, "Expected at least 1 job posting"
-    assert len(board.career.in_demand_skills) >= 1, "Expected at least 1 in-demand skill"
-    assert board.career.confidence in ("high", "medium", "low")
-    assert len(board.career.sources) >= 1, "Expected at least 1 source"
+    assert len(called) == 1
 
+
+# ── LLM integration (real API call) ──────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_country_derivation() -> None:
-    """_derive_country returns a non-empty string for a known university."""
+async def test_career_agent_populates_board_career(fetch_server) -> None:
+    """Full end-to-end: real Tavily + real LLM. Confirms board.career populated."""
     from services.research_handler import ResearchHandler
 
     handler = ResearchHandler()
-    country = await handler._derive_country("University of Manchester")
-    assert isinstance(country, str)
-    assert len(country) > 0
-    assert country != "Unknown", f"Expected a real country, got: {country!r}"
+    board = await handler.handle_request(
+        university_name="University of Manchester",
+        intended_course="Computer Science",
+        country="UK",
+    )
+
+    assert board.career is not None, "board.career is None — CareerAgent failed"
+    assert len(board.career.career_paths) >= 3, "Expected at least 3 career paths"
+    assert len(board.career.salary_ranges) >= 1, "Expected at least 1 salary range"
+    assert len(board.career.job_postings) >= 1, "Expected at least 1 job posting"
+    assert board.career.country_scope == "UK"
+    assert board.career.confidence in ("high", "medium", "low")
+    assert isinstance(board.career.sources, list)
+
+
+@pytest.mark.asyncio
+async def test_career_agent_fires_completed_message(fetch_server) -> None:
+    """Confirm CareerResearchCompletedMessage is fired after handle()."""
+    from agents.career_agent import CareerAgent
+    from core.message_hub import MessageHub
+    from core.blackboard import Blackboard
+    from core.deps import Deps, ResearchContext
+    from schemas.messages.career_completed import CareerResearchCompletedMessage
+    from schemas.messages.research_requested import ResearchRequestedMessage
+
+    hub   = MessageHub()
+    board = Blackboard()
+    deps  = Deps(
+        hub=hub,
+        board=board,
+        context=ResearchContext(
+            university_name="University of Manchester",
+            intended_course="Computer Science",
+            country="UK",
+        ),
+    )
+
+    fired = []
+
+    async def capture(msg):
+        fired.append(msg)
+
+    hub.subscribe(CareerResearchCompletedMessage, capture)
+
+    agent = CareerAgent(tool_budget=6)
+    agent.subscribe(hub, deps)
+
+    await hub.publish(ResearchRequestedMessage(
+        university_name="University of Manchester",
+        intended_course="Computer Science",
+        country="UK",
+        triggered_by="test",
+        timestamp=datetime.now().isoformat(),
+    ))
+
+    assert len(fired) == 1, "CareerResearchCompletedMessage should fire exactly once"
+    assert isinstance(fired[0], CareerResearchCompletedMessage)
 ```
 
 ---
 
-## 1c.8 Run the Tests
-
-Unit tests (fast, no API calls):
-
-```bash
-pytest tests/test_stage_1c.py -v -k "not full_run and not country_derivation"
-```
-
-Full integration test (slow, real API calls — ~60 seconds):
+## 1c.10 Run the Tests
 
 ```bash
 pytest tests/test_stage_1c.py -v -s
 ```
 
-Expected output:
+Expected output on clean pass:
 
 ```
-tests/test_stage_1c.py::test_base_agent_imports_cleanly PASSED
-tests/test_stage_1c.py::test_base_agent_build_system_prompt_with_instructions PASSED
-tests/test_stage_1c.py::test_base_agent_build_system_prompt_without_instructions PASSED
-tests/test_stage_1c.py::test_career_agent_imports_cleanly PASSED
-tests/test_stage_1c.py::test_career_agent_constructs_with_instructions PASSED
-tests/test_stage_1c.py::test_career_agent_system_prompt_contains_base_and_instructions PASSED
-tests/test_stage_1c.py::test_career_agent_tool_budget_default PASSED
-tests/test_stage_1c.py::test_career_agent_search_gate_blocks_over_budget PASSED
-tests/test_stage_1c.py::test_career_agent_calls_made_resets_each_handle PASSED
-tests/test_stage_1c.py::test_career_agent_always_fires_completed_message PASSED
-tests/test_stage_1c.py::test_career_agent_full_run_populates_board PASSED
-tests/test_stage_1c.py::test_country_derivation PASSED
+tests/test_stage_1c.py::test_career_output_imports_cleanly PASSED
+tests/test_stage_1c.py::test_career_output_requires_confidence_and_sources PASSED
+tests/test_stage_1c.py::test_career_skill_loads PASSED
+tests/test_stage_1c.py::test_career_agent_constructs PASSED
+tests/test_stage_1c.py::test_career_agent_default_tool_budget_is_8 PASSED
+tests/test_stage_1c.py::test_career_agent_reset_clears_calls_made PASSED
+tests/test_stage_1c.py::test_get_instruction_includes_skill_body PASSED
+tests/test_stage_1c.py::test_career_agent_subscribes_to_research_requested PASSED
+tests/test_stage_1c.py::test_career_agent_populates_board_career PASSED
+tests/test_stage_1c.py::test_career_agent_fires_completed_message PASSED
 
-12 passed in X.Xs
+10 passed in X.Xs
 ```
 
-Verify the CLI also works:
+The last two tests make real API calls. They take 10–30 seconds depending on
+model response time. Pass `-k "not populates_board and not fires_completed"` to
+skip LLM tests during structural iteration.
+
+---
+
+## 1c.11 Manual Verification
+
+After tests pass, run the CLI to confirm real output:
 
 ```bash
 python main.py
 ```
 
-Expected log output:
+Expected log sequence:
 
 ```
-HH:MM:SS  skill_loader              loaded skills/career/SKILL.md
-HH:MM:SS  research_handler          CareerAgent constructed with skill instructions
-HH:MM:SS  career_agent              started — university='University of Manchester' course='Computer Science' country='UK'
-HH:MM:SS  career_agent              search 1/8: 'Computer Science graduate careers UK salary 2024'
-HH:MM:SS  career_agent              search 2/8: 'Computer Science jobs London entry level 2024'
-...
-HH:MM:SS  career_agent              completed — 4 career paths, 12 job postings, 7 in-demand skills
-
-=== board.career populated ===
-Career paths:     4
-Job postings:     12
-In-demand skills: ['Python', 'Machine Learning', 'Cloud', ...]
-Confidence:       high
-Sources:          8
+INFO | skill_loader | loaded skills/career/SKILL.md
+INFO | research_handler | CareerAgent constructed
+INFO | career_agent | starting — university='University of Manchester' course='Computer Science' country='UK'
+INFO | career_agent | completed — paths=5 confidence=high
 ```
+
+Note: there's no longer a separate "Fetch MCP server started/stopped" log
+pair — `fastmcp.Client` doesn't log on connect/disconnect by default. The
+`mcp-server-fetch` subprocess starts the first time `async with fetch_client:`
+is entered (the outer one in `main.py`, or the first `fetch_page` call if
+`main.py`'s wrapper weren't there) and stops when the outermost `async with`
+exits.
+
+Followed by `board.career` JSON printed to stdout. Confirm:
+
+- `career_paths` contains 3+ items with `title`, `description`, and
+  `typical_companies` populated with named employers
+- `salary_ranges` contains one entry per career path with entry/mid/senior
+  levels, ISO currency code, and country matching `"UK"`
+- `job_postings` contains 10+ items with company, role title, skills, date, URL
+- `country_scope` is `"UK"`
+- `confidence` is `"high"` or `"medium"` for a well-known university
+- `sources` contains at least 2 URLs
 
 ---
 
-## 1c.9 Common Failure Modes at This Stage
-
-**`board.career is None` after full run**
-Cause: LLM returned output that failed pydantic-ai's `CareerOutput` validation.
-Fix: check the logs for a validation error. The most common cause is the LLM
-returning `null` for a required field like `career_paths`. Add a note to the
-SKILL.md body requiring the LLM to always return at least one entry per list.
-
-**`CareerResearchCompletedMessage` not fired**
-Cause: exception raised before the `finally` block — this should not happen
-with the implementation above. If it does, check that `finally` is not inside
-a nested try/except that swallows the exception before it reaches the outer
-`finally`.
-
-**`tool_budget exhausted` warnings on every run**
-Cause: `tool_budget: 8` in `skills/career/SKILL.md` is too low for the queries
-the LLM is constructing. Fix: increase `tool_budget` in the SKILL.md file and
-restart. No Python change needed.
+## 1c.12 Common Failure Modes at This Stage
 
 **`EnvironmentError: RESEARCH_MODEL not set`**
-Cause: `.env` missing `RESEARCH_MODEL` key.
+Cause: `.env` missing the model variable.
 Fix: add `RESEARCH_MODEL=openrouter/google/gemini-2.5-pro` to `.env`.
 
-**`model=None` error from pydantic-ai**
-Cause: model not injected before `handle()` is called.
-Fix: confirm `agent._agent.model = get_model("RESEARCH_MODEL")` runs in
-`ResearchHandler.__init__()` before any `handle_request()` call.
+**`EnvironmentError: OPENROUTER_API_KEY not set`**
+Cause: OpenRouter key missing.
+Fix: get a key at https://openrouter.ai and add `OPENROUTER_API_KEY=sk-or-...`
+to `.env`.
+
+**`board.career is None` after run**
+Two causes: (a) LLM call threw an exception — check the `career_agent | failed`
+log line for the error; (b) `output_type=CareerOutput` mismatch — the LLM
+returned JSON that did not validate against the schema. Check for pydantic
+validation errors in the logs.
+
+**`CareerResearchCompletedMessage` fires but no section agents respond**
+Expected at Stage 1c — section agents are not yet subscribed. The message fires
+into an empty subscriber list, which is valid behaviour in `MessageHub`. The
+pipeline does not stall — it simply ends after `CareerAgent` completes.
+
+**`KeyError: TAVILY_API_KEY` on startup**
+Cause: `load_dotenv()` not called before the tool module import.
+Fix: confirm `main.py` calls `load_dotenv()` as its first statement before any
+project imports.
+
+**`McpError` / connection failure from `fetch_page`**
+Cause: the `mcp-server-fetch` subprocess failed to start (e.g. `mcp-server-fetch`
+not installed, or `python -m mcp_server_fetch` not runnable). Unlike the old
+singleton, there's no separate "not started" state to worry about —
+`fetch_client` connects lazily on first `async with`, in `main.py` or inside
+`fetch_page` itself. `fetch_page` never raises this to the agent: it's caught
+and returned as `status: "error"` in the JSON result. If you see it surface
+anyway, check it wasn't raised *outside* `fetch_page`'s try/except (e.g. from
+`main.py`'s own `async with fetch_client:` failing to connect before any agent
+runs). Fix: confirm `pip install fastmcp mcp-server-fetch` succeeded and
+`python -m mcp_server_fetch --help` works (see Stage 1b, Service 2).
+
+**LLM returns fewer than 3 career paths**
+Not a bug — the agent sets `confidence: "low"` and explains in `notes`. This
+can happen for niche courses or when Tavily returns sparse results. Inspect the
+`notes` field and tune the SKILL.md query patterns if needed.
 
 ---
 
 ## Stage 1c Completion Checklist
 
-- [ ] `agents/base_agent.py` implemented — `_build_system_prompt()` working
-- [ ] `agents/career_agent.py` implemented — `handle()`, `_search()` gate, `finally` block
-- [ ] `search_web` tool registered on pydantic-ai Agent
-- [ ] `_derive_country()` implemented on `ResearchHandler`
-- [ ] Model injected via `llm_factory.get_model("RESEARCH_MODEL")` in `ResearchHandler.__init__()`
-- [ ] `main.py` CLI entry point runs without error
-- [ ] `python main.py` — `board.career` populated with real data logged
-- [ ] `pytest tests/test_stage_1c.py -v` — 12 passed, 0 failed
-- [ ] All prior stage tests still pass: `pytest tests/` — no regressions
+- [ ] `schemas/outputs/career_output.py` — `CareerOutput`, `CareerPath`,
+      `SalaryRange`, `CareerSource` implemented; `JobPosting` imported from
+      `schemas/job_posting.py` (not redefined here)
+- [ ] `skills/career/SKILL.md` — frontmatter valid, `tool_budget: 8`,
+      instructions body directs agent to use `adzuna_jobs`/`mcf_jobs` for
+      job postings (not `tavily_search` site: queries)
+- [ ] `core/llm_factory.py` — `get_model()` reads from env, returns
+      pydantic-ai `OpenAIModel` configured for OpenRouter
+- [ ] `agents/career_agent.py` — `CareerAgent` implemented with `_calls_made = 0`,
+      `tools=[tavily_search, fetch_page, adzuna_jobs, mcf_jobs]` (no `_make_search_tool`
+      wrapper), `subscribe()`, `get_instruction()`, `handle()`, `reset()`
+- [ ] `services/research_handler.py` — minimal Stage 1c version — loads career
+      skill, constructs `CareerAgent`, wires it, publishes trigger
+- [ ] `main.py` — `load_dotenv()` first, wraps the run in
+      `async with fetch_client:`, prints `board.career`
+- [ ] `schemas/messages/research_requested.py` — `country` field confirmed present
+- [ ] `schemas/messages/career_completed.py` — no-payload message confirmed
+- [ ] `pytest tests/test_stage_1c.py -v` — 10 passed (one new test added)
+- [ ] `python main.py` — `board.career` printed with real data, `confidence`
+      is `"high"` or `"medium"` for University of Manchester Computer Science
+- [ ] Stage 1b tests still pass: `pytest tests/test_stage_1b.py -v`
 
 ---
 

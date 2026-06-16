@@ -38,9 +38,11 @@ class Deps:
     Agents read context, write to board, publish via hub.
     Never share a Deps instance across requests.
 
-    Tool clients (tavily, fetch, reddit, ddg) are created once at
-    ResearchHandler startup and reused across requests — they carry no
-    per-request state. hub and board are fresh each request.
+    Tool clients (Tavily, Fetch MCP) are NOT on Deps.
+    Each tool owns its own client:
+      - Tavily: module-level AsyncTavilyClient singleton in tools/search_tool.py
+      - Fetch MCP: module-level fastmcp.Client singleton in mcps/fetch_client.py,
+        exposed as the module-level `fetch_client` instance
 
     tool_budget and calls_made are NOT on Deps — they live on each agent
     instance so concurrent agents manage their own counters independently.
@@ -48,8 +50,4 @@ class Deps:
     hub:     MessageHub
     board:   Blackboard
     context: ResearchContext
-    tavily:  Any              # TavilyClient — used by all research agents
-    fetch:   Any              # MCPServerStdio from mcp/fetch_client.py — all research agents
-    reddit:  Any | None       # praw.Reddit — ForumAgent only, None if not configured
-    ddg:     Any              # DDGS — NewsAgent only
     
