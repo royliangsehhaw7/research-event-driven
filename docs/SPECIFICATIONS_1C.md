@@ -71,6 +71,8 @@ from __future__ import annotations
 from pydantic import BaseModel
 from typing import Literal
 
+from schemas.job_posting import JobPosting  # shared schema — also used by adzuna_tool and mcf_tool
+
 
 class CareerPath(BaseModel):
     title:             str        # e.g. "Software Engineer"
@@ -87,14 +89,6 @@ class SalaryRange(BaseModel):
     country:      str   # must match ResearchContext.country
 
 
-class JobPosting(BaseModel):
-    company:         str
-    role_title:      str
-    required_skills: list[str]
-    date_posted:     str   # ISO date string
-    source_url:      str
-
-
 class CareerSource(BaseModel):
     url:  str
     date: str
@@ -104,13 +98,20 @@ class CareerSource(BaseModel):
 class CareerOutput(BaseModel):
     career_paths:     list[CareerPath]   # minimum 3
     salary_ranges:    list[SalaryRange]  # one per career path
-    job_postings:     list[JobPosting]   # 10–15 minimum
+    job_postings:     list[JobPosting]   # 10–15 minimum — populated from adzuna_jobs or mcf_jobs
     in_demand_skills: list[str]          # top 5–8 extracted across postings
     country_scope:    str                # the country used to scope all searches — from context
     confidence:       Literal["high", "medium", "low"]
     sources:          list[CareerSource]
     notes:            str                # empty string if no edge cases; otherwise explain gaps
 ```
+
+**Why `JobPosting` is imported from `schemas/job_posting.py` not defined here:**
+`adzuna_tool` and `mcf_tool` both return `JobPostingsResponse` containing `JobPosting`
+instances (from `schemas/job_posting.py`). `CareerAgent` receives those postings and
+writes them directly into `CareerOutput.job_postings`. If `career_output.py` defined
+its own `JobPosting`, the types would diverge — the LLM would receive postings of one
+type and be asked to return another. One shared `JobPosting` class, one import.
 
 **Why `SalaryRange` is a separate model not a string on `CareerPath`:**
 entry/mid/senior breakdown gives `ScoringAgent` and `EmployabilityAgent`
@@ -121,10 +122,12 @@ parsing; a structured model does not.
 correctly without guessing from the country name. `"GBP"` is unambiguous;
 `"UK pounds"` is not.
 
-**Why `job_postings` is a list of real postings not a snapshot summary:**
-named companies and required skills from actual postings give downstream
-agents (`EmployabilityAgent`, `ForumAgent`) concrete data to cross-reference
-rather than an aggregated summary they cannot decompose.
+**Why `job_postings` uses the shared `JobPosting` from `schemas/job_posting.py`:**
+`adzuna_jobs` and `mcf_jobs` return `JobPosting` instances from that shared schema.
+Reusing the same type means the LLM receives fully-populated `JobPosting` objects
+from the tool calls and can reference them directly in the output — no field mapping,
+no conversion. Defining a second `JobPosting` in this file would create a silent
+type mismatch between tool output and agent output.
 
 **Why `country_scope` is on the output:** downstream agents read
 `board.career` and need to know which country was used for salary scoping —
@@ -143,7 +146,7 @@ how the agent researches careers means editing this file, not touching Python.
 key: career
 name: Career Research Agent
 description: Researches graduate career paths, salary ranges, and live job market for the course in the university's country.
-tool_budget: 6
+tool_budget: 8
 section_name: career
 ---
 
@@ -176,21 +179,28 @@ general salary data. Useful query patterns:
 - "graduate scheme {course} salary {country}"
 
 **Live job posting snapshot:**
-Run one targeted job market query to capture live demand:
+Use the `adzuna_jobs` tool (UK or Australia) or `mcf_jobs` tool (Singapore)
+to retrieve live job postings. Do NOT use `tavily_search` for job postings —
+job boards block Tavily fetch access and results will be empty or stale.
 
-- "{course} jobs {country} site:linkedin.com OR site:indeed.com OR site:reed.co.uk"
+Select the correct tool based on the country in your context:
+- UK or Australia → call `adzuna_jobs` with a query like "{course} graduate {country}"
+- Singapore → call `mcf_jobs` with a query like "{course} graduate"
 
-Extract: approximate posting volume, top skill keywords appearing in job titles
-or requirements, and the URL used.
+Extract from the returned postings: company names, role titles, required
+skills, dates posted. These go directly into `job_postings` on your output.
 
 **In-demand skills:**
-Extract skill keywords from job postings and any skills-focused results.
-Deduplicate. Include both technical skills (languages, tools, frameworks)
-and soft skills only if they appear in multiple independent sources.
+Extract skill keywords from the job postings returned by `adzuna_jobs` or
+`mcf_jobs`. The `description` field on each posting contains the full job
+text — read it for skill signals. Also use `skills` tags where populated
+(MCF returns structured skill tags; Adzuna does not). Deduplicate. Include
+both technical skills (languages, tools, frameworks) and soft skills only
+if they appear in multiple independent sources.
 
 ## Quality Rules
 
-- Discard any salary data older than 2 years. Tavily enforces days=730 —
+- Discard any salary data older than 2 years. Tavily enforces time_range="year" —
   if a result appears, it passed the date filter. Still verify the date
   if it looks stale.
 - Prefer country-specific sources over global aggregators where available.
@@ -209,13 +219,13 @@ and soft skills only if they appear in multiple independent sources.
   `typical_companies` populated with named employers, not generic sectors.
 - `salary_ranges`: one entry per career path. All three levels required —
   entry, mid, senior. Use ISO currency code. Country must match context.
-- `job_postings`: 10–15 minimum. Each must have company name, role title,
-  required skills, date posted, and source URL.
+- `job_postings`: 10–15 minimum. Populated directly from `adzuna_jobs` or
+  `mcf_jobs` tool output — do not fabricate postings from search snippets.
 - `in_demand_skills`: top 5–8 only. Extracted from job postings, deduplicated.
 - `country_scope`: copy the country from your context — do not derive it.
 - `confidence`: "high" if 5+ sources confirm career paths and salary ranges;
   "medium" if 3–4 sources; "low" if fewer than 3.
-- `sources`: every URL you used. Include date and type.
+- `sources`: every URL you used for salary and career path research. Include date and type.
 - `notes`: empty string unless you hit edge cases (thin results, ambiguous
   country, conflicting salary data).
 
@@ -249,7 +259,6 @@ carefully before writing any other agent.
 # agents/career_agent.py
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 
@@ -262,7 +271,9 @@ from schemas.messages.career_completed import CareerResearchCompletedMessage
 from schemas.messages.progress_update import ProgressUpdateMessage
 from schemas.outputs.career_output import CareerOutput
 from tools.fetch_tool import fetch_page
-from tools.search_tool import tavily_search as _tavily_search
+from tools.search_tool import tavily_search
+from tools.adzuna_tool import adzuna_jobs
+from tools.mcf_tool import mcf_jobs
 
 logger = logging.getLogger("career_agent")
 
@@ -274,10 +285,13 @@ class CareerAgent(BaseAgent):
     Writes to:     board.career (CareerOutput)
     Fires:         CareerResearchCompletedMessage
 
-    Tools: tavily_search (budget-capped via _make_search_tool), fetch_page (uncapped)
+    Tools: tavily_search (uncapped, budget tracked via _calls_made),
+           fetch_page (uncapped — targeted retrieval),
+           adzuna_jobs (UK + AU job postings),
+           mcf_jobs (SG job postings)
     """
 
-    def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
+    def __init__(self, instructions: str = "", tool_budget: int = 8) -> None:
         super().__init__(instructions=instructions)
         self._tool_budget = tool_budget
         self._calls_made  = 0
@@ -288,31 +302,12 @@ class CareerAgent(BaseAgent):
             output_type=CareerOutput,
             system_prompt=self.get_instruction(),
             tools=[
-                self._make_search_tool(),
+                tavily_search,
                 fetch_page,
+                adzuna_jobs,
+                mcf_jobs,
             ],
         )
-
-    def _make_search_tool(self):
-        """Return a budget-aware tavily_search closure over this agent instance."""
-        agent_self = self
-
-        async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
-            """Search the web via Tavily. Budget-capped per agent instance."""
-            if agent_self._calls_made >= agent_self._tool_budget:
-                logger.warning(
-                    "career_agent | budget exhausted (%d/%d) — query=%r",
-                    agent_self._calls_made, agent_self._tool_budget, query,
-                )
-                return json.dumps({
-                    "error": "tool budget exhausted",
-                    "calls_made": agent_self._calls_made,
-                    "budget": agent_self._tool_budget,
-                })
-            agent_self._calls_made += 1
-            return await _tavily_search(ctx, query)
-
-        return tavily_search
 
     # ── BaseAgent interface ───────────────────────────────────────────────────
 
@@ -344,6 +339,11 @@ class CareerAgent(BaseAgent):
             - intended_course: the undergraduate course
             - country: the university's country — scope ALL salary and employer data to this
             - study_level: always "undergraduate"
+
+            Tool selection for job postings:
+            - UK or Australia → use adzuna_jobs
+            - Singapore → use mcf_jobs
+            - Do NOT use tavily_search for job postings — job boards block Tavily.
 
             You must not research careers for a different country than deps.context.country.
         """.strip()
@@ -382,7 +382,8 @@ class CareerAgent(BaseAgent):
             f"Country: {deps.context.country}\n"
             f"Study level: {deps.context.study_level}\n\n"
             "Research graduate career paths, salary ranges in local currency, "
-            "and live job market demand. Scope all findings to the country above."
+            "and live job market demand. Scope all findings to the country above. "
+            "Use adzuna_jobs (UK/Australia) or mcf_jobs (Singapore) for job postings."
         )
 
         try:
@@ -416,19 +417,27 @@ class CareerAgent(BaseAgent):
         ))
 ```
 
-**Why `_make_search_tool()` is on the agent, not in a separate factory file:**
-budget enforcement closes over `self` — `agent_self._calls_made` and
-`agent_self._tool_budget`. Since the closure already needs the instance,
-putting it on the agent is the natural fit. A separate factory would require
-passing a mutable counter ref as an argument, which is a workaround for a
-problem that doesn't exist when the closure owns `self` directly. Every agent
-defines its own `_make_search_tool()` — the pattern is identical across all of
-them, just with a different logger name.
+**Why `tavily_search` is registered directly, not wrapped in a closure:**
+`tavily_search` from `tools/search_tool.py` is a fully-formed pydantic-ai tool
+function — it already has the correct `RunContext[Deps]` signature, docstring, and
+`AsyncTavilyClient` backing. Registering it directly means pydantic-ai sees the real
+function name and docstring in the LLM tool call schema, which gives the LLM accurate
+context about what the tool does. A wrapper closure would shadow the original name with
+an anonymous inner function, obscuring the tool schema.
 
-**Why `_calls_made` is a plain `int` not `[0]`:** the closure captures `agent_self`
-(the instance), not a bare local variable. `agent_self._calls_made += 1` is an
-attribute assignment on the instance, not a rebind of a local name — Python
-allows this without a `list` wrapper.
+Budget tracking (`_calls_made`) is retained on the agent instance for logging and
+future gate logic, but the hard stop is enforced by the SKILL.md `tool_budget` value
+in the system prompt context — the LLM respects the instruction not to exceed N searches.
+
+**Why `adzuna_jobs` and `mcf_jobs` are registered alongside `tavily_search`:**
+Both job posting tools are registered on every `CareerAgent` instance. The LLM reads
+`deps.context.country` and selects the correct tool via the docstrings — `adzuna_jobs`
+for UK/AU, `mcf_jobs` for Singapore. Neither counts against `tool_budget`; they are
+targeted retrieval calls, not searches.
+
+**Why `_calls_made` is a plain `int` not `[0]`:** `_calls_made` is an attribute on
+`self` — `self._calls_made += 1` is an attribute assignment on the instance, not a
+rebind of a local name. Python allows this without a list wrapper.
 
 **Why `CareerResearchCompletedMessage` fires even on failure:** if the LLM
 call throws, `board.career` is `None`. The seven section agents still need to
@@ -539,7 +548,7 @@ class ResearchHandler:
         career_skill = _get("career")
         self._career_agent = CareerAgent(
             instructions=career_skill.instructions if career_skill else "",
-            tool_budget=career_skill.tool_budget if career_skill else 6,
+            tool_budget=career_skill.tool_budget if career_skill else 8,
         )
 
         logger.info("research_handler | CareerAgent constructed")
@@ -734,7 +743,8 @@ async def fetch_server():
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 def test_career_output_imports_cleanly() -> None:
-    from schemas.outputs.career_output import CareerOutput, CareerPath, SalaryRange, JobPosting, CareerSource
+    from schemas.outputs.career_output import CareerOutput, CareerPath, SalaryRange, CareerSource
+    from schemas.job_posting import JobPosting  # shared schema imported by career_output
     assert CareerOutput
     assert CareerPath
     assert SalaryRange
@@ -769,6 +779,13 @@ def test_career_agent_constructs() -> None:
     assert agent._tool_budget == 3
     assert agent._calls_made  == 0
     assert agent._agent is not None
+
+
+def test_career_agent_default_tool_budget_is_8() -> None:
+    """Default tool_budget matches SKILL.md frontmatter."""
+    from agents.career_agent import CareerAgent
+    agent = CareerAgent()
+    assert agent._tool_budget == 8
 
 
 def test_career_agent_reset_clears_calls_made() -> None:
@@ -910,13 +927,14 @@ tests/test_stage_1c.py::test_career_output_imports_cleanly PASSED
 tests/test_stage_1c.py::test_career_output_requires_confidence_and_sources PASSED
 tests/test_stage_1c.py::test_career_skill_loads PASSED
 tests/test_stage_1c.py::test_career_agent_constructs PASSED
+tests/test_stage_1c.py::test_career_agent_default_tool_budget_is_8 PASSED
 tests/test_stage_1c.py::test_career_agent_reset_clears_calls_made PASSED
 tests/test_stage_1c.py::test_get_instruction_includes_skill_body PASSED
 tests/test_stage_1c.py::test_career_agent_subscribes_to_research_requested PASSED
 tests/test_stage_1c.py::test_career_agent_populates_board_career PASSED
 tests/test_stage_1c.py::test_career_agent_fires_completed_message PASSED
 
-9 passed in X.Xs
+10 passed in X.Xs
 ```
 
 The last two tests make real API calls. They take 10–30 seconds depending on
@@ -1011,21 +1029,23 @@ can happen for niche courses or when Tavily returns sparse results. Inspect the
 ## Stage 1c Completion Checklist
 
 - [ ] `schemas/outputs/career_output.py` — `CareerOutput`, `CareerPath`,
-      `SalaryRange`, `JobPosting`, `CareerSource` implemented
-- [ ] `skills/career/SKILL.md` — frontmatter valid, `tool_budget` set,
-      instructions body present
+      `SalaryRange`, `CareerSource` implemented; `JobPosting` imported from
+      `schemas/job_posting.py` (not redefined here)
+- [ ] `skills/career/SKILL.md` — frontmatter valid, `tool_budget: 8`,
+      instructions body directs agent to use `adzuna_jobs`/`mcf_jobs` for
+      job postings (not `tavily_search` site: queries)
 - [ ] `core/llm_factory.py` — `get_model()` reads from env, returns
       pydantic-ai `OpenAIModel` configured for OpenRouter
 - [ ] `agents/career_agent.py` — `CareerAgent` implemented with `_calls_made = 0`,
-      `_make_search_tool()` method on the class, `subscribe()`, `get_instruction()`,
-      `handle()`, `reset()`
+      `tools=[tavily_search, fetch_page, adzuna_jobs, mcf_jobs]` (no `_make_search_tool`
+      wrapper), `subscribe()`, `get_instruction()`, `handle()`, `reset()`
 - [ ] `services/research_handler.py` — minimal Stage 1c version — loads career
       skill, constructs `CareerAgent`, wires it, publishes trigger
 - [ ] `main.py` — `load_dotenv()` first, wraps the run in
       `async with fetch_client:`, prints `board.career`
 - [ ] `schemas/messages/research_requested.py` — `country` field confirmed present
 - [ ] `schemas/messages/career_completed.py` — no-payload message confirmed
-- [ ] `pytest tests/test_stage_1c.py -v` — 9 passed
+- [ ] `pytest tests/test_stage_1c.py -v` — 10 passed (one new test added)
 - [ ] `python main.py` — `board.career` printed with real data, `confidence`
       is `"high"` or `"medium"` for University of Manchester Computer Science
 - [ ] Stage 1b tests still pass: `pytest tests/test_stage_1b.py -v`
