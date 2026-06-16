@@ -240,9 +240,9 @@ class Deps:
 
     Tool clients (Tavily, Fetch MCP) are NOT on Deps.
     Each tool owns its own client:
-      - Tavily: module-level singleton in tools/search_tool.py
-      - Fetch MCP: FetchClient singleton in mcp/fetch_client.py, exposed as
-        the module-level `fetch_client` instance
+      - Tavily: module-level AsyncTavilyClient singleton in tools/search_tool.py
+      - Fetch MCP: module-level fastmcp.Client singleton in mcps/fetch_client.py,
+        exposed as the module-level `fetch_client` instance
 
     tool_budget and calls_made are NOT on Deps — they live on each agent
     instance so concurrent agents manage their own counters independently.
@@ -480,7 +480,7 @@ class SalaryRange(BaseModel):
     country:      str   # must match ResearchContext.country
 
 
-class JobPosting(BaseModel):
+class JobPostingSnapshot(BaseModel):
     company:        str
     role_title:     str
     required_skills: list[str]
@@ -495,10 +495,10 @@ class CareerSource(BaseModel):
 
 
 class CareerOutput(BaseModel):
-    career_paths:    list[CareerPath]    # minimum 3
-    salary_ranges:   list[SalaryRange]  # one per career path
-    job_postings:    list[JobPosting]   # 10–15 minimum
-    in_demand_skills: list[str]         # top 5–8 extracted across postings
+    career_paths:    list[CareerPath]          # minimum 3
+    salary_ranges:   list[SalaryRange]         # one per career path
+    job_postings:    list[JobPostingSnapshot]  # 10–15 minimum, normalised from adzuna/mcf tools
+    in_demand_skills: list[str]               # top 5–8 extracted across postings
     sources:         list[CareerSource]
     confidence:      Literal["high", "medium", "low"]
     notes:           str
@@ -1163,8 +1163,13 @@ Generic university experience threads are not acceptable output.
    Fetch the course page via fetch_page for full review text.
 4. `site:quora.com` via Tavily — student Q&A threads, useful for international
    student perspectives and course comparisons.
-5. `site:reddit.com` via Tavily — best-effort snippets only (no full threads).
-   Use as a supporting source, not primary. Weight lower than sources 1–4.
+5. `site:reddit.com` via Tavily — finds Reddit post URLs. After getting a URL
+   from Tavily, fetch the full thread by appending `.json` to the post URL and
+   calling `fetch_page`. Example:
+   - Tavily returns: `https://www.reddit.com/r/edinburghuniversity/comments/abc123/title/`
+   - Fetch this: `https://www.reddit.com/r/edinburghuniversity/comments/abc123/title/.json`
+   The JSON response contains all comments — extract from `[1].data.children[].data.body`.
+   Discard threads with fewer than 3 substantive replies.
    For non-UK universities, promote this to source 2 if TSR coverage is sparse.
 6. `site:collegeconfidential.com` via Tavily — use for US and international
    universities only. Skip for UK-only queries where TSR and StudentCrowd suffice.
@@ -1387,7 +1392,7 @@ that these agents must never call search tools.
 at startup. The enforcement is implemented when agents are built in Stage 1c
 (`CareerAgent`) and Stage 2a (all remaining section agents).
 
-The pattern every agent follows:
+The pattern every agent follows (implemented in Stage 1c and 2a via `_make_search_tool()`):
 
 ```python
 class CareerAgent(BaseAgent):
@@ -1396,20 +1401,27 @@ class CareerAgent(BaseAgent):
         self._tool_budget = tool_budget
         self._calls_made  = 0        # reset per request in handle()
 
-    async def _search(self, deps, query: str, **kwargs):
-        """Gated search call. Skips and warns if budget exhausted."""
-        if self._calls_made >= self._tool_budget:
-            self._logger.warning(
-                "%s | tool budget exhausted (%d calls) — skipping: %r",
-                self.__class__.__name__, self._tool_budget, query,
-            )
-            return None
-        self._calls_made += 1
-        return await deps.tavily.search(query, **kwargs)
+    def _make_search_tool(self):
+        """Wrap tavily_search with a budget-aware closure over this agent instance."""
+        agent_self = self
+        async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
+            if agent_self._calls_made >= agent_self._tool_budget:
+                agent_self._logger.warning(
+                    "%s | tool budget exhausted (%d calls) — skipping: %r",
+                    agent_self.__class__.__name__, agent_self._tool_budget, query,
+                )
+                return json.dumps({"error": "tool budget exhausted", "query": query})
+            agent_self._calls_made += 1
+            from tools.search_tool import _client as tavily_client   # module-level singleton
+            results = await tavily_client.search(query, max_results=5, time_range="year")
+            return json.dumps(results)
+        return tavily_search
 ```
 
-Every tool call goes through `_make_search_tool()` or an equivalent gated
-wrapper. Direct calls to the Tavily client that bypass the gate are a bug.
+The Tavily client is the module-level `AsyncTavilyClient` singleton in `tools/search_tool.py` —
+it is **not** on `Deps`. The budget closure reaches it via a direct module import inside the
+wrapper function. `fetch_page` and job posting tools (`adzuna_jobs`, `mcf_jobs`) are registered
+directly without budget wrapping — they are targeted retrieval calls, not searches.
 
 `_calls_made` is reset at the start of each `handle()` call — not in
 `__init__()` — so the same agent instance handles multiple requests across
@@ -1525,7 +1537,7 @@ from pathlib import Path
 
 import pytest
 
-from core.message_hub import MessageHub, AgentParam
+from core.message_hub import MessageHub
 from core.blackboard import Blackboard
 from core.deps import Deps, ResearchContext
 
@@ -1548,12 +1560,17 @@ TIMESTAMP = datetime.now().isoformat()
 # ── MessageHub ────────────────────────────────────────────────────────────────
 
 def test_hub_subscribe_and_publish() -> None:
-    """Hub dispatches to registered handler with AgentParam."""
+    """Hub dispatches to registered handler via closure capturing deps."""
     hub = MessageHub()
     received: list = []
 
-    async def handler(param: AgentParam) -> None:
-        received.append(param.message)
+    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
+        university_name="U", intended_course="CS", country="UK"
+    ))
+
+    # Handlers are closures that capture deps at subscription time
+    async def handler(message: SectionCompletedMessage) -> None:
+        received.append(message)
 
     hub.subscribe(SectionCompletedMessage, handler)
     msg = SectionCompletedMessage(
@@ -1561,10 +1578,7 @@ def test_hub_subscribe_and_publish() -> None:
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
-    asyncio.run(hub.publish(msg, deps))
+    asyncio.run(hub.publish(msg))
     assert len(received) == 1
     assert received[0].section_name == "forum"
 
@@ -1574,9 +1588,9 @@ def test_hub_multiple_handlers() -> None:
     hub = MessageHub()
     calls: list[str] = []
 
-    async def h1(param: AgentParam): calls.append("h1")
-    async def h2(param: AgentParam): calls.append("h2")
-    async def h3(param: AgentParam): calls.append("h3")
+    async def h1(message): calls.append("h1")
+    async def h2(message): calls.append("h2")
+    async def h3(message): calls.append("h3")
 
     hub.subscribe(SectionCompletedMessage, h1)
     hub.subscribe(SectionCompletedMessage, h2)
@@ -1587,21 +1601,15 @@ def test_hub_multiple_handlers() -> None:
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
-    asyncio.run(hub.publish(msg, deps))
+    asyncio.run(hub.publish(msg))
     assert sorted(calls) == ["h1", "h2", "h3"]
 
 
 def test_hub_no_handlers_is_noop() -> None:
     """Publishing to a type with no subscribers does nothing."""
     hub = MessageHub()
-    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
     msg = ScoringCompletedMessage(triggered_by="test", timestamp=TIMESTAMP)
-    asyncio.run(hub.publish(msg, deps))  # must not raise
+    asyncio.run(hub.publish(msg))  # must not raise
 
 
 def test_hub_type_isolation() -> None:
@@ -1609,19 +1617,16 @@ def test_hub_type_isolation() -> None:
     hub = MessageHub()
     calls: list[str] = []
 
-    async def handler(param: AgentParam): calls.append("fired")
+    async def handler(message): calls.append("fired")
 
     hub.subscribe(SectionCompletedMessage, handler)
-    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
     msg = SectionFailedMessage(
         section_name="news",
         reason="timeout",
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    asyncio.run(hub.publish(msg, deps))
+    asyncio.run(hub.publish(msg))
     assert calls == []
 
 
@@ -1631,18 +1636,15 @@ def test_hub_fresh_instance_isolation() -> None:
     hub2 = MessageHub()
     calls: list[str] = []
 
-    async def handler(param: AgentParam): calls.append("fired")
+    async def handler(message): calls.append("fired")
 
     hub1.subscribe(SectionCompletedMessage, handler)
-    deps2 = Deps(hub=hub2, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
     msg = SectionCompletedMessage(
         section_name="rankings",
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    asyncio.run(hub2.publish(msg, deps2))
+    asyncio.run(hub2.publish(msg))
     assert calls == []   # hub2 has no subscribers
 
 
@@ -1840,9 +1842,11 @@ Cause: the markdown body after the second `---` is empty.
 The body does not need to be complete at this stage, but it must not be blank.
 Add at least a one-line placeholder if the full content is not written yet.
 
-**`test_hub_subscribe_and_publish FAILED — handler received wrong type`**
-Cause: handler signature uses `msg` typed as `BaseMessage` instead of `AgentParam`.
-Fix: all handlers must accept `param: AgentParam` and read `param.message` and `param.deps`.
+**`test_hub_subscribe_and_publish FAILED — handler not called`**
+Cause: handler signature is wrong or `hub.publish(msg, deps)` was called with two args.
+`hub.publish(message)` takes only the message — `deps` is captured by closure at subscription
+time, not passed through the hub. Fix: ensure `hub.subscribe(MsgType, handler)` is called
+before `hub.publish(msg)`, and that the handler accepts a single message argument.
 
 **`AssertionError: forum should have the highest tool_budget`**
 Cause: `forum/SKILL.md` has `tool_budget: 8` instead of `10`.

@@ -29,19 +29,19 @@ def get_model(env_key: str):
         )
 
     api_key = os.getenv("OPENROUTER_API_KEY")
-    base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    base_url = os.getenv("OPENROUTER_BASE_URL")
 
-    if not api_key:
-        raise EnvironmentError(
-            "OPENROUTER_API_KEY is not set. Check your .env file."
-        )
 
     # pydantic-ai OpenAI-compatible provider
-    from pydantic_ai.models.openai import OpenAIModel
+    from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
+    from pydantic_ai.settings import ModelSettings
 
     provider = OpenAIProvider(
         base_url=base_url,
         api_key=api_key,
     )
-    return OpenAIModel(model_name=model_string, provider=provider)
+    settings = ModelSettings(
+        temperature=0.35
+    )
+    return OpenAIChatModel(model_name=model_string, provider=provider, settings=settings)

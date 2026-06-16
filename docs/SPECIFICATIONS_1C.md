@@ -591,8 +591,9 @@ focused on the agent pattern, not on utility functions.
 
 ## 1c.6 `main.py` — CLI Entry Point
 
-`main.py` boots the fetch client, creates the handler, runs one request, and
-prints `board.career` to stdout. This is the verification step.
+`main.py` opens the shared fetch client around the run, creates the handler,
+runs one request, and prints `board.career` to stdout. This is the
+verification step.
 
 ```python
 # main.py — Stage 1c
@@ -611,13 +612,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 from services.research_handler import ResearchHandler
 
 
 async def run(university_name: str, intended_course: str, country: str) -> None:
-    await fetch_client.startup()
-    try:
+    async with fetch_client:
         handler = ResearchHandler()
         board = await handler.handle_request(
             university_name=university_name,
@@ -632,8 +632,6 @@ async def run(university_name: str, intended_course: str, country: str) -> None:
             print("\n── board.career ──────────────────────────────────────────")
             print(board.career.model_dump_json(indent=2))
             print("──────────────────────────────────────────────────────────\n")
-    finally:
-        await fetch_client.shutdown()
 
 
 if __name__ == "__main__":
@@ -643,6 +641,17 @@ if __name__ == "__main__":
         country="UK",
     ))
 ```
+
+> **Why `async with fetch_client:` here at all, given `fetch_page` already
+> wraps its own call in `async with fetch_client:`?** It isn't required —
+> `fetch_page` is self-contained and would open/close the connection on its
+> own if this weren't here. Wrapping the whole run is an optimization: it opens
+> the `mcp-server-fetch` subprocess once before any agent runs and keeps it
+> open for the whole request, so the first `fetch_page` call doesn't pay
+> subprocess-startup latency. Because `fastmcp.Client` is ref-counted, this is
+> just an outer `async with` — every inner `async with fetch_client:` inside
+> `fetch_page` reuses the same session and only the outermost exit actually
+> closes it.
 
 **Why `load_dotenv()` before any imports:** `tools/search_tool.py` reads
 `TAVILY_API_KEY` from `os.environ` at module import time. If `.env` is not
@@ -703,7 +712,7 @@ Real LLM + real Tavily calls. Requires:
   - OPENROUTER_API_KEY in .env
   - RESEARCH_MODEL in .env
 
-The fetch_server fixture starts FetchClient for tests that call fetch_page.
+The fetch_server fixture opens the shared fetch_client for tests that call fetch_page.
 """
 from __future__ import annotations
 
@@ -713,14 +722,13 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 
 @pytest.fixture(scope="module")
 async def fetch_server():
-    await fetch_client.startup()
-    yield
-    await fetch_client.shutdown()
+    async with fetch_client:
+        yield
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -930,11 +938,16 @@ Expected log sequence:
 ```
 INFO | skill_loader | loaded skills/career/SKILL.md
 INFO | research_handler | CareerAgent constructed
-INFO | fetch_client | Fetch MCP server started
 INFO | career_agent | starting — university='University of Manchester' course='Computer Science' country='UK'
 INFO | career_agent | completed — paths=5 confidence=high
-INFO | fetch_client | Fetch MCP server stopped
 ```
+
+Note: there's no longer a separate "Fetch MCP server started/stopped" log
+pair — `fastmcp.Client` doesn't log on connect/disconnect by default. The
+`mcp-server-fetch` subprocess starts the first time `async with fetch_client:`
+is entered (the outer one in `main.py`, or the first `fetch_page` call if
+`main.py`'s wrapper weren't there) and stops when the outermost `async with`
+exits.
 
 Followed by `board.career` JSON printed to stdout. Confirm:
 
@@ -976,11 +989,17 @@ Cause: `load_dotenv()` not called before the tool module import.
 Fix: confirm `main.py` calls `load_dotenv()` as its first statement before any
 project imports.
 
-**`RuntimeError: FetchClient is not running`**
-Cause: `fetch_client.startup()` not called before the first request, or a test
-runs without the `fetch_server` fixture.
-Fix: confirm `main.py` calls `await fetch_client.startup()` before constructing
-`ResearchHandler`. Confirm LLM tests use the `fetch_server` fixture.
+**`McpError` / connection failure from `fetch_page`**
+Cause: the `mcp-server-fetch` subprocess failed to start (e.g. `mcp-server-fetch`
+not installed, or `python -m mcp_server_fetch` not runnable). Unlike the old
+singleton, there's no separate "not started" state to worry about —
+`fetch_client` connects lazily on first `async with`, in `main.py` or inside
+`fetch_page` itself. `fetch_page` never raises this to the agent: it's caught
+and returned as `status: "error"` in the JSON result. If you see it surface
+anyway, check it wasn't raised *outside* `fetch_page`'s try/except (e.g. from
+`main.py`'s own `async with fetch_client:` failing to connect before any agent
+runs). Fix: confirm `pip install fastmcp mcp-server-fetch` succeeded and
+`python -m mcp_server_fetch --help` works (see Stage 1b, Service 2).
 
 **LLM returns fewer than 3 career paths**
 Not a bug — the agent sets `confidence: "low"` and explains in `notes`. This
@@ -1002,8 +1021,8 @@ can happen for niche courses or when Tavily returns sparse results. Inspect the
       `handle()`, `reset()`
 - [ ] `services/research_handler.py` — minimal Stage 1c version — loads career
       skill, constructs `CareerAgent`, wires it, publishes trigger
-- [ ] `main.py` — `load_dotenv()` first, `fetch_client.startup()` before
-      handler, `shutdown()` in `finally`, prints `board.career`
+- [ ] `main.py` — `load_dotenv()` first, wraps the run in
+      `async with fetch_client:`, prints `board.career`
 - [ ] `schemas/messages/research_requested.py` — `country` field confirmed present
 - [ ] `schemas/messages/career_completed.py` — no-payload message confirmed
 - [ ] `pytest tests/test_stage_1c.py -v` — 9 passed

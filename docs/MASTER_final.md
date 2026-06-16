@@ -134,7 +134,7 @@ never silently omits a section.
 
 | Tool | Kind | Role | API Key Required |
 |---|---|---|---|
-| **Tavily** | Python client (`AsyncTavilyClient`) | Primary search — career paths, salary, forum, news, rankings | `TAVILY_API_KEY` |
+| **Tavily** | Python client | Primary search — career paths, salary, forum, news, rankings | `TAVILY_API_KEY` |
 | **Fetch MCP** | MCP server | Direct URL fetch — catalog pages, salary surveys | None |
 | **Adzuna** | REST API | Live job postings — UK and Australia | `ADZUNA_APP_ID` + `ADZUNA_APP_KEY` |
 | **MyCareersFuture** | REST API | Live job postings — Singapore only | None — public API |
@@ -143,17 +143,11 @@ never silently omits a section.
 > DDG will NOT be wired up first as it does NOT filter by dates
 >
 
-**Tavily client note:** the singleton in `tools/search_tool.py` is an
-`AsyncTavilyClient`, not the synchronous `TavilyClient`. Section agents run
-concurrently via `asyncio.gather()` from Stage 1d onward — a synchronous
-`TavilyClient.search()` call would block the entire event loop for its
-duration, serialising every agent's work. `AsyncTavilyClient` is built on
-`httpx.AsyncClient`; one shared module-level instance is safe and intended to
-be used concurrently by multiple agents.
 **Fetch MCP is the only MCP server in the stack.** Tavily, Adzuna, MyCareersFuture,
 and DuckDuckGo are plain Python/HTTP clients — no MCP protocol involved.
-The MCP server connection for Fetch lives in `mcps/fetch_client.py` as a managed
-singleton. The pydantic-ai tool function that wraps it lives in `tools/fetch_tool.py`.
+The connection for Fetch is a shared `fastmcp.Client`, defined once in
+`mcps/fetch_client.py` and reused by every agent. The pydantic-ai tool function
+that wraps it lives in `tools/fetch_tool.py`.
 
 **Why dedicated job posting tools:** Tavily cannot reliably retrieve live job
 postings — job boards (Indeed, Reed, LinkedIn) block fetch-based access and
@@ -161,6 +155,14 @@ Tavily's `site:` queries do not honour `time_range` filtering for job boards.
 Adzuna (UK + AU) and MyCareersFuture (SG) are purpose-built APIs returning
 structured, dated postings. They replace Tavily for the job posting snapshot
 in CareerAgent only — Tavily remains the primary tool for all other research.
+
+**Why these tools:**
+Tavily handles all general search including `site:thestudentroom.co.uk`,
+`site:studentcrowd.com`, `site:whatuni.com`, `site:quora.com`, and
+`site:reddit.com` queries. ForumAgent uses `site:` queries across multiple
+confirmed-accessible public student forums — no separate Reddit API client is
+required. DuckDuckGo replaces SerpAPI as a zero-cost news fallback with no
+monthly quota.
 
 ### LLM Provider
 
@@ -210,6 +212,7 @@ chainlit
 pyyaml                # SKILL.md frontmatter parsing
 tavily-python         # Tavily search client
 ddgs                  # News fallback — no key needed (NewsAgent)
+fastmcp               # Fetch MCP client (shared, reentrant)
 mcp-server-fetch      # Fetch MCP Server subprocess
 jinja2                # report generation
 python-dotenv
@@ -1010,136 +1013,67 @@ This is the key constraint: the tool set assigned at construction time limits wh
 the LLM can do. There is no free orchestration. A `CareerAgent` cannot call
 `ddg_search` because that function was never registered on it.
 
-### 8.2 Folder structure — `mcp/` vs `tools/`
+### 8.2 Folder structure — `mcps/` vs `tools/`
 
 Two folders. One responsibility each.
 
-**`mcp/`** — MCP server connection objects. One file per MCP server. Each file
-owns the connection, configuration, and lifecycle for exactly one MCP server.
-Nothing else lives here.
+**`mcps/`** — MCP server connection objects. One file per MCP server. Each file
+defines the shared client object for exactly one MCP server. Nothing else
+lives here. (Named `mcps/`, not `mcp/` — `mcp` is the name of the underlying
+SDK package, and a same-named local folder would shadow it on `sys.path`.)
 
 **`tools/`** — pydantic-ai tool functions. One file per tool. Each file defines
 one async tool function that the LLM can call. Each tool owns its own client as
-a module-level singleton. Nothing else lives here.
+a module-level singleton (or, for Fetch, imports the shared client from `mcps/`).
+Nothing else lives here.
 
 ```
-mcp/
-└── fetch_client.py         Fetch MCP server — singleton lifecycle management
+mcps/
+└── fetch_client.py         Fetch MCP — module-level fastmcp.Client (shared, reentrant)
 
 tools/
-├── search_tool.py          tavily_search — module-level AsyncTavilyClient singleton (async, concurrency-safe)
-├── fetch_tool.py           fetch_page — calls fetch singleton from mcp/fetch_client.py
-└── ddg_tool.py             ddg_search — module-level DDGS singleton, calls via asyncio.to_thread — NOT registered on any agent
+├── search_tool.py          tavily_search — module-level AsyncTavilyClient singleton
+├── fetch_tool.py           fetch_page — calls fetch_client from mcps/fetch_client.py
+└── ddg_tool.py              ddg_search — module-level DDGS singleton
 ```
 
 Tavily and DuckDuckGo are plain Python client libraries — no MCP
-protocol. Only Fetch is an MCP server. Its singleton is managed in
-`mcp/fetch_client.py`. `tools/fetch_tool.py` calls it via `get_fetch_server()` —
-the tool function has no knowledge of how the client was constructed.
+protocol. Only Fetch is an MCP server. Its shared client is defined in
+`mcps/fetch_client.py`. `tools/fetch_tool.py` imports that client directly and
+calls `call_tool()` on it inside its own `async with` block — the tool function
+owns its docstring, error handling, and return shape; the client object owns
+the connection.
 
-### 8.3 `mcp/fetch_client.py`
+### 8.3 `mcps/fetch_client.py`
 
 ```python
-# mcp/fetch_client.py
+# mcps/fetch_client.py
 from __future__ import annotations
-import logging
-from pydantic_ai.mcp import MCPServerStdio
 
-logger = logging.getLogger("fetch_client")
+from fastmcp import Client
+from fastmcp.client.transports import StdioTransport
 
-
-class FetchClient:
-    """Singleton wrapper around the Fetch MCP server subprocess.
-
-    One instance for the lifetime of the application. All state lives on
-    the instance — no globals, no module-level mutation.
-
-    Lifecycle:
-        await fetch_client.startup()   # called once at app boot
-        await fetch_client.shutdown()  # called once at app exit
-
-    Usage in tools:
-        result = await fetch_client.call_tool("fetch", {"url": url})
-
-    The module-level `fetch_client` instance is the singleton. Import and
-    use it directly — never construct FetchClient() yourself.
-    """
-
-    _instance: FetchClient | None = None
-
-    def __new__(cls) -> FetchClient:
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._server = None
-            cls._instance._started = False
-        return cls._instance
-
-    async def startup(self) -> None:
-        """Start the Fetch MCP server subprocess.
-
-        No-op if already started — safe to call multiple times.
-        Raises RuntimeError if the server fails to start.
-        """
-        if self._started:
-            return
-        self._server = MCPServerStdio(
-            command="npx",
-            args=["-y", "@modelcontextprotocol/server-fetch"],
-        )
-        await self._server.__aenter__()
-        self._started = True
-        logger.info("fetch_client | Fetch MCP server started")
-
-    async def shutdown(self) -> None:
-        """Shut down the Fetch MCP server subprocess cleanly.
-
-        No-op if never started.
-        """
-        if not self._started or self._server is None:
-            return
-        await self._server.__aexit__(None, None, None)
-        self._server = None
-        self._started = False
-        logger.info("fetch_client | Fetch MCP server stopped")
-
-    async def call_tool(self, tool: str, args: dict) -> str:
-        """Call a tool on the Fetch MCP server.
-
-        Raises RuntimeError if startup() has not been called.
-        """
-        if not self._started or self._server is None:
-            raise RuntimeError(
-                "FetchClient is not running — call startup() at application boot"
-            )
-        return await self._server.call_tool(tool, args)
-
-    @property
-    def ready(self) -> bool:
-        """True if the server is running and ready to accept calls."""
-        return self._started and self._server is not None
-
-
-# Module-level singleton — import and use this, never instantiate FetchClient directly
-fetch_client = FetchClient()
+# Single shared client for the Fetch MCP server (mcp-server-fetch, run as a
+# subprocess via stdio). Import this instance everywhere it's needed — do not
+# construct a new Client.
+#
+# fastmcp.Client is a reentrant, ref-counted async context manager: `async with
+# fetch_client:` can be entered from multiple places (the app entry point, and
+# again inside fetch_page) and the underlying subprocess/session is started on
+# the first entry and only stopped on the last matching exit. Concurrent
+# `call_tool()` calls on the shared session are multiplexed by request ID, so
+# this is safe under `asyncio.gather()` across section agents.
+fetch_client = Client(
+    StdioTransport(command="python", args=["-m", "mcp_server_fetch"])
+)
 ```
 
-One file. All state on the instance. `tools/fetch_tool.py` imports `fetch_client`
-and calls `call_tool()` — it has no knowledge of the lifecycle. The app entry
-point calls `startup()` and `shutdown()`.
-
-**Is the singleton still right under `asyncio.gather()`?** Yes — and it's the
-one tool wrapper that was already concurrency-safe by construction. From
-Stage 1d onward several section agents call `fetch_page` concurrently. The
-MCP transport is JSON-RPC over stdio: each `call_tool()` request carries a
-unique ID, and the session's read-loop dispatches each response back to the
-coroutine that's awaiting it. That means multiple agents can `await
-fetch_client.call_tool(...)` at the same time on the *same* underlying
-subprocess/session — requests are multiplexed, not serialised. One subprocess
-for the whole run is also cheaper than spawning `mcp-server-fetch` per agent
-or per call. Contrast this with Tavily: `TavilyClient.search()` is a
-synchronous call with no concurrency story, which is why that client needed
-to change to `AsyncTavilyClient` (see Section 3) — `fetch_client` needed no
-equivalent change.
+One file, one shared object, no custom class. `tools/fetch_tool.py` imports
+`fetch_client` and calls `await fetch_client.call_tool(...)` inside its own
+`async with fetch_client:` block — it has no knowledge of who else has the
+connection open. The app entry point *may* also wrap the whole run in
+`async with fetch_client:` to pre-warm the subprocess before the first
+`fetch_page` call, but this is an optimization, not a requirement (see 8.9).
 
 ### 8.4 Tool budget enforcement
 
@@ -1209,11 +1143,11 @@ blackboard. `tool_budget: 0` in their SKILL.md makes this explicit.
 ```python
 import json
 import os
-from tavily import AsyncTavilyClient
+from tavily import TavilyClient
 from pydantic_ai import RunContext
 from core.deps import Deps
 
-_client = AsyncTavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
 
 async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
@@ -1224,19 +1158,13 @@ async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
     return json.dumps(results)
 ```
 
-> `AsyncTavilyClient` (not `TavilyClient`) — `tavily_search` is called
-> concurrently by multiple section agents via `asyncio.gather()`. The
-> synchronous client would block the event loop for the duration of each
-> call; `AsyncTavilyClient` is built on `httpx.AsyncClient` and a single
-> shared instance is safe under concurrent `await`.
-
 **`tools/fetch_tool.py`**
 
 ```python
 import json
 from pydantic_ai import RunContext
 from core.deps import Deps
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 
 async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
@@ -1244,22 +1172,19 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
     Use for university catalog pages, rankings pages, or any URL found in
     search results. Does not count against tool_budget — targeted retrieval,
     not a search."""
-    result = await fetch_client.call_tool("fetch", {"url": url})
-    return json.dumps({"url": url, "content": result})
+    async with fetch_client:
+        result = await fetch_client.call_tool("fetch", {"url": url})
+    return json.dumps({"url": url, "content": str(result)})
 ```
+
+> This is the illustrative shape. The full implementation (Stage 1b) wraps the
+> result in `FetchResult`, extracts text content from the MCP response, and
+> never raises — see `tools/fetch_tool.py` in Stage 1b for the real version.
 
 **`tools/ddg_tool.py`**
 
-> Not registered on any agent (see Section 13 and the warning below). Fixed
-> here anyway: `DDGS().text(...)` is synchronous (`requests`-based, no async
-> client exists in `ddgs`). Calling it directly from an `async def` would block
-> the event loop, the same issue `tavily_search` had with `TavilyClient`. The
-> fix is `asyncio.to_thread(...)`, which runs the blocking call in a worker
-> thread.
-
 ```python
 import json
-import asyncio
 from datetime import datetime, timedelta
 from dateutil.parser import parse as parse_date
 from ddgs import DDGS
@@ -1276,7 +1201,7 @@ async def ddg_search(ctx: RunContext[Deps], query: str) -> str:
     CURRENTLY NOT WIRED TO ANY AGENTS
     """
     cutoff = datetime.now() - timedelta(days=730)
-    raw = await asyncio.to_thread(_client.text, query, max_results=10)
+    raw = _client.text(query, max_results=10)
     items = []
     for r in raw:
         date_str = r.get("date", "")
@@ -1341,35 +1266,43 @@ class NewsAgent(BaseAgent):
 
 ### 8.9 Fetch MCP server lifecycle — app entry points
 
-`fetch_client` is a singleton. Its lifecycle is managed at the application
-boundary — not inside `ResearchHandler`. `ResearchHandler` has no startup or
-shutdown responsibilities.
+`fetch_client` is a single shared `fastmcp.Client`. Wrapping the application
+boundary in `async with fetch_client:` is **optional** — `fetch_page` opens its
+own `async with fetch_client:` block on every call and is fully self-contained.
+Doing it at the boundary too is purely a latency optimization: it pre-starts
+the `mcp-server-fetch` subprocess once, before the first request, so the first
+`fetch_page` call doesn't pay subprocess-startup cost. Because the client is
+reentrant and ref-counted, the inner and outer `async with` blocks nest safely
+— the connection stays open until the outermost one exits. `ResearchHandler`
+still has no startup or shutdown responsibilities either way.
 
 **Chainlit (`ui/app.py`):**
 
 ```python
-from mcp.fetch_client import fetch_client
+from contextlib import AsyncExitStack
+from mcps.fetch_client import fetch_client
+
+_stack = AsyncExitStack()
 
 @cl.on_chat_start
 async def start():
-    await fetch_client.startup()
+    await _stack.enter_async_context(fetch_client)
 
 @cl.on_chat_end
 async def end():
-    await fetch_client.shutdown()
+    await _stack.aclose()
 ```
 
 **FastAPI (when you expose an endpoint):**
 
 ```python
 from contextlib import asynccontextmanager
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await fetch_client.startup()
-    yield
-    await fetch_client.shutdown()
+    async with fetch_client:
+        yield
 
 app = FastAPI(lifespan=lifespan)
 ```
@@ -1377,19 +1310,12 @@ app = FastAPI(lifespan=lifespan)
 **CLI (`main.py`):**
 
 ```python
-from mcp.fetch_client import fetch_client
+from mcps.fetch_client import fetch_client
 
 async def main():
-    await fetch_client.startup()
-    try:
+    async with fetch_client:
         result = await handler.handle_request(university_name, course)
-    finally:
-        await fetch_client.shutdown()
 ```
-
-`fetch_client.startup()` is idempotent — calling it more than once is safe.
-If `fetch_client.ready` is `False` when the first request arrives,
-`fetch_tool.py` raises `RuntimeError` immediately rather than hanging.
 
 ---
 
@@ -1565,8 +1491,12 @@ skill_loader | loaded skills/program/SKILL.md
 skill_loader | loaded skills/rankings/SKILL.md
 skill_loader | loaded skills/scoring/SKILL.md
 research_handler | agents constructed with skill instructions
-fetch_client    | Fetch MCP server started
 ```
+
+Note: there's no separate "Fetch MCP server started" log line — `fastmcp.Client`
+doesn't log on connect by default. The `mcp-server-fetch` subprocess starts
+lazily on the first `async with fetch_client:` (the entry-point wrapper from
+8.9, if used, or the first `fetch_page` call otherwise).
 
 Files load alphabetically (`sorted(skills_dir.iterdir())`). If any file
 is missing a warning appears instead — no crash:
@@ -1603,8 +1533,8 @@ university_research/
 │   ├── llm_factory.py              model initialisation from env vars
 │   └── skill_loader.py             SkillMeta + load_skill() + scan_skills_dir()
 │
-├── mcp/
-│   └── fetch_client.py             Fetch MCP singleton — startup() / shutdown() / call_tool()
+├── mcps/
+│   └── fetch_client.py             Fetch MCP — module-level fastmcp.Client (shared, reentrant)
 │
 ├── schemas/
 │   ├── messages/                   lean hub notifications
@@ -1618,17 +1548,17 @@ university_research/
 │   │   ├── report_ready.py         carries file_paths[]
 │   │   └── progress_update.py      carries status + message
 │   │
-│   ├── outputs/                    rich LLM outputs written to cblackboard
-│   │   ├── career_output.py
-│   │   ├── background_output.py
-│   │   ├── rankings_output.py
-│   │   ├── program_output.py
-│   │   ├── employability_output.py
-│   │   ├── accommodation_output.py
-│   │   ├── news_output.py
-│   │   ├── forum_output.py
-│   │   ├── scoring_output.py
-│   │   └── alternatives_output.py
+│   └── outputs/                    rich LLM outputs written to blackboard
+│       ├── career_output.py
+│       ├── background_output.py
+│       ├── rankings_output.py
+│       ├── program_output.py
+│       ├── employability_output.py
+│       ├── accommodation_output.py
+│       ├── news_output.py
+│       ├── forum_output.py
+│       ├── scoring_output.py
+│       └── alternatives_output.py
 │   ├── search_result.py            SearchResult, SearchResponse
 │   ├── fetch_result.py             FetchResult
 │   └── job_posting.py              JobPosting, JobPostingsResponse — shared schema for Adzuna + MCF
@@ -1648,9 +1578,9 @@ university_research/
 │   └── conversation_agent.py       reads blackboard, no tools
 │
 ├── tools/
-│   ├── search_tool.py              tavily_search — module-level AsyncTavilyClient singleton (async, concurrency-safe)
-│   ├── fetch_tool.py               fetch_page — calls fetch_client singleton, never raises
-│   ├── ddg_tool.py                 ddg_search — module-level DDGS singleton, calls via asyncio.to_thread — NOT registered on any agent
+│   ├── search_tool.py              tavily_search — module-level AsyncTavilyClient singleton, await search()
+│   ├── fetch_tool.py               fetch_page — calls shared fastmcp.Client fetch_client, never raises
+│   ├── ddg_tool.py                 ddg_search — module-level DDGS singleton, date-filtered (NewsAgent only)
 │   ├── adzuna_tool.py              adzuna_jobs — httpx REST, UK + AU, routes by deps.context.country
 │   └── mcf_tool.py                 mcf_jobs — httpx REST, Singapore only, no auth required
 │
@@ -1701,18 +1631,6 @@ arrives before startup, `fetch_tool.py` raises `RuntimeError` immediately.
 These clients read from `os.environ` when their modules are imported.
 If `.env` is not loaded before the modules are imported, they will raise
 `KeyError`. Always call `load_dotenv()` before any tool module is imported.
-
-**Synchronous tool clients block the event loop under `asyncio.gather()`**
-`asyncio.gather()` runs all section agents concurrently on one event loop.
-A tool function declared `async def` that calls a *synchronous* client
-underneath (e.g. plain `TavilyClient.search()`, or `DDGS().text()`) blocks
-that loop for the full duration of the call — it doesn't run "in the
-background", it stalls every other agent's `await`s too. `search_tool.py`
-uses `AsyncTavilyClient` for this reason. `ddg_tool.py` has no async client
-available, so it wraps the blocking call in `asyncio.to_thread(...)`. Fetch
-MCP's `ClientSession.call_tool()` is natively async and needs no such wrapper.
-When adding a new tool client, check whether its underlying library ships an
-async variant before assuming `async def` alone makes it concurrency-safe.
 
 **Skills load before agents are constructed**
 `scan_skills_dir()` must complete before any agent constructor is called.
@@ -1770,14 +1688,14 @@ verifiable. No stage is purely structural.
 |---|---|---|
 | 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
 | 1a | MessageHub (closure pattern), Blackboard, Deps (hub + board + context only — no tool clients), all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
-| 1b | `mcps/fetch_client.py` singleton (kept — concurrent `call_tool()` is safe, multiplexed by request ID over one shared stdio session). `tools/search_tool.py` uses `AsyncTavilyClient` + `await` (was sync `TavilyClient` — would block the loop under `asyncio.gather()`). `tools/fetch_tool.py` unchanged. `tools/ddg_tool.py` calls `DDGS().text()` via `asyncio.to_thread` for the same reason — still NOT registered on any agent (date filtering unreliable, see Section 13). `tools/adzuna_tool.py` (UK + AU job postings via Adzuna REST). `tools/mcf_tool.py` (SG job postings via MyCareersFuture public API). `schemas/job_posting.py` shared normalised schema. `ResearchHandler.startup()` warms Fetch MCP. | Real job postings confirmed for UK, AU, SG. All 5 tools pass live tests. 26 tests pass. |
+| 1b | `mcps/fetch_client.py` singleton. `tools/` — `search_tool.py`, `fetch_tool.py`, `ddg_tool.py` (unchanged from original). `tools/adzuna_tool.py` (UK + AU job postings via Adzuna REST). `tools/mcf_tool.py` (SG job postings via MyCareersFuture public API). `schemas/job_posting.py` shared normalised schema. `ResearchHandler.startup()` warms Fetch MCP. | Real job postings confirmed for UK, AU, SG. All 5 tools pass live tests. 26 tests pass. |
 | 1c | `CareerAgent` end-to-end — pydantic-ai Agent with `tavily_search` + `fetch_page` tools, budget-aware closure, `subscribe()` + `get_instruction()`, `handle()` resets `_calls_made` | `board.career` populated from real data via CLI |
 | 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same tool set as CareerAgent (Tavily + Fetch), same pattern | `board.background`, `board.rankings`, `board.program` populated via CLI |
-| 1e | EmployabilityAgent + AccommodationAgent + NewsAgent — all three use Tavily + Fetch only. NewsAgent sets confidence: "low" when news results are sparse | board.employability, board.accommodation, board.news populated from a single pipeline run |
+| 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` — all three use Tavily + Fetch only. NewsAgent sets confidence: "low" when news results are sparse | board.employability, board.accommodation, board.news populated from a single pipeline run |
 | 1f | `ForumAgent` — Tavily + Fetch, highest budget, strict scope rules across 5 confirmed forum sources | `board.forum` populated via CLI — TSR, StudentCrowd, WhatUni, Quora, Reddit snippets via Tavily confirmed |
 | 2a | `ScoringAgent` + quorum gate — no tools, reads blackboard only, asyncio.Lock | `board.score` populated after all 7 section agents complete — lock verified, partial results handled |
 | 2b | `AlternativesAgent` (Tavily + Fetch) + `ReportGenerator` (Jinja2, no LLM) | `score.json` and `report.md` generated from CLI for real university |
-| 2c | Chainlit UI Mode 1 + Mode 2 + `ConversationAgent` (no tools, reads blackboard) | Full pipeline from UI with live progress, follow-up questions answered |
+| 2c | `Chainlit` UI Mode 1 + Mode 2 + `ConversationAgent` (no tools, reads blackboard) | Full pipeline from UI with live progress, follow-up questions answered |
 | 3a | Report quality pass — template, confidence flags, comparison script | Side-by-side `score.json` comparison working |
 | 3b | Edge case hardening | All failure scenarios handled without crash |
 
