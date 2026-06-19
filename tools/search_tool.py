@@ -19,10 +19,12 @@ _client = TavilyClient(api_key=_os.environ["TAVILY_API_KEY"])
 
 
 async def tavily_search(ctx: RunContext[Deps], query: str, max_results: int = 5) -> str:
-    """Search the web via Tavily. days=730 always enforced.
+    """Search the web via Tavily. time_range='year' always enforced.
     Never register this directly on an agent — agents wrap it via
     _make_search_tool() to add budget enforcement."""
-    raw = _client.search(query=query, max_results=max_results, days=730)
+
+    raw = _client.search(query=query, max_results=max_results, time_range="year")
+
     logger.debug("search_tool | query=%r results=%d", query, len(raw.get("results", [])))
     return _json.dumps({
         "query": query,

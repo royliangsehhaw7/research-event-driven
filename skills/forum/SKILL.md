@@ -14,19 +14,35 @@ Every result that does not mention the specific course or department is discarde
 Generic university experience threads are not acceptable output.
 
 ## Sources — search in this order
-1. **Reddit API** — search r/UniUK, r/AskUK, r/ApplyingToCollege, university-specific subreddits
-   directly via PRAW. Returns full post bodies and comment threads — higher signal than site: queries.
-2. `site:thestudentroom.co.uk` via Tavily — course-specific threads
-3. `site:thegradcafe.com` via Tavily — applicant and student discussion
-4. `site:quora.com` via Tavily — student experience questions
+1. `site:thestudentroom.co.uk` via Tavily — primary source. Deep UK student forum,
+   course-specific threads, high signal. Use for course experience, teaching quality,
+   and student life feedback.
+2. `site:studentcrowd.com` via Tavily — verified student reviews per course with
+   structured ratings. Fetch the course-specific page via fetch_page for full reviews.
+3. `site:whatuni.com` via Tavily — student ratings and reviews per course.
+   Fetch the course page via fetch_page for full review text.
+4. `site:quora.com` via Tavily — student Q&A threads, useful for international
+   student perspectives and course comparisons.
+5. `site:reddit.com` via Tavily — finds Reddit post URLs. After getting a URL
+   from Tavily, fetch the full thread by appending `.json` to the post URL and
+   calling `fetch_page`. Example:
+   - Tavily returns: `https://www.reddit.com/r/edinburghuniversity/comments/abc123/title/`
+   - Fetch this: `https://www.reddit.com/r/edinburghuniversity/comments/abc123/title/.json`
+   The JSON response contains all comments — extract from `[1].data.children[].data.body`.
+   Discard threads with fewer than 3 substantive replies.
+   For non-UK universities, promote this to source 2 if TSR coverage is sparse.
+6. `site:collegeconfidential.com` via Tavily — use for US and international
+   universities only. Skip for UK-only queries where TSR and StudentCrowd suffice.
 
 ## Query construction
 Always: [university name] + [course name] + [signal type]
 
 Examples:
-- "site:reddit.com University of Manchester Computer Science student experience"
-- "site:thestudentroom.co.uk University of Manchester Computer Science review"
+- "site:thestudentroom.co.uk University of Manchester Computer Science student experience"
+- "site:studentcrowd.com University of Manchester Computer Science review"
+- "site:whatuni.com University of Manchester Computer Science student review"
 - "site:quora.com University of Manchester Computer Science worth it"
+- "site:reddit.com University of Manchester Computer Science undergraduate"
 
 ## Signal weighting
 1. Current student (enrolled now) — highest weight
