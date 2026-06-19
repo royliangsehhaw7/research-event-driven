@@ -709,7 +709,7 @@ from typing import Literal
 
 class ForumSource(BaseModel):
     url:         str
-    platform:    str    # "thestudentroom", "studentcrowd", "whatuni", "quora", "reddit"
+    platform:    str    # "thestudentroom", "studentcrowd", "whatuni", "quora"
     year:        int
     poster_type: str    # "current_student" | "recent_graduate" | "former_student" | "prospective"
 
@@ -863,6 +863,29 @@ section_name: career
 You are the first agent to run. Every other agent depends on the career
 context you establish. Research thoroughly before returning.
 
+## Tools
+You have four tools. Use each only for its designated purpose:
+
+- `tavily_search` — web search. Use for career paths, salary ranges, and
+  general labour market research. Every call costs 1 tool budget credit.
+  Budget: 8 total across all tavily_search calls this run.
+- `fetch_page` — fetches a specific URL. Use after tavily_search returns
+  a promising URL you need to read in full (e.g. a salary survey page,
+  a graduate destinations report). Does NOT count against tool_budget.
+  Do NOT use for Reddit URLs — Reddit blocks this tool.
+- `adzuna_jobs` — live job postings API for UK and Australia. Call this
+  instead of tavily_search when you need job posting data for UK or AU.
+  Does NOT count against tool_budget.
+- `mcf_jobs` — live job postings API for Singapore only. Call this instead
+  of tavily_search when you need job posting data for SG.
+  Does NOT count against tool_budget.
+
+**Tool selection for job postings — mandatory routing:**
+- country is "UK" or "Australia" → call `adzuna_jobs`
+- country is "Singapore" → call `mcf_jobs`
+- Never use `tavily_search` for job postings — job boards block Tavily
+  and results will be empty or stale.
+
 ## What to research
 - Realistic career paths a graduate of this course typically enters
 - Salary ranges for those careers in the university's country (not global)
@@ -902,6 +925,20 @@ description: Researches the university's institutional profile — history, size
 tool_budget: 5
 section_name: background
 ---
+
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use for all background research queries.
+  Every call costs 1 tool budget credit. Budget: 5 total.
+- `fetch_page` — fetches a specific URL in full. Use when tavily_search
+  returns a URL you need to read completely (e.g. an accreditation body
+  page, the university's about page, a department profile).
+  Does NOT count against tool_budget.
+
+**Decision rule:** search first with `tavily_search`, then fetch the
+most relevant URL with `fetch_page` if the snippet is insufficient.
+Never call `fetch_page` on a URL you haven't found via search first.
 
 ## What to research
 - University founding date, size (student population), public or private status
@@ -946,6 +983,21 @@ tool_budget: 6
 section_name: rankings
 ---
 
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use to find ranking table pages and
+  subject-specific positions. Every call costs 1 tool budget credit.
+  Budget: 6 total.
+- `fetch_page` — fetches a specific URL in full. Use when a ranking table
+  page found by tavily_search needs to be read in full to extract the
+  exact position (snippets often truncate tables).
+  Does NOT count against tool_budget.
+
+**Decision rule:** use `tavily_search` to locate the ranking source,
+then `fetch_page` on the ranking page URL if the snippet does not include
+the specific position for this university.
+
 ## Priority order
 1. Subject-specific ranking for this course (QS by Subject, THE by Subject,
    Guardian Subject Rankings, Complete University Guide)
@@ -985,6 +1037,22 @@ description: Researches the specific undergraduate programs, modules, and delive
 tool_budget: 5
 section_name: program
 ---
+
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use to locate the university's course
+  catalog page and any program structure documents.
+  Every call costs 1 tool budget credit. Budget: 5 total.
+- `fetch_page` — fetches a specific URL in full. The university's official
+  course catalog page is the primary source for module names and structure —
+  always fetch it once you have the URL. Snippets from search results
+  never contain the full module list.
+  Does NOT count against tool_budget.
+
+**Recommended sequence:** 1 tavily_search to find the catalog URL,
+then 1 fetch_page to read the full page. Use remaining tavily_search
+budget for specialisation pathways or sandwich year details if needed.
 
 ## What to research
 - Available undergraduate programs matching the course name
@@ -1028,6 +1096,21 @@ tool_budget: 8
 section_name: employability
 ---
 
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use for all employment statistics, alumni
+  destination searches, and industry partnership queries.
+  Every call costs 1 tool budget credit. Budget: 8 total.
+- `fetch_page` — fetches a specific URL in full. Use when a graduate
+  outcomes report, HESA data page, or employer partnership page found
+  by tavily_search needs to be read fully.
+  Does NOT count against tool_budget.
+
+**Decision rule:** search first, then fetch the single most data-rich
+URL per topic. Do not fetch speculatively — only fetch URLs that
+tavily_search snippets confirm contain the specific data you need.
+
 ## Dependency
 Read board.career before beginning any searches. The career paths and
 in-demand skills already found there define what counts as a relevant
@@ -1069,6 +1152,22 @@ tool_budget: 6
 section_name: accommodation
 ---
 
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use for accommodation cost queries, safety
+  statistics, and transport route lookups.
+  Every call costs 1 tool budget credit. Budget: 6 total.
+- `fetch_page` — fetches a specific URL in full. Use when the university's
+  official accommodation page or a local transport authority page needs
+  to be read in full for current pricing or route details.
+  Does NOT count against tool_budget.
+
+**Recommended allocation:** 1 search + 1 fetch for on-campus costs,
+1 search for off-campus rents, 1 search for area safety, 1 search for
+transport. Fetch the university accommodation page if pricing is not
+in the search snippet.
+
 ## What to research
 - On-campus accommodation: cost range per week, what is included
 - Off-campus private accommodation: typical rent range per month in the
@@ -1107,9 +1206,21 @@ tool_budget: 6
 section_name: news
 ---
 
-## Search tool order
-1. Tavily — primary and only search tool. Use `days=730` filter on every query.
-   If results are sparse, set `confidence: "low"` and explain in `notes`.
+## Tools
+You have two tools:
+
+- `tavily_search` — web search with `time_range="year"` enforced on every
+  call. This is the primary and only search tool for this agent.
+  Every call costs 1 tool budget credit. Budget: 6 total.
+  If results are sparse after 3–4 queries, set `confidence: "low"` and
+  explain in `notes` — do not keep searching beyond budget.
+- `fetch_page` — fetches a specific URL in full. Use only when a news
+  article found by tavily_search requires the full text to extract a
+  publication date or confirm it is department-specific.
+  Does NOT count against tool_budget.
+
+**Do NOT use** `fetch_page` speculatively. Fetch only when the snippet
+is insufficient to determine date or relevance.
 
 ## What to research
 - Institutional news: significant events from the past 2 years — strikes,
@@ -1148,41 +1259,62 @@ section_name: forum
 
 ## This agent has the highest tool budget and the strictest scope rules.
 
+## Tools
+You have two tools. Each has a specific role — do not substitute one for another:
+
+- `tavily_search` — web search. Use for all forum source discovery: finding
+  TSR threads, StudentCrowd pages, WhatUni pages, and Quora threads.
+  Use `include_domains` to restrict searches to specific forum sites.
+  Every call costs 1 tool budget credit. Budget: 10 total.
+- `fetch_page` — fetches a specific URL in full. Use for StudentCrowd and
+  WhatUni course pages once tavily_search returns the URL. Gives you the
+  full review text that snippets truncate.
+  Does NOT count against tool_budget.
+
+**Tool routing by source:**
+| Source | Find URL with | Read content with |
+|---|---|---|
+| The Student Room | `tavily_search` with `include_domains=["thestudentroom.co.uk"]` | snippet is usually sufficient; skip fetch |
+| StudentCrowd | `tavily_search` with `include_domains=["studentcrowd.com"]` | `fetch_page` for full review text |
+| WhatUni | `tavily_search` with `include_domains=["whatuni.com"]` | `fetch_page` for full review text |
+| Quora | `tavily_search` with `include_domains=["quora.com"]` | snippet is usually sufficient; skip fetch |
+
 ## Scope rules — enforced on every query and every result
 Every query must include both the university name AND the course name.
 Every result that does not mention the specific course or department is discarded.
 Generic university experience threads are not acceptable output.
 
 ## Sources — search in this order
-1. `site:thestudentroom.co.uk` via Tavily — primary source. Deep UK student forum,
-   course-specific threads, high signal. Use for course experience, teaching quality,
-   and student life feedback.
-2. `site:studentcrowd.com` via Tavily — verified student reviews per course with
-   structured ratings. Fetch the course-specific page via fetch_page for full reviews.
-3. `site:whatuni.com` via Tavily — student ratings and reviews per course.
-   Fetch the course page via fetch_page for full review text.
-4. `site:quora.com` via Tavily — student Q&A threads, useful for international
-   student perspectives and course comparisons.
-5. `site:reddit.com` via Tavily — finds Reddit post URLs. After getting a URL
-   from Tavily, fetch the full thread by appending `.json` to the post URL and
-   calling `fetch_page`. Example:
-   - Tavily returns: `https://www.reddit.com/r/edinburghuniversity/comments/abc123/title/`
-   - Fetch this: `https://www.reddit.com/r/edinburghuniversity/comments/abc123/title/.json`
-   The JSON response contains all comments — extract from `[1].data.children[].data.body`.
-   Discard threads with fewer than 3 substantive replies.
-   For non-UK universities, promote this to source 2 if TSR coverage is sparse.
-6. `site:collegeconfidential.com` via Tavily — use for US and international
-   universities only. Skip for UK-only queries where TSR and StudentCrowd suffice.
+1. `thestudentroom.co.uk` via tavily_search with `include_domains=["thestudentroom.co.uk"]` —
+   primary source for UK universities. Deep student forum, course-specific threads, high signal.
+   Use for course experience, teaching quality, and student life feedback.
+   For non-UK universities, still try this first — TSR covers international study threads too.
+2. `studentcrowd.com` via tavily_search with `include_domains=["studentcrowd.com"]` —
+   verified student reviews per course with structured ratings. Fetch the
+   course-specific page via fetch_page for full reviews.
+3. `whatuni.com` via tavily_search with `include_domains=["whatuni.com"]` —
+   student ratings and reviews per course. Fetch the course page via
+   fetch_page for full review text.
+4. `quora.com` via tavily_search with `include_domains=["quora.com"]` —
+   student Q&A threads, useful for international student perspectives and
+   course comparisons.
+5. Unrestricted tavily_search (no include_domains) — use as final sweep for
+   non-UK universities where the above sources return sparse results. Allows
+   Tavily to surface any other authentic forum or review content available.
 
 ## Query construction
 Always: [university name] + [course name] + [signal type]
 
-Examples:
-- "site:thestudentroom.co.uk University of Manchester Computer Science student experience"
-- "site:studentcrowd.com University of Manchester Computer Science review"
-- "site:whatuni.com University of Manchester Computer Science student review"
-- "site:quora.com University of Manchester Computer Science worth it"
-- "site:reddit.com University of Manchester Computer Science undergraduate"
+Examples (UK university):
+- tavily_search("University of Manchester Computer Science student experience", include_domains=["thestudentroom.co.uk"])
+- tavily_search("University of Manchester Computer Science review", include_domains=["studentcrowd.com"])
+- tavily_search("University of Manchester Computer Science student review", include_domains=["whatuni.com"])
+- tavily_search("University of Manchester Computer Science worth it", include_domains=["quora.com"])
+
+Examples (non-UK university):
+- tavily_search("NUS Computer Science student experience", include_domains=["thestudentroom.co.uk"])
+- tavily_search("NUS Computer Science review", include_domains=["studentcrowd.com"])
+- tavily_search("NUS Computer Science student experience forum")  ← unrestricted sweep
 
 ## Signal weighting
 1. Current student (enrolled now) — highest weight
@@ -1371,15 +1503,15 @@ stalling the others.
 
 | Agent | `tool_budget` | Why |
 |---|---|---|
-| `forum` | 10 | Highest — 5 forum sources × Tavily `site:` queries + fetch_page calls for StudentCrowd and WhatUni course pages |
-| `career` | 8 | Job postings snapshot + salary data requires multiple queries |
-| `employability` | 8 | Named companies require several targeted queries |
-| `alternatives` | 8 | 2–3 universities × multiple queries each |
+| `forum` | 10 | Highest — 4 include_domains tavily_search queries + 1 unrestricted sweep + fetch_page for StudentCrowd/WhatUni pages |
+| `career` | 8 | Salary + career path research via tavily_search; job postings via adzuna_jobs or mcf_jobs (not counted against budget) |
+| `employability` | 8 | Named company evidence requires multiple targeted tavily_search queries |
+| `alternatives` | 8 | 2–3 universities × multiple tavily_search queries each |
 | `rankings` | 6 | Multiple ranking bodies — QS, THE, Guardian, Complete University Guide |
-| `accommodation` | 6 | On-campus + off-campus + safety + transport — four distinct searches |
-| `news` | 6 | Tavily only — news queries plus department-specific searches |
-| `background` | 5 | Institutional facts — fewer queries needed |
-| `program` | 5 | Course catalog fetch + 1–2 search queries |
+| `accommodation` | 6 | On-campus + off-campus + safety + transport — four distinct tavily_search calls |
+| `news` | 6 | tavily_search only — institutional + department-specific news queries |
+| `background` | 5 | Institutional facts — fewer tavily_search queries needed |
+| `program` | 5 | 1–2 tavily_search calls to locate catalog URL, then fetch_page for full content |
 | `scoring` | 0 | No tools — synthesises from blackboard only, never searches |
 | `conversation` | 0 | No tools — answers follow-up questions from blackboard only |
 
@@ -1401,7 +1533,7 @@ class CareerAgent(BaseAgent):
         self._tool_budget = tool_budget
         self._calls_made  = 0        # reset per request in handle()
 
-    def _make_search_tool(self):
+    def _make_search_tool(self):1
         """Wrap tavily_search with a budget-aware closure over this agent instance."""
         agent_self = self
         async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
