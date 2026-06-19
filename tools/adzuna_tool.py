@@ -15,7 +15,7 @@ load_dotenv()
 
 _APP_ID  = os.environ["ADZUNA_APP_ID"]
 _APP_KEY = os.environ["ADZUNA_APP_KEY"]
-_BASE    = os.environ["ADZUNA_URL"]
+_BASE    = "https://api.adzuna.com/v1/api/jobs"
 
 # Single source of truth for country routing.
 # Key:   the exact string value of deps.context.country for supported countries.
@@ -24,7 +24,6 @@ _BASE    = os.environ["ADZUNA_URL"]
 _COUNTRY_MAP: dict[str, tuple[str, str]] = {
     "UK":        ("gb", "GBP"),
     "Australia": ("au", "AUD"),
-    "Singapore": ("sg", "SGD")
 }
 
 
@@ -56,7 +55,7 @@ async def adzuna_jobs(
             total_found=0,
             error=(
                 f"adzuna_jobs does not support country={country!r}. "
-                f"Supported: {list(_COUNTRY_MAP)}. Use mcf_jobs for other countries."
+                f"Supported: {list(_COUNTRY_MAP)}. Use mcf_jobs for Singapore."
             ),
         )
 

@@ -157,12 +157,12 @@ structured, dated postings. They replace Tavily for the job posting snapshot
 in CareerAgent only — Tavily remains the primary tool for all other research.
 
 **Why these tools:**
-Tavily handles all general search including `site:thestudentroom.co.uk`,
-`site:studentcrowd.com`, `site:whatuni.com`, `site:quora.com`, and
-`site:reddit.com` queries. ForumAgent uses `site:` queries across multiple
+Tavily handles all general search including `include_domains`-scoped queries
+against `thestudentroom.co.uk`, `studentcrowd.com`, `whatuni.com`, and
+`quora.com`. ForumAgent uses `include_domains` to restrict searches to specific
 confirmed-accessible public student forums — no separate Reddit API client is
-required. DuckDuckGo replaces SerpAPI as a zero-cost news fallback with no
-monthly quota.
+required or available (Reddit API access closed May 2026). DuckDuckGo replaces
+SerpAPI as a zero-cost news fallback with no monthly quota.
 
 ### LLM Provider
 
@@ -761,7 +761,7 @@ from typing import Literal
 
 class ForumSource(BaseModel):
     url: str
-    platform: str   # "reddit", "thestudentroom", etc.
+    platform: str   # "thestudentroom", "studentcrowd", "whatuni", "quora"
     year: int
     poster_type: str   # "current_student", "graduate", "prospective"
 

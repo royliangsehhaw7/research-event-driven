@@ -709,7 +709,7 @@ from typing import Literal
 
 class ForumSource(BaseModel):
     url:         str
-    platform:    str    # "thestudentroom", "studentcrowd", "whatuni", "quora", "reddit"
+    platform:    str    # "thestudentroom", "studentcrowd", "whatuni", "quora"
     year:        int
     poster_type: str    # "current_student" | "recent_graduate" | "former_student" | "prospective"
 
@@ -1260,32 +1260,24 @@ section_name: forum
 ## This agent has the highest tool budget and the strictest scope rules.
 
 ## Tools
-You have three tools. Each has a specific role — do not substitute one for another:
+You have two tools. Each has a specific role — do not substitute one for another:
 
 - `tavily_search` — web search. Use for all forum source discovery: finding
-  TSR threads, StudentCrowd pages, WhatUni pages, Quora threads, and Reddit
-  post URLs. Every call costs 1 tool budget credit. Budget: 10 total.
+  TSR threads, StudentCrowd pages, WhatUni pages, and Quora threads.
+  Use `include_domains` to restrict searches to specific forum sites.
+  Every call costs 1 tool budget credit. Budget: 10 total.
 - `fetch_page` — fetches a specific URL in full. Use for StudentCrowd and
   WhatUni course pages once tavily_search returns the URL. Gives you the
   full review text that snippets truncate.
-  Does NOT count against tool_budget.
-  **NEVER use fetch_page for Reddit URLs** — Reddit blocks this tool with
-  a robots.txt error. Use reddit_fetch_thread instead.
-- `reddit_fetch_thread` — fetches the full comment thread for a Reddit post
-  via Reddit's public JSON API. Use this after tavily_search returns a
-  Reddit post URL. Returns the post title, body, and all top-level comments
-  with score ≥ 1, already parsed — no manual JSON extraction needed.
   Does NOT count against tool_budget.
 
 **Tool routing by source:**
 | Source | Find URL with | Read content with |
 |---|---|---|
-| The Student Room | `tavily_search` | snippet is usually sufficient; skip fetch |
-| StudentCrowd | `tavily_search` | `fetch_page` for full review text |
-| WhatUni | `tavily_search` | `fetch_page` for full review text |
-| Quora | `tavily_search` | snippet is usually sufficient; skip fetch |
-| Reddit | `tavily_search` | `reddit_fetch_thread` — never fetch_page |
-| College Confidential | `tavily_search` | snippet is usually sufficient |
+| The Student Room | `tavily_search` with `include_domains=["thestudentroom.co.uk"]` | snippet is usually sufficient; skip fetch |
+| StudentCrowd | `tavily_search` with `include_domains=["studentcrowd.com"]` | `fetch_page` for full review text |
+| WhatUni | `tavily_search` with `include_domains=["whatuni.com"]` | `fetch_page` for full review text |
+| Quora | `tavily_search` with `include_domains=["quora.com"]` | snippet is usually sufficient; skip fetch |
 
 ## Scope rules — enforced on every query and every result
 Every query must include both the university name AND the course name.
@@ -1293,34 +1285,36 @@ Every result that does not mention the specific course or department is discarde
 Generic university experience threads are not acceptable output.
 
 ## Sources — search in this order
-1. `site:thestudentroom.co.uk` via tavily_search — primary source. Deep UK
-   student forum, course-specific threads, high signal. Use for course
-   experience, teaching quality, and student life feedback.
-2. `site:studentcrowd.com` via tavily_search — verified student reviews per
-   course with structured ratings. Fetch the course-specific page via
-   fetch_page for full reviews.
-3. `site:whatuni.com` via tavily_search — student ratings and reviews per
-   course. Fetch the course page via fetch_page for full review text.
-4. `site:quora.com` via tavily_search — student Q&A threads, useful for
-   international student perspectives and course comparisons.
-5. `site:reddit.com` via tavily_search — finds Reddit post URLs. After
-   getting a URL from tavily_search, call reddit_fetch_thread with that URL
-   to get the full thread. Do NOT call fetch_page on Reddit URLs.
-   Discard threads with fewer than 3 substantive comments (score ≥ 1).
-   For non-UK universities, promote this to source 2 if TSR coverage is sparse.
-6. `site:collegeconfidential.com` via tavily_search — use for US and
-   international universities only. Skip for UK-only queries where TSR
-   and StudentCrowd suffice.
+1. `thestudentroom.co.uk` via tavily_search with `include_domains=["thestudentroom.co.uk"]` —
+   primary source for UK universities. Deep student forum, course-specific threads, high signal.
+   Use for course experience, teaching quality, and student life feedback.
+   For non-UK universities, still try this first — TSR covers international study threads too.
+2. `studentcrowd.com` via tavily_search with `include_domains=["studentcrowd.com"]` —
+   verified student reviews per course with structured ratings. Fetch the
+   course-specific page via fetch_page for full reviews.
+3. `whatuni.com` via tavily_search with `include_domains=["whatuni.com"]` —
+   student ratings and reviews per course. Fetch the course page via
+   fetch_page for full review text.
+4. `quora.com` via tavily_search with `include_domains=["quora.com"]` —
+   student Q&A threads, useful for international student perspectives and
+   course comparisons.
+5. Unrestricted tavily_search (no include_domains) — use as final sweep for
+   non-UK universities where the above sources return sparse results. Allows
+   Tavily to surface any other authentic forum or review content available.
 
 ## Query construction
 Always: [university name] + [course name] + [signal type]
 
-Examples:
-- "site:thestudentroom.co.uk University of Manchester Computer Science student experience"
-- "site:studentcrowd.com University of Manchester Computer Science review"
-- "site:whatuni.com University of Manchester Computer Science student review"
-- "site:quora.com University of Manchester Computer Science worth it"
-- "site:reddit.com University of Manchester Computer Science undergraduate"
+Examples (UK university):
+- tavily_search("University of Manchester Computer Science student experience", include_domains=["thestudentroom.co.uk"])
+- tavily_search("University of Manchester Computer Science review", include_domains=["studentcrowd.com"])
+- tavily_search("University of Manchester Computer Science student review", include_domains=["whatuni.com"])
+- tavily_search("University of Manchester Computer Science worth it", include_domains=["quora.com"])
+
+Examples (non-UK university):
+- tavily_search("NUS Computer Science student experience", include_domains=["thestudentroom.co.uk"])
+- tavily_search("NUS Computer Science review", include_domains=["studentcrowd.com"])
+- tavily_search("NUS Computer Science student experience forum")  ← unrestricted sweep
 
 ## Signal weighting
 1. Current student (enrolled now) — highest weight
@@ -1509,7 +1503,7 @@ stalling the others.
 
 | Agent | `tool_budget` | Why |
 |---|---|---|
-| `forum` | 10 | Highest — 5 forum sources × tavily_search `site:` queries, plus fetch_page for StudentCrowd/WhatUni pages, plus reddit_fetch_thread for Reddit threads (fetch_page cannot be used for Reddit) |
+| `forum` | 10 | Highest — 4 include_domains tavily_search queries + 1 unrestricted sweep + fetch_page for StudentCrowd/WhatUni pages |
 | `career` | 8 | Salary + career path research via tavily_search; job postings via adzuna_jobs or mcf_jobs (not counted against budget) |
 | `employability` | 8 | Named company evidence requires multiple targeted tavily_search queries |
 | `alternatives` | 8 | 2–3 universities × multiple tavily_search queries each |

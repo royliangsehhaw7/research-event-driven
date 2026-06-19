@@ -938,195 +938,24 @@ async def mcf_jobs(
 
 ---
 
-## 1b.7 `tools/reddit_tool.py` — NEW
+## 1b.7 `tools/reddit_tool.py` — REMOVED
 
-> **Why a dedicated Reddit tool and not `fetch_page`:** the Fetch MCP server
-> sends `User-Agent: ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)`
-> as its User-Agent. Reddit's `robots.txt` sets `User-agent: * / Disallow: /`,
-> which blocks this UA unconditionally. Every `fetch_page` call to a Reddit URL
-> returns `status: "error"` with a robots.txt violation message — the content
-> field is always empty. This is not a transient failure; it is Reddit's
-> deliberate policy against automated MCP crawlers.
+> **Why this file no longer exists:** Reddit's public JSON API (the `.json` endpoint
+> approach the original spec relied on) returned 403 Forbidden as of May 30, 2026.
+> Reddit's Responsible Builder Policy (November 2025) closed self-service API
+> registration — new applications require explicit pre-approval that takes weeks
+> and is rarely granted. OAuth token registration is also no longer open.
 >
-> Reddit's **public JSON API** (`/r/subreddit/comments/post_id/.json`) is a
-> different access path. It requires no authentication for public subreddits and
-> is not subject to the robots.txt crawler block — it is an API endpoint, not a
-> crawlable page. It does require a descriptive, non-generic User-Agent string
-> per Reddit's API terms. `httpx` with `User-Agent: UniversityResearchBot/1.0`
-> works correctly. No OAuth, no API key, no rate-limit token needed for
-> read-only access at the volumes this project uses (a few dozen calls per run).
+> There is no viable unauthenticated path to Reddit content. Do not create this file.
 >
-> The workflow is: `tavily_search` finds Reddit post URLs → `reddit_fetch_thread`
-> converts each URL to its `.json` API form and fetches the full thread via
-> `httpx`. `fetch_page` is never used for Reddit URLs.
-
-```python
-# tools/reddit_tool.py
-from __future__ import annotations
-
-import json
-import re
-
-import httpx
-from pydantic_ai import RunContext
-
-from core.deps import Deps
-from core.logger import logger
-
-# Reddit's public JSON API requires a non-generic User-Agent.
-# Format per Reddit API terms: "<AppName>/version (by /u/<username> or contact)"
-# This UA identifies the bot clearly and is accepted for read-only public access.
-_UA = "UniversityResearchBot/1.0 (university research pipeline; read-only public data)"
-
-# Matches a standard Reddit post URL and extracts subreddit + post_id.
-# Handles both www.reddit.com and old.reddit.com.
-_POST_URL_RE = re.compile(
-    r"https?://(?:www\.|old\.)?reddit\.com"
-    r"/r/(?P<sub>[^/]+)/comments/(?P<post_id>[^/?#]+)"
-)
-
-
-def _to_json_url(post_url: str) -> str | None:
-    """Convert a Reddit post URL to its public JSON API URL.
-
-    Returns None if the URL does not match the expected Reddit post pattern.
-
-    Examples:
-        https://www.reddit.com/r/edinburghuniversity/comments/abc123/title/
-        → https://www.reddit.com/r/edinburghuniversity/comments/abc123/.json
-
-        https://old.reddit.com/r/edinburghuniversity/comments/abc123/
-        → https://www.reddit.com/r/edinburghuniversity/comments/abc123/.json
-    """
-    m = _POST_URL_RE.match(post_url)
-    if not m:
-        return None
-    sub     = m.group("sub")
-    post_id = m.group("post_id")
-    return f"https://www.reddit.com/r/{sub}/comments/{post_id}/.json"
-
-
-async def reddit_fetch_thread(
-    ctx: RunContext[Deps],
-    post_url: str,
-    max_comments: int = 20,
-) -> str:
-    """Fetch the full comment thread for a Reddit post.
-
-    Use this tool for Reddit URLs found by tavily_search. Do NOT use
-    fetch_page for Reddit URLs — Reddit blocks the MCP server User-Agent.
-
-    Calls Reddit's public JSON API via httpx with a descriptive User-Agent.
-    No authentication required. Works for any public subreddit.
-
-    Args:
-        post_url:     full Reddit post URL (www or old.reddit.com)
-        max_comments: maximum top-level comments to return (default 20)
-
-    Returns:
-        JSON string containing post title, selftext, and top-level comments.
-        Comments with score < 1 are excluded. Never raises — returns error
-        field on failure.
-    """
-    json_url = _to_json_url(post_url)
-    if not json_url:
-        logger.warning("reddit_tool | unrecognised URL pattern: %r", post_url)
-        return json.dumps({
-            "error": f"URL does not match Reddit post pattern: {post_url!r}",
-            "post_url": post_url,
-            "comments": [],
-        })
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=15.0,
-            headers={"User-Agent": _UA},
-            follow_redirects=True,
-        ) as client:
-            resp = await client.get(json_url)
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as exc:
-        logger.error("reddit_tool | request failed for %r: %s", json_url, exc)
-        return json.dumps({
-            "error": str(exc),
-            "post_url": post_url,
-            "comments": [],
-        })
-
-    # Reddit JSON structure: [post_listing, comment_listing]
-    # data[0].data.children[0].data  → post metadata
-    # data[1].data.children          → top-level comment nodes
-    try:
-        post_data = data[0]["data"]["children"][0]["data"]
-        title    = post_data.get("title", "")
-        selftext = post_data.get("selftext", "")
-
-        comment_nodes = data[1]["data"]["children"]
-        comments = []
-        for node in comment_nodes:
-            if node.get("kind") != "t1":
-                continue   # skip "more" nodes and non-comment kinds
-            cd = node["data"]
-            score = cd.get("score", 0)
-            if score < 1:
-                continue   # exclude downvoted / collapsed comments
-            comments.append({
-                "author": cd.get("author", "[deleted]"),
-                "score":  score,
-                "body":   cd.get("body", ""),
-                "created_utc": cd.get("created_utc"),
-            })
-            if len(comments) >= max_comments:
-                break
-
-    except (KeyError, IndexError, TypeError) as exc:
-        logger.error("reddit_tool | parse error for %r: %s", json_url, exc)
-        return json.dumps({
-            "error": f"Failed to parse Reddit JSON response: {exc}",
-            "post_url": post_url,
-            "comments": [],
-        })
-
-    logger.info(
-        "reddit_tool | %r — title=%r comments=%d",
-        json_url, title[:60], len(comments),
-    )
-
-    return json.dumps({
-        "post_url":  post_url,
-        "json_url":  json_url,
-        "title":     title,
-        "selftext":  selftext,
-        "comments":  comments,
-        "error":     None,
-    })
-```
-
-**Key design decisions:**
-
-`_to_json_url()` is a pure function separate from the tool — it is unit-testable
-without any HTTP calls and handles both `www.` and `old.` Reddit prefixes.
-
-Comments with `score < 1` are excluded before returning. Downvoted or collapsed
-comments add noise without signal. `ForumAgent` reads comments directly from the
-returned list — it does not need to filter in the prompt.
-
-`max_comments=20` is a safe default. Reddit threads on university subreddits
-rarely have more than 30–40 substantive top-level replies; 20 captures the
-useful content without inflating context. The LLM can call the tool again with
-a lower limit if the thread is unusually dense.
-
-The tool never raises. All failure modes — bad URL pattern, HTTP error, JSON
-parse failure — return a JSON object with an `error` field and an empty
-`comments` list. `ForumAgent` checks `error` before reading `comments`.
+> **What replaces it:** `ForumAgent` uses `tavily_search` with `include_domains`
+> to restrict searches to specific student forum sites. This was confirmed working
+> in live tests — see Section 1b.9 for the forum search tests. The SKILL.md for
+> ForumAgent is updated to reflect this approach.
 
 ---
 
 ## 1b.8 Master Reference Changes
-
-The following sections of the master reference need updating to reflect the
-new tools. These are drop-in replacements — only the listed sections change.
 
 ### Section 3 — Third-Party Tools (replace tools table)
 
@@ -1137,7 +966,6 @@ new tools. These are drop-in replacements — only the listed sections change.
 | **Fetch MCP** | MCP server | Direct URL fetch — catalog pages, salary surveys | None |
 | **Adzuna** | REST API | Live job postings — UK and Australia | `ADZUNA_APP_ID` + `ADZUNA_APP_KEY` |
 | **MyCareersFuture** | REST API | Live job postings — Singapore only | None — public API |
-| **Reddit** | REST API (public JSON) | Forum thread content — ForumAgent only | None — public API, custom UA required |
 | **DuckDuckGo** | Python client | NewsAgent fallback — no key, no quota — **not yet registered on any agent** | None |
 ```
 
@@ -1147,13 +975,10 @@ new tools. These are drop-in replacements — only the listed sections change.
 > built on `httpx.AsyncClient` and a single module-level instance is safe to
 > share across concurrent agents.
 
-> **Reddit note:** `fetch_page` (the Fetch MCP server) **cannot** be used for
-> Reddit. Reddit's `robots.txt` sets `User-agent: * / Disallow: /`, and the Fetch
-> MCP server sends `User-Agent: ModelContextProtocol/1.0 (Autonomous; ...)` which
-> triggers the block. Reddit's public JSON API (`/r/subreddit/comments/id/.json`)
-> works correctly when called via `httpx` with a descriptive `User-Agent` string.
-> A dedicated `tools/reddit_tool.py` handles this — `fetch_page` is never used
-> for Reddit URLs.
+> **Forum search note:** ForumAgent uses Tavily with `include_domains` to restrict
+> searches to specific student forum sites (e.g. `include_domains=["thestudentroom.co.uk"]`).
+> Reddit is no longer accessible — as of May 2026 all unauthenticated `.json` endpoints
+> return 403 and API registration requires pre-approval that is rarely granted.
 
 ### Section 8.6 — Tool-to-agent mapping (replace entire table and note)
 
@@ -1164,25 +989,18 @@ new tools. These are drop-in replacements — only the listed sections change.
 | `fetch_page` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | |
 | `adzuna_jobs` | ✓ | | | | | | | | | | |
 | `mcf_jobs` | ✓ | | | | | | | | | | |
-| `reddit_fetch_thread` | | | | | | | | ✓ | | | |
 | `ddg_search` | | | | | | | | | | | |
 
 `adzuna_jobs` and `mcf_jobs` are both registered on `CareerAgent`. The LLM
 selects which to call based on `deps.context.country` and the tool docstrings.
-`reddit_fetch_thread` is registered on `ForumAgent` only — it fetches the full
-comment thread for a Reddit post URL found by `tavily_search`. `fetch_page` must
-NOT be used for Reddit URLs — Reddit's robots.txt blocks the MCP server UA.
+`ForumAgent` uses `tavily_search` with `include_domains` to restrict searches
+to specific student forum sites — no separate Reddit tool is required or available.
 `scoring` and `conversation` have no tools — they work entirely from the
 blackboard. `tool_budget: 0` in their SKILL.md makes this explicit.
 ```
 
 >[!WARNING] DuckDuckGo Search NOT wired
 >Due to the inability to specify a date range for selection and filtering
-
->[!WARNING] fetch_page cannot fetch Reddit
->Reddit's `robots.txt` blocks the Fetch MCP server's User-Agent (`ModelContextProtocol/1.0 (Autonomous; ...)`).
->Use `reddit_fetch_thread` from `tools/reddit_tool.py` for Reddit content — it calls
->the Reddit public JSON API via `httpx` with a descriptive User-Agent and is not affected by the robots.txt block.
 
 
 ### Section 8.8 — How tools attach to agents (replace CareerAgent constructor only)
@@ -1227,14 +1045,13 @@ count against `tool_budget` and are registered directly, the same way `fetch_pag
 │   ├── fetch_tool.py       fetch_page — calls shared fastmcp.Client fetch_client, never raises
 │   ├── ddg_tool.py         ddg_search — module-level DDGS singleton, date-filtered, calls via asyncio.to_thread — NOT registered on any agent
 │   ├── adzuna_tool.py      adzuna_jobs — httpx REST, UK + AU, _COUNTRY_MAP routes code + currency
-│   ├── mcf_tool.py         mcf_jobs — httpx REST, SG only, no auth, skills from API tags
-│   └── reddit_tool.py      reddit_fetch_thread — httpx REST, Reddit public JSON API, custom UA, ForumAgent only
+│   └── mcf_tool.py         mcf_jobs — httpx REST, SG only, no auth, skills from API tags
 ```
 
 ### Section 14 — Development Stage Summary (replace 1b row)
 
 ```
-| 1b | Fetch MCP client is a shared `fastmcp.Client` (reentrant, ref-counted — concurrent `call_tool()` is safe by design, requests multiplexed by id over one shared session). search_tool now uses AsyncTavilyClient + await (was sync TavilyClient — would block the loop under asyncio.gather). tavily_search registered directly on agents — no _make_search_tool() wrapper. fetch_tool calls fetch_client via `async with`. ddg_tool calls DDGS via asyncio.to_thread (still NOT registered on any agent — date filtering remains unreliable). adzuna_tool (UK+AU job postings via Adzuna REST, _COUNTRY_MAP for code + currency). mcf_tool (SG job postings via MyCareersFuture public API, skills from API tags). reddit_tool (Reddit public JSON API via httpx, custom UA — fetch_page cannot be used for Reddit, robots.txt blocks MCP UA). schemas/job_posting.py shared schema. CareerAgent registers [tavily_search, fetch_page, adzuna_jobs, mcf_jobs] directly. main.py opens fetch_client once around the pipeline run. | Real job postings confirmed for UK, AU, SG. Reddit thread fetch confirmed. All 6 tools pass live tests. 34 tests pass. |
+| 1b | Fetch MCP client is a shared `fastmcp.Client` (reentrant, ref-counted — concurrent `call_tool()` is safe by design, requests multiplexed by id over one shared session). search_tool now uses AsyncTavilyClient + await (was sync TavilyClient — would block the loop under asyncio.gather). tavily_search registered directly on agents — no _make_search_tool() wrapper. fetch_tool calls fetch_client via `async with`. ddg_tool calls DDGS via asyncio.to_thread (still NOT registered on any agent — date filtering remains unreliable). adzuna_tool (UK+AU job postings via Adzuna REST, _COUNTRY_MAP for code + currency). mcf_tool (SG job postings via MyCareersFuture public API, skills from API tags). schemas/job_posting.py shared schema. CareerAgent registers [tavily_search, fetch_page, adzuna_jobs, mcf_jobs] directly. ForumAgent uses tavily_search with include_domains for site-scoped student forum searches — Reddit API access is no longer available (403 since May 2026). main.py opens fetch_client once around the pipeline run. | Real job postings confirmed for UK, AU, SG. Tavily include_domains confirmed working for thestudentroom.co.uk. All 5 tools pass live tests. 27 tests pass. |
 ```
 
 ---
@@ -1574,77 +1391,57 @@ async def test_mcf_postings_have_required_fields() -> None:
         assert isinstance(p.skills, list)
 
 
-# ── Reddit ────────────────────────────────────────────────────────────────────
+# ── Forum Search (Tavily include_domains) ─────────────────────────────────────
 
-def test_reddit_imports_cleanly() -> None:
-    from tools.reddit_tool import reddit_fetch_thread, _to_json_url
-    assert reddit_fetch_thread
-    assert _to_json_url
-
-
-def test_reddit_to_json_url_converts_www() -> None:
-    from tools.reddit_tool import _to_json_url
-    url = "https://www.reddit.com/r/edinburghuniversity/comments/abc123/some_title/"
-    result = _to_json_url(url)
-    assert result == "https://www.reddit.com/r/edinburghuniversity/comments/abc123/.json"
-
-
-def test_reddit_to_json_url_converts_old() -> None:
-    from tools.reddit_tool import _to_json_url
-    url = "https://old.reddit.com/r/Edinburgh/comments/xyz789/a_post/"
-    result = _to_json_url(url)
-    assert result == "https://www.reddit.com/r/Edinburgh/comments/xyz789/.json"
-
-
-def test_reddit_to_json_url_rejects_non_post_urls() -> None:
-    from tools.reddit_tool import _to_json_url
-    assert _to_json_url("https://www.reddit.com/r/edinburghuniversity/") is None
-    assert _to_json_url("https://www.google.com/search?q=reddit") is None
-    assert _to_json_url("not a url at all") is None
+def test_tavily_forum_search_imports_cleanly() -> None:
+    from tools.search_tool import tavily_search
+    assert tavily_search
 
 
 @pytest.mark.asyncio
-async def test_reddit_returns_error_for_bad_post_url() -> None:
-    """Non-post Reddit URL (no /comments/) returns error, does not raise."""
-    from tools.reddit_tool import reddit_fetch_thread
-    ctx = _mock_ctx()
-    raw = await reddit_fetch_thread(ctx, "https://www.reddit.com/r/edinburghuniversity/")
-    result = json.loads(raw)
-    assert result["error"] is not None
-    assert result["comments"] == []
+async def test_tavily_forum_search_tsr_returns_results() -> None:
+    """Live call: Tavily with include_domains restricted to thestudentroom.co.uk returns results."""
+    from tools.search_tool import _client
+    raw = await _client.search(
+        query="University of Edinburgh Computer Science student experience",
+        include_domains=["thestudentroom.co.uk"],
+        max_results=3,
+        time_range="year",
+    )
+    results = raw.get("results", [])
+    assert len(results) > 0, "Expected at least one TSR result"
+    for r in results:
+        assert "thestudentroom.co.uk" in r.get("url", ""), (
+            f"Result URL not from TSR: {r.get('url')}"
+        )
 
 
 @pytest.mark.asyncio
-async def test_reddit_fetches_real_thread() -> None:
-    """Live call: fetch a known public Reddit thread via the JSON API."""
-    from tools.reddit_tool import reddit_fetch_thread
-    ctx = _mock_ctx()
-    # Use a well-known, stable public thread — r/learnpython is reliable
-    test_url = "https://www.reddit.com/r/learnpython/comments/1c5mf2z/what_are_the_best_resources_for_learning_python/"
-    raw = await reddit_fetch_thread(ctx, test_url, max_comments=5)
-    result = json.loads(raw)
-    if result["error"]:
-        pytest.skip(f"Reddit API unavailable: {result['error']}")
-    assert result["title"], "Expected a post title"
-    assert isinstance(result["comments"], list)
-    for comment in result["comments"]:
-        assert "body" in comment
-        assert "score" in comment
-        assert comment["score"] >= 1   # low-score comments filtered out
+async def test_tavily_forum_search_studentcrowd_returns_results() -> None:
+    """Live call: Tavily with include_domains restricted to studentcrowd.com returns results."""
+    from tools.search_tool import _client
+    raw = await _client.search(
+        query="University of Manchester Computer Science review",
+        include_domains=["studentcrowd.com"],
+        max_results=3,
+        time_range="year",
+    )
+    results = raw.get("results", [])
+    # StudentCrowd may return 0 for niche queries — acceptable, just confirm no crash
+    assert isinstance(results, list)
 
 
 @pytest.mark.asyncio
-async def test_reddit_comment_score_filter() -> None:
-    """Verify that comments with score < 1 are excluded from results."""
-    from tools.reddit_tool import reddit_fetch_thread
-    ctx = _mock_ctx()
-    test_url = "https://www.reddit.com/r/learnpython/comments/1c5mf2z/what_are_the_best_resources_for_learning_python/"
-    raw = await reddit_fetch_thread(ctx, test_url, max_comments=20)
-    result = json.loads(raw)
-    if result["error"]:
-        pytest.skip(f"Reddit API unavailable: {result['error']}")
-    for comment in result["comments"]:
-        assert comment["score"] >= 1, f"Comment with score {comment['score']} should have been filtered"
+async def test_tavily_forum_search_unrestricted_returns_results() -> None:
+    """Live call: unrestricted Tavily forum sweep returns results for non-UK university."""
+    from tools.search_tool import _client
+    raw = await _client.search(
+        query="NUS Computer Science student experience forum",
+        max_results=3,
+        time_range="year",
+    )
+    results = raw.get("results", [])
+    assert len(results) > 0, "Expected at least one result for unrestricted forum sweep"
 ```
 
 ---
@@ -1685,20 +1482,15 @@ tests/test_stage_1b.py::test_mcf_imports_cleanly PASSED
 tests/test_stage_1b.py::test_mcf_returns_singapore_postings PASSED
 tests/test_stage_1b.py::test_mcf_rejects_non_singapore PASSED
 tests/test_stage_1b.py::test_mcf_postings_have_required_fields PASSED
-tests/test_stage_1b.py::test_reddit_imports_cleanly PASSED
-tests/test_stage_1b.py::test_reddit_to_json_url_converts_www PASSED
-tests/test_stage_1b.py::test_reddit_to_json_url_converts_old PASSED
-tests/test_stage_1b.py::test_reddit_to_json_url_rejects_non_post_urls PASSED
-tests/test_stage_1b.py::test_reddit_returns_error_for_bad_post_url PASSED
-tests/test_stage_1b.py::test_reddit_fetches_real_thread PASSED
-tests/test_stage_1b.py::test_reddit_comment_score_filter PASSED
+tests/test_stage_1b.py::test_tavily_forum_search_imports_cleanly PASSED
+tests/test_stage_1b.py::test_tavily_forum_search_tsr_returns_results PASSED
+tests/test_stage_1b.py::test_tavily_forum_search_studentcrowd_returns_results PASSED
+tests/test_stage_1b.py::test_tavily_forum_search_unrestricted_returns_results PASSED
 
-34 passed in X.Xs
+31 passed in X.Xs
 ```
 
 Fetch tests may SKIP if MCP server is not installed — this is acceptable.
-Reddit live tests may SKIP if the test URL is no longer accessible — replace
-`test_url` with any current public Reddit post URL.
 They must all pass before Stage 1c.
 
 ---
@@ -1742,23 +1534,22 @@ after the env var is deleted.
 - [ ] Tavily API key in `.env` — confirmed working
 - [ ] Adzuna `app_id` and `app_key` in `.env` — confirmed working
 - [ ] MyCareersFuture — no key needed, confirmed reachable
-- [ ] Reddit — no key needed, confirmed reachable via httpx with custom UA
 - [ ] `pip install tavily-python ddgs httpx fastmcp mcp-server-fetch` clean
 - [ ] `schemas/search_result.py` — `SearchResult`, `SearchResponse` defined
 - [ ] `schemas/fetch_result.py` — `FetchResult` defined
 - [ ] `schemas/job_posting.py` — `JobPosting`, `JobPostingsResponse` defined (NEW)
 - [ ] `mcps/fetch_client.py` — single module-level `fastmcp.Client` (no custom class, no manual `startup()`/`shutdown()`) — reentrant and ref-counted, concurrent `call_tool()` calls are safe (session multiplexes by request ID)
-- [ ] `tools/search_tool.py` — `tavily_search` uses `AsyncTavilyClient` (not `TavilyClient`), `time_range="year"` enforced, `await _client.search(...)`
-- [ ] `tools/fetch_tool.py` — `fetch_page`, never raises, docstring warns off job board URLs **and Reddit URLs**, calls `fetch_client` via `async with`
+- [ ] `tools/search_tool.py` — `tavily_search` uses `AsyncTavilyClient` (not `TavilyClient`), `time_range="year"` enforced, `await _client.search(...)`, `include_domains` parameter passed through to Tavily when provided
+- [ ] `tools/fetch_tool.py` — `fetch_page`, never raises, docstring warns off job board URLs, calls `fetch_client` via `async with`
 - [ ] `tools/ddg_tool.py` — `ddg_search`, date filter applied before return, `_client.text(...)` called via `asyncio.to_thread` — still NOT registered on any agent
 - [ ] `tools/adzuna_tool.py` — `adzuna_jobs`, `_COUNTRY_MAP` maps country → `(code, currency)`, `skills=[]` (NEW)
 - [ ] `tools/mcf_tool.py` — `mcf_jobs`, Singapore only, no auth, skills from API tags, location from API (NEW)
-- [ ] `tools/reddit_tool.py` — `reddit_fetch_thread`, `_to_json_url()` pure function, httpx with custom UA, score < 1 filtered, never raises (NEW)
-- [ ] MASTER section 3 updated — Reddit row added to tools table, robots.txt block note added
-- [ ] MASTER section 8.6 updated — `adzuna_jobs`, `mcf_jobs`, `reddit_fetch_thread` rows added; fetch_page Reddit warning added
+- [ ] No `tools/reddit_tool.py` — Reddit API access unavailable since May 2026, file removed
+- [ ] MASTER section 3 updated — Reddit row removed, forum include_domains note added
+- [ ] MASTER section 8.6 updated — `adzuna_jobs`, `mcf_jobs` rows added; `reddit_fetch_thread` row removed
 - [ ] MASTER section 8.8 updated — `CareerAgent` registers `[tavily_search, fetch_page, adzuna_jobs, mcf_jobs]` directly (no `_make_search_tool()` wrapper)
 - [ ] `main.py` — wraps the pipeline run in `async with fetch_client:` (optional — `fetch_page` also self-manages via its own `async with`)
-- [ ] `pytest tests/test_stage_1b.py -v` — 34 passed (fetch may SKIP, reddit live tests may SKIP if URL stale)
+- [ ] `pytest tests/test_stage_1b.py -v` — 31 passed (fetch may SKIP)
 - [ ] Stage 1a tests still pass: `pytest tests/test_stage_1a.py -v`
 
 ---
