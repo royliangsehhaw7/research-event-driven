@@ -721,6 +721,22 @@ class BaseAgent(ABC):
 
 ```
 
+**Why `_setup_telemetry_hooks()` and `flush_cot_log()` live here:**
+Every agent in the fleet needs uniform token tracking and chain-of-thought
+capture without each subclass reimplementing it. `_setup_telemetry_hooks()`
+is a factory method called once during each subclass's `__init__`, passed
+into the pydantic-ai `Agent` constructor via `capabilities=[...]`. The hook
+registers an `after_model_request` callback that fires after every LLM turn —
+it logs input/output/total token counts at `WARNING` level (so they surface
+regardless of the active log filter), and appends any `TextPart` or
+`ThinkingPart` content to `self._current_cot_buffer`. `ThinkingPart` blocks
+(extended thinking from supported models) are also logged immediately as
+they arrive. `flush_cot_log()` collapses the buffer into a single string
+after the run completes — subclasses call it in `handle()` if they want to
+persist or log the full reasoning trace. The buffer lives on the agent
+instance (`self._current_cot_buffer`), so concurrent section agents each
+maintain their own independent trace.
+
 **Why closures instead of passing `deps` through the hub:** the hub's `publish(message)`
 signature stays clean — it has no knowledge of `deps`. Each agent's `subscribe()` captures
 `deps` in a closure at subscription time. The hub calls `handler(message)`; the handler
@@ -1485,42 +1501,870 @@ agent manages its own counter independently.
 
 ---
 
-## 10. Chainlit — Two Modes
+## 10. Chainlit — UI Layer
 
-### Mode 1 — Research Trigger
+### 10.1 Two Modes
 
-User submits university + course. The pipeline fires. `ProgressUpdateMessage`
-events render live agent status in the Chainlit step display. On
-`ReportReadyMessage`, the report renders inline and both files (`report.md`,
-`score.json`) are offered for download.
+The UI has exactly two modes. Mode is determined by whether a research run has
+completed in the current session — not by a user setting or a keyword.
 
-### Mode 2 — Conversational Follow-Up
+**Mode 1 — Research Trigger**
+The user has not yet submitted a research request in this session, or has
+started a new one. Any message that looks like a university + course input
+triggers the pipeline. `ProgressUpdateMessage` events render live agent
+status as the pipeline runs. On `ReportReadyMessage`, the report renders
+inline and both output files are offered for download.
 
-After the report is generated, the blackboard persists in the Chainlit
-session. `ConversationAgent` handles natural language follow-up answered
-from research data — no new searches.
-
-```python
-# Session state — Chainlit session-scoped
-@dataclass
-class ResearchSession:
-    blackboard:           Blackboard
-    report_files:         list[str]
-    conversation_history: list        # pydantic-ai ModelMessage list
-    context:              ResearchContext
-```
-
-`ConversationAgent.run()` receives: user question + serialised blackboard
-as context + `message_history`. It returns an answer and the updated history.
-History grows across turns and is stored in the session.
-
-**Session isolation:** each new research request creates a fresh blackboard and
-clears the conversation history. Data from a previous run never bleeds into
-a new one.
+**Mode 2 — Conversational Follow-Up**
+A research run has completed. The blackboard is populated and stored in
+the Chainlit session. Any subsequent message is treated as a follow-up
+question. `ConversationAgent` answers from the blackboard — no new searches,
+no new pipeline run. Mode 2 ends when the user submits a new research
+request (explicit re-trigger), which resets the session state.
 
 ---
 
-## 11. Startup Log Sequence (Expected)
+### 10.2 Session State
+
+One dataclass holds all per-session state. It is stored in the Chainlit
+user session dict and is `None` until a research run completes.
+
+```python
+# ui/app.py
+from __future__ import annotations
+from dataclasses import dataclass, field
+from core.blackboard import Blackboard
+from core.deps import ResearchContext
+
+@dataclass
+class ResearchSession:
+    blackboard:           Blackboard
+    report_files:         list[str]          # [path/to/report.md, path/to/score.json]
+    conversation_history: list = field(default_factory=list)   # pydantic-ai ModelMessage list
+    context:              ResearchContext = None
+```
+
+**Session isolation:** each new research request creates a fresh `ResearchSession`
+and overwrites the previous one. Data from a prior run never bleeds into a
+new one. The Chainlit session dict key is `"research_session"`.
+
+```python
+# Store after pipeline completes
+cl.user_session.set("research_session", ResearchSession(
+    blackboard=board,
+    report_files=message.file_paths,
+    context=deps.context,
+))
+
+# Read in Mode 2
+session: ResearchSession | None = cl.user_session.get("research_session")
+```
+
+---
+
+### 10.3 `ui/app.py` — Full Structure
+
+```python
+# ui/app.py
+from __future__ import annotations
+
+import asyncio
+from contextlib import AsyncExitStack
+from datetime import datetime
+from pathlib import Path
+
+import chainlit as cl
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from mcps.fetch_client import fetch_client
+from services.research_handler import ResearchHandler
+from agents.conversation_agent import ConversationAgent
+from core.skill_loader import scan_skills_dir
+from schemas.messages.progress_update import ProgressUpdateMessage
+from schemas.messages.report_ready import ReportReadyMessage
+
+_stack = AsyncExitStack()
+_handler: ResearchHandler | None = None
+
+
+# ── Lifecycle ──────────────────────────────────────────────────────────────────
+
+@cl.on_chat_start
+async def on_chat_start() -> None:
+    """Boot fetch client and handler once per session."""
+    global _handler
+    await _stack.enter_async_context(fetch_client)
+    if _handler is None:
+        _handler = ResearchHandler()
+    cl.user_session.set("research_session", None)
+    await cl.Message(
+        content=(
+            "Welcome. Enter a university name and course to begin research.\n\n"
+            "Example: *University of Manchester — Computer Science*"
+        )
+    ).send()
+
+
+@cl.on_chat_end
+async def on_chat_end() -> None:
+    await _stack.aclose()
+
+
+# ── Message routing ───────────────────────────────────────────────────────────
+
+@cl.on_message
+async def on_message(message: cl.Message) -> None:
+    session = cl.user_session.get("research_session")
+
+    if session is None or _is_new_research_request(message.content):
+        await _run_research(message.content)
+    else:
+        await _run_conversation(message.content, session)
+
+
+def _is_new_research_request(text: str) -> bool:
+    """Heuristic: does this look like a university + course pair?
+    Any message containing ' — ' or matching known trigger patterns resets the session.
+    Keeps Mode 2 from accidentally re-triggering the pipeline on a follow-up question."""
+    return " — " in text or text.strip().lower().startswith("research ")
+
+
+# ── Mode 1 — Research pipeline ────────────────────────────────────────────────
+
+async def _run_research(user_input: str) -> None:
+    """Parse input, run pipeline, render report, store session."""
+    cl.user_session.set("research_session", None)   # clear any prior session
+
+    university_name, intended_course = _parse_input(user_input)
+    if not university_name or not intended_course:
+        await cl.Message(
+            content=(
+                "Please enter a university name and course separated by ' — '\n"
+                "Example: *University of Manchester — Computer Science*"
+            )
+        ).send()
+        return
+
+    # Register progress handler BEFORE starting pipeline
+    progress_msg = await cl.Message(content="Starting research pipeline…").send()
+    step_lines: list[str] = []
+
+    async def on_progress(msg: ProgressUpdateMessage) -> None:
+        icon = {"started": "🔍", "completed": "✅", "failed": "❌"}.get(msg.status, "•")
+        step_lines.append(f"{icon} {msg.message}")
+        await progress_msg.update(content="\n".join(step_lines))
+
+    async def on_report_ready(msg: ReportReadyMessage) -> None:
+        pass   # handled after handle_request() returns
+
+    board = await _handler.handle_request(
+        university_name=university_name,
+        intended_course=intended_course,
+        on_progress=on_progress,
+        on_report_ready=on_report_ready,
+    )
+
+    # Render report inline
+    report_path = Path("outputs") / f"{university_name}_{intended_course}_report.md"
+    score_path  = Path("outputs") / f"{university_name}_{intended_course}_score.json"
+
+    if report_path.exists():
+        report_text = report_path.read_text(encoding="utf-8")
+        await cl.Message(content=report_text).send()
+        await cl.Message(
+            content="Download your research files:",
+            elements=[
+                cl.File(name="report.md",   path=str(report_path), display="inline"),
+                cl.File(name="score.json",  path=str(score_path),  display="inline"),
+            ],
+        ).send()
+    else:
+        await cl.Message(content="⚠️ Report generation failed — check logs.").send()
+        return
+
+    # Persist session for Mode 2
+    from core.deps import ResearchContext
+    cl.user_session.set("research_session", ResearchSession(
+        blackboard=board,
+        report_files=[str(report_path), str(score_path)],
+        context=ResearchContext(
+            university_name=university_name,
+            intended_course=intended_course,
+            country=board.career.country_scope if board.career else "unknown",
+        ),
+    ))
+
+    await cl.Message(
+        content="Research complete. Ask any follow-up questions about this university and course."
+    ).send()
+
+
+def _parse_input(text: str) -> tuple[str, str]:
+    """Split 'University Name — Course Name' into two strings.
+    Returns ('', '') if the format is not recognised."""
+    if " — " in text:
+        parts = text.split(" — ", maxsplit=1)
+        return parts[0].strip(), parts[1].strip()
+    if " - " in text:
+        parts = text.split(" - ", maxsplit=1)
+        return parts[0].strip(), parts[1].strip()
+    return "", ""
+
+
+# ── Mode 2 — Conversational follow-up ────────────────────────────────────────
+
+async def _run_conversation(question: str, session: ResearchSession) -> None:
+    """Answer a follow-up question from the blackboard via ConversationAgent."""
+    skills = scan_skills_dir(Path("skills"))
+    conv_skill = skills.get("conversation")
+    agent = ConversationAgent(
+        instructions=conv_skill.instructions if conv_skill else ""
+    )
+
+    thinking_msg = await cl.Message(content="Thinking…").send()
+
+    answer, updated_history = await agent.run(
+        question=question,
+        blackboard=session.blackboard,
+        context=session.context,
+        history=session.conversation_history,
+    )
+
+    session.conversation_history = updated_history
+    cl.user_session.set("research_session", session)
+
+    await thinking_msg.update(content=answer)
+```
+
+**Why `ConversationAgent` is constructed per-question rather than once at startup:**
+`ConversationAgent` holds no per-request state — it carries no `_calls_made`
+counter and no `_fired` flag. Constructing it fresh each time avoids any risk
+of history contamination between sessions. The cost is negligible since it
+makes no tool calls.
+
+**Why progress messages are a running log, not individual Chainlit steps:**
+Chainlit steps (`async with cl.Step(...)`) require knowing the step name at
+entry time. Agent progress arrives asynchronously as `ProgressUpdateMessage`
+events — we don't know which agent will report next. Appending to a single
+message and calling `update()` gives a clean live feed without needing step
+nesting or ordering.
+
+**Why `_is_new_research_request()` uses ` — ` as the signal:**
+The canonical input format is `University Name — Course`. A follow-up
+question like "what are the top employers?" will never contain that separator.
+This heuristic is intentionally simple — the alternative is an intent
+classifier LLM call, which adds latency and a new failure mode.
+
+---
+
+### 10.4 `ConversationAgent`
+
+`ConversationAgent` is the only agent that is not wired into the pub-sub
+pipeline. It has no `subscribe()` call and fires no messages. It is called
+directly by `ui/app.py` in Mode 2.
+
+```python
+# agents/conversation_agent.py
+from __future__ import annotations
+
+from pydantic_ai import Agent
+from agents.base_agent import BaseAgent
+from core.blackboard import Blackboard
+from core.deps import ResearchContext
+from core.llm_factory import get_model
+from core.logger import logger
+
+
+class ConversationAgent(BaseAgent):
+    """Answers follow-up questions from the blackboard. No tools. No pub-sub.
+
+    Called directly by ui/app.py — not subscribed to any hub message.
+    Uses CONVERSATION_MODEL (typically a faster/cheaper model than RESEARCH_MODEL).
+    """
+
+    def __init__(self, instructions: str = "") -> None:
+        super().__init__(instructions=instructions)
+        self._agent = Agent(
+            model=get_model("CONVERSATION_MODEL"),
+            capabilities=[self._setup_telemetry_hooks()],
+        )
+        logger.info("ConversationAgent | initialized")
+
+    def subscribe(self, hub, deps) -> None:
+        pass   # ConversationAgent is never subscribed to the hub
+
+    def get_instruction(self) -> str:
+        base = "You are the Conversation Agent in a university research pipeline."
+        return base + "\n\n" + self.instructions if self.instructions else base
+
+    async def run(
+        self,
+        question:   str,
+        blackboard: Blackboard,
+        context:    ResearchContext,
+        history:    list,
+    ) -> tuple[str, list]:
+        """Answer a follow-up question using only the blackboard data.
+
+        Returns (answer_text, updated_message_history).
+        Never makes tool calls — all data is in the blackboard context.
+        """
+        board_summary = _serialise_blackboard(blackboard)
+
+        system_prompt = (
+            self.get_instruction() + "\n\n"
+            f"University: {context.university_name}\n"
+            f"Course: {context.intended_course}\n"
+            f"Country: {context.country}\n\n"
+            "Research data (answer only from this — do not invent):\n"
+            f"{board_summary}"
+        )
+
+        result = await self._agent.run(
+            question,
+            system_prompt=system_prompt,
+            message_history=history,
+        )
+        return result.output, result.all_messages()
+
+
+def _serialise_blackboard(board: Blackboard) -> str:
+    """Convert populated blackboard fields to compact JSON string for context injection."""
+    import json
+    sections = {}
+    for field_name in [
+        "career", "background", "rankings", "program",
+        "employability", "accommodation", "news", "forum",
+        "score", "alternatives",
+    ]:
+        value = getattr(board, field_name)
+        if value is not None:
+            sections[field_name] = value.model_dump()
+    return json.dumps(sections, indent=2, default=str)
+```
+
+**Why `system_prompt` is passed per-call rather than at construction:**
+The blackboard content is per-session and changes between sessions. Passing
+it at construction would bind the agent to one session's data permanently.
+Passing it per-call keeps the agent stateless and safely reusable.
+
+**Why `_serialise_blackboard()` uses `model_dump()` not `model_dump_json()`:**
+`json.dumps(..., default=str)` handles any non-serialisable types (dates,
+custom objects) gracefully. `model_dump_json()` would raise on the same inputs.
+
+---
+
+## 11. ReportGenerator — Deterministic Rendering
+
+### 11.1 Role and Constraints
+
+`ReportGenerator` is not an agent. It makes no LLM calls. It subscribes to
+`AlternativesCompletedMessage`, reads the full blackboard, renders two output
+files using Jinja2, then fires `ReportReadyMessage`. It is pure deterministic
+Python — the same blackboard always produces the same files.
+
+This is a deliberate constraint. LLM-generated report prose drifts between
+runs and is hard to test. Jinja2 templates are version-controlled, reviewable,
+and produce consistent structure. Quality tuning means editing the template —
+not re-prompting.
+
+`ReportGenerator` lives in `report/generator.py`. The Jinja2 template lives in
+`report/templates/report.md.j2`. Both are loaded at runtime — the generator
+has no hardcoded strings beyond section headers.
+
+---
+
+### 11.2 Output Files
+
+Two files are written per run, into an `outputs/` directory at the project root.
+Filenames are slugified from the university name and course.
+
+| File | Format | Purpose |
+|---|---|---|
+| `{slug}_report.md` | Markdown | Human-readable report — all 10 sections, inline sources, confidence flags |
+| `{slug}_score.json` | JSON | Machine-readable scores — enables multi-university comparison |
+
+Filename slug example: `university_of_manchester_computer_science_report.md`
+
+---
+
+### 11.3 `report/generator.py`
+
+```python
+# report/generator.py
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+from core.blackboard import Blackboard
+from core.deps import ResearchContext
+from core.logger import logger
+from schemas.messages.alternatives_completed import AlternativesCompletedMessage
+from schemas.messages.progress_update import ProgressUpdateMessage
+from schemas.messages.report_ready import ReportReadyMessage
+
+
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+OUTPUT_DIR   = Path("outputs")
+
+
+class ReportGenerator:
+    """Subscribes to AlternativesCompletedMessage. Renders report.md and score.json.
+    Fires ReportReadyMessage with file paths on completion.
+    No LLM calls. No tool calls. Pure Jinja2 + JSON serialisation.
+    """
+
+    def subscribe(self, hub, deps) -> None:
+        async def handler(message: AlternativesCompletedMessage) -> None:
+            await self.handle(message, deps)
+        hub.subscribe(AlternativesCompletedMessage, handler)
+
+    def reset(self) -> None:
+        pass   # no per-request state
+
+    async def handle(self, message: AlternativesCompletedMessage, deps) -> None:
+        logger.info("ReportGenerator | starting")
+
+        await deps.hub.publish(ProgressUpdateMessage(
+            status="started",
+            message="Generating report files…",
+            triggered_by="report_generator",
+            timestamp=datetime.now().isoformat(),
+        ))
+
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        slug = _slugify(
+            f"{deps.context.university_name}_{deps.context.intended_course}"
+        )
+
+        try:
+            report_path = OUTPUT_DIR / f"{slug}_report.md"
+            score_path  = OUTPUT_DIR / f"{slug}_score.json"
+
+            _render_report(deps.board, deps.context, report_path)
+            _render_score(deps.board, deps.context, score_path)
+
+            logger.info(
+                "ReportGenerator | completed — report=%s score=%s",
+                report_path, score_path,
+            )
+
+            await deps.hub.publish(ProgressUpdateMessage(
+                status="completed",
+                message="Report files ready.",
+                triggered_by="report_generator",
+                timestamp=datetime.now().isoformat(),
+            ))
+
+            await deps.hub.publish(ReportReadyMessage(
+                file_paths=[str(report_path), str(score_path)],
+                triggered_by="report_generator",
+                timestamp=datetime.now().isoformat(),
+            ))
+
+        except Exception as exc:
+            logger.error("ReportGenerator | failed: %s", exc)
+            await deps.hub.publish(ProgressUpdateMessage(
+                status="failed",
+                message=f"Report generation failed: {exc}",
+                triggered_by="report_generator",
+                timestamp=datetime.now().isoformat(),
+            ))
+
+
+def _render_report(board: Blackboard, context: ResearchContext, path: Path) -> None:
+    env = Environment(
+        loader=FileSystemLoader(str(TEMPLATE_DIR)),
+        undefined=StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    template = env.get_template("report.md.j2")
+    rendered = template.render(board=board, context=context)
+    path.write_text(rendered, encoding="utf-8")
+
+
+def _render_score(board: Blackboard, context: ResearchContext, path: Path) -> None:
+    if board.score is None:
+        score_data = {"error": "scoring did not complete"}
+    else:
+        score_data = {
+            "university":      context.university_name,
+            "course":          context.intended_course,
+            "country":         context.country,
+            "generated_at":    datetime.now().isoformat(),
+            "overall_score":   board.score.overall_score,
+            "tier":            board.score.tier,
+            "dimension_scores": board.score.dimension_scores,
+            "top_positives":   board.score.top_positives,
+            "top_concerns":    board.score.top_concerns,
+            "alternatives": [
+                {
+                    "name":               alt.university_name,
+                    "subject_rank":       alt.subject_rank,
+                    "gap_addressed":      alt.gap_addressed,
+                    "employability_note": alt.employability_note,
+                    "program_note":       alt.program_note,
+                }
+                for alt in (board.alternatives.alternatives if board.alternatives else [])
+            ],
+        }
+    path.write_text(json.dumps(score_data, indent=2, default=str), encoding="utf-8")
+
+
+def _slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+```
+
+---
+
+### 11.4 `score.json` Schema
+
+The score file is the machine-readable output designed for multi-university
+comparison. Its structure is fixed — do not add LLM-generated prose to it.
+
+```json
+{
+  "university":    "University of Manchester",
+  "course":        "Computer Science",
+  "country":       "UK",
+  "generated_at":  "2025-10-01T14:23:00",
+  "overall_score": 7.4,
+  "tier":          "Strong Consider",
+  "dimension_scores": {
+    "career":          8.0,
+    "background":      7.5,
+    "rankings":        8.5,
+    "program":         7.0,
+    "employability":   8.0,
+    "accommodation":   6.5,
+    "news":            7.0,
+    "forum":           6.5
+  },
+  "top_positives": [
+    "Top-10 UK subject ranking for Computer Science (QS 2024)",
+    "Strong graduate employment rate — 92% within 6 months",
+    "Named partnerships with Amazon, ThoughtWorks, and BAE Systems"
+  ],
+  "top_concerns": [
+    "Accommodation costs among highest in UK outside London",
+    "Forum feedback flags large class sizes in Year 1",
+    "Limited sandwich year uptake reported by students"
+  ],
+  "alternatives": [
+    {
+      "name":               "University of Edinburgh",
+      "subject_rank":       "Top 50 QS CS 2024",
+      "gap_addressed":      "accommodation",
+      "employability_note": "Strong fintech and startup pipeline",
+      "program_note":       "MEng option available"
+    }
+  ]
+}
+```
+
+**Why `dimension_scores` uses blackboard field names as keys:** `ScoringAgent`
+writes scores keyed to section names that match the blackboard fields exactly.
+The renderer copies them directly. Any mismatch between `ScoringOutput` field
+names and blackboard field names surfaces immediately as a `KeyError` in tests.
+
+---
+
+### 11.5 `report.md.j2` — Template Structure
+
+The Jinja2 template renders all 10 sections in fixed order. Each section
+block is wrapped in a `{% if board.<field> %}` guard — if the agent failed,
+the section renders a `> ⚠️ Data unavailable` notice instead of being silently
+omitted. This is the "never silently omit a section" guarantee from Section 1.
+
+**Confidence flag convention used throughout the template:**
+
+| `confidence` value | Flag rendered |
+|---|---|
+| `"high"` | *(no flag — high confidence is the default)* |
+| `"medium"` | `> 📊 Medium confidence — some sources limited` |
+| `"low"` | `> ⚠️ Low confidence — treat findings as indicative only` |
+
+**Source citation convention:** every source renders as
+`([domain](url), date)` inline — extracted from each output schema's
+`sources` list. The template never renders raw URLs without anchor text.
+
+```jinja
+{# report/templates/report.md.j2 #}
+# {{ context.university_name }} — {{ context.intended_course }} Research Report
+*Generated {{ now }}*
+
+---
+
+## Executive Summary
+
+{% if board.score %}
+**Overall Score:** {{ board.score.overall_score }}/10 — **{{ board.score.tier }}**
+
+**Top 3 Strengths:**
+{% for p in board.score.top_positives %}
+- {{ p }}
+{% endfor %}
+
+**Top 3 Concerns:**
+{% for c in board.score.top_concerns %}
+- {{ c }}
+{% endfor %}
+
+**Alternative Universities:** See Section 10.
+{% else %}
+> ⚠️ Scoring did not complete — executive summary unavailable.
+{% endif %}
+
+---
+
+## 1. Career Landscape
+
+{% if board.career %}
+{% if board.career.confidence != "high" %}
+> {{ board.career.confidence | confidence_flag }}
+{% endif %}
+
+**Country scope:** {{ board.career.country_scope }}
+
+**Graduate Career Paths:**
+{% for path in board.career.career_paths %}
+- **{{ path.title }}** — {{ path.description }}
+  *Typical employers: {{ path.typical_companies | join(", ") }}*
+{% endfor %}
+
+**Salary Ranges ({{ board.career.salary_ranges[0].currency if board.career.salary_ranges }}):**
+| Role | Entry | Mid | Senior |
+|---|---|---|---|
+{% for s in board.career.salary_ranges %}
+| {{ s.career_path }} | {{ s.entry_level }} | {{ s.mid_level }} | {{ s.senior_level }} |
+{% endfor %}
+
+**In-Demand Skills:** {{ board.career.in_demand_skills | join(", ") }}
+
+**Live Job Postings Snapshot ({{ board.career.job_postings | length }} postings):**
+{% for job in board.career.job_postings[:5] %}
+- {{ job.title }} @ {{ job.company }} — {{ job.location }} ([link]({{ job.url }}), {{ job.date_posted }})
+{% endfor %}
+{% if board.career.job_postings | length > 5 %}
+*…and {{ board.career.job_postings | length - 5 }} more postings retrieved.*
+{% endif %}
+
+{% if board.career.notes %}*Note: {{ board.career.notes }}*{% endif %}
+
+*Sources: {% for s in board.career.sources %}([{{ s.url | domain }}]({{ s.url }}), {{ s.date }}){% if not loop.last %}, {% endif %}{% endfor %}*
+
+{% else %}
+> ⚠️ Career landscape data unavailable — CareerAgent did not complete.
+{% endif %}
+
+---
+
+## 2. University Background
+
+{% if board.background %}
+{% if board.background.confidence != "high" %}
+> {{ board.background.confidence | confidence_flag }}
+{% endif %}
+
+| | |
+|---|---|
+| **Founded** | {{ board.background.founded }} |
+| **Size** | {{ board.background.size_students }} students |
+| **Status** | {{ board.background.public_or_private | title }} |
+| **Orientation** | {{ board.background.research_orientation | replace("-", " ") | title }} |
+| **Campus** | {{ board.background.campus_setting | title }} |
+
+{% if board.background.accreditations %}
+**Course Accreditations:**
+{% for acc in board.background.accreditations %}
+- {{ acc.body }} — *{{ acc.scope }}* ({{ acc.year_listed }})
+{% endfor %}
+{% else %}
+*No course-specific accreditations found.*
+{% endif %}
+
+{% if board.background.industry_partnerships %}
+**Department Industry Partnerships:**
+{% for p in board.background.industry_partnerships %}
+- **{{ p.partner }}** — {{ p.nature }} ({{ p.department }})
+{% endfor %}
+{% else %}
+*No named department-level industry partnerships found.*
+{% endif %}
+
+{% if board.background.notes %}*Note: {{ board.background.notes }}*{% endif %}
+
+{% else %}
+> ⚠️ University background data unavailable.
+{% endif %}
+
+---
+
+## 3. Subject Rankings
+
+{% if board.rankings %}
+{% if board.rankings.confidence != "high" %}
+> {{ board.rankings.confidence | confidence_flag }}
+{% endif %}
+
+{{ board.rankings.ranking_summary }}
+
+**Subject-Specific Rankings:**
+{% for r in board.rankings.subject_rankings %}
+- **{{ r.source }}** ({{ r.year }}): {{ r.rank }} for {{ r.subject_scope }} — [source]({{ r.url }})
+{% endfor %}
+
+{% if board.rankings.employability_rankings %}
+**Graduate Employability Rankings:**
+{% for r in board.rankings.employability_rankings %}
+- **{{ r.source }}** ({{ r.year }}): {{ r.rank }} — [source]({{ r.url }})
+{% endfor %}
+{% endif %}
+
+**Overall University Rankings** *(low weight — not subject-specific):*
+{% for r in board.rankings.overall_rankings %}
+- **{{ r.source }}** ({{ r.year }}): {{ r.rank }}
+{% endfor %}
+
+{% if board.rankings.notes %}*Note: {{ board.rankings.notes }}*{% endif %}
+
+{% else %}
+> ⚠️ Rankings data unavailable.
+{% endif %}
+
+---
+
+## 4. Undergraduate Program
+
+{% if board.program %}
+{% if board.program.confidence != "high" %}
+> {{ board.program.confidence | confidence_flag }}
+{% endif %}
+
+**Matching Programs:**
+{% for prog in board.program.matching_programs %}
+- **{{ prog.title }}** ({{ prog.degree_type }}, {{ prog.duration_years }} years)
+  UCAS: {{ prog.ucas_code if prog.ucas_code else "not found" }} |
+  Sandwich year: {{ "yes" if prog.sandwich_year else "no" }} |
+  Study abroad: {{ "yes" if prog.study_abroad else "no" }}
+{% endfor %}
+
+**Core Modules (Year 1 & 2):**
+{% for mod in board.program.core_modules %}
+- {{ mod.name }} ({{ mod.year }})
+{% endfor %}
+
+{% if board.program.electives %}
+**Elective Modules:**
+{% for mod in board.program.electives %}
+- {{ mod.name }}
+{% endfor %}
+{% endif %}
+
+{% if board.program.skill_mappings %}
+**Curriculum → Career Skills Mapping:**
+{% for mapping in board.program.skill_mappings %}
+- **{{ mapping.career_skill }}**: {{ mapping.modules | join(", ") if mapping.modules else "No direct module found" }}
+{% endfor %}
+{% endif %}
+
+{% if board.program.curriculum_notes %}*Note: {{ board.program.curriculum_notes }}*{% endif %}
+
+{% else %}
+> ⚠️ Program data unavailable.
+{% endif %}
+
+---
+
+## 5. Graduate Employability
+{# ...same pattern — renders board.employability fields #}
+
+## 6. Accommodation & Living
+{# ...renders board.accommodation fields #}
+
+## 7. Recent News
+{# ...renders board.news.items with sentiment labels #}
+
+## 8. Student Forum Findings
+{# ...renders board.forum.recurring_positives, recurring_concerns, department_feedback #}
+
+---
+
+## 9. Score & Recommendation
+
+{% if board.score %}
+**Overall Score: {{ board.score.overall_score }}/10 — {{ board.score.tier }}**
+
+| Dimension | Score |
+|---|---|
+{% for dim, score in board.score.dimension_scores.items() %}
+| {{ dim | title }} | {{ score }}/10 |
+{% endfor %}
+
+**Why this tier:**
+{% for reason in board.score.top_positives %}
+- ✅ {{ reason }}
+{% endfor %}
+
+**What to investigate further:**
+{% for concern in board.score.top_concerns %}
+- ⚠️ {{ concern }}
+{% endfor %}
+
+{% else %}
+> ⚠️ Scoring did not complete.
+{% endif %}
+
+---
+
+## 10. Alternative Universities
+
+{% if board.alternatives and board.alternatives.alternatives %}
+{% for alt in board.alternatives.alternatives %}
+### {{ alt.university_name }}
+
+- **Subject rank:** {{ alt.subject_rank }}
+- **Why listed:** {{ alt.gap_addressed }}
+- **Program note:** {{ alt.program_note }}
+- **Employability note:** {{ alt.employability_note }}
+
+{% endfor %}
+{% else %}
+> ⚠️ Alternatives data unavailable.
+{% endif %}
+```
+
+**Why `StrictUndefined` in the Jinja2 environment:** any template variable
+that references a missing field raises immediately at render time rather than
+silently rendering as an empty string. This surfaces schema mismatches (e.g.
+a field renamed in the output schema but not updated in the template) as an
+explicit error rather than a silently broken report section.
+
+**Why sections 5–8 are abbreviated in the template above:** they follow the
+identical `{% if board.<field> %}` / confidence flag / field rendering / `{% else %}` unavailable notice pattern as sections 1–4. The full template in
+`report/templates/report.md.j2` must implement all 10 sections completely.
+The abbreviation here is documentation economy only.
+
+**Why `| domain` is a custom filter:** Jinja2 has no built-in URL parser.
+A custom filter `domain(url)` extracts the hostname from a URL for use as
+link anchor text. Register it on the `Environment` object:
+```python
+env.filters["domain"] = lambda url: url.split("/")[2] if "//" in url else url
+env.filters["confidence_flag"] = lambda c: {
+    "medium": "📊 Medium confidence — some sources limited",
+    "low":    "⚠️ Low confidence — treat findings as indicative only",
+}.get(c, "")
+```
+
+## 12. Startup Log Sequence (Expected)
 
 When the system starts, logs must appear in this order:
 
@@ -1554,7 +2398,7 @@ research_handler | no SKILL.md for 'forum' — agent will use base prompt
 
 ---
 
-## 12. Project Folder Structure
+## 13. Project Folder Structure
 
 ```
 university_research/
@@ -1651,7 +2495,7 @@ university_research/
 
 ---
 
-## 13. Known Implementation Pitfalls
+## 14. Known Implementation Pitfalls
 
 These are issues that caused real debugging time in prior projects. Know
 them before building.
@@ -1681,7 +2525,7 @@ If `.env` is not loaded before the modules are imported, they will raise
 **Skills load before agents are constructed**
 `scan_skills_dir()` must complete before any agent constructor is called.
 If agents are constructed before skills are loaded, they receive empty
-instructions. The startup log sequence (Section 11) confirms correct ordering.
+instructions. The startup log sequence (Section 12) confirms correct ordering.
 
 **`expected_sections` is set from loaded skill count, not hardcoded**
 Count only the keys in `RESEARCH_AGENT_KEYS` that successfully loaded from
@@ -1725,25 +2569,49 @@ DDG has no API-level date range parameter equivalent to Tavily's days=730. Post-
 
 ---
 
-## 14. Development Stage Summary
+## 15. Development Stage Summary
 
 These stages are implemented in order. Each ends with something running and
 verifiable. No stage is purely structural.
 
-| Stage | What you build | Ends with |
-|---|---|---|
-| 0 | Repo scaffold, env setup, dependencies | Clean install, `.env` validated |
-| 1a | MessageHub (closure pattern), Blackboard, Deps (hub + board + context only — no tool clients), all schemas, SkillLoader + all 11 SKILL.md files | Hub test passing, skill scan returning 11 keys |
-| 1b | `mcps/fetch_client.py` singleton. `tools/` — `search_tool.py`, `fetch_tool.py`, `ddg_tool.py` (unchanged from original). `tools/adzuna_tool.py` (UK + AU job postings via Adzuna REST). `tools/mcf_tool.py` (SG job postings via MyCareersFuture public API). `schemas/job_posting.py` shared normalised schema. `ResearchHandler.startup()` warms Fetch MCP. | Real job postings confirmed for UK, AU, SG. All 5 tools pass live tests. 26 tests pass. |
-| 1c | `CareerAgent` end-to-end — pydantic-ai Agent with `tavily_search` + `fetch_page` tools, budget-aware closure, `subscribe()` + `get_instruction()`, `handle()` resets `_calls_made` | `board.career` populated from real data via CLI |
-| 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same tool set as CareerAgent (Tavily + Fetch), same pattern | `board.background`, `board.rankings`, `board.program` populated via CLI |
-| 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` — all three use Tavily + Fetch only. NewsAgent sets confidence: "low" when news results are sparse | board.employability, board.accommodation, board.news populated from a single pipeline run |
-| 1f | `ForumAgent` — Tavily + Fetch, highest budget, strict scope rules across 5 confirmed forum sources | `board.forum` populated via CLI — TSR, StudentCrowd, WhatUni, Quora, Reddit snippets via Tavily confirmed |
-| 2a | `ScoringAgent` + quorum gate — no tools, reads blackboard only, asyncio.Lock | `board.score` populated after all 7 section agents complete — lock verified, partial results handled |
-| 2b | `AlternativesAgent` (Tavily + Fetch) + `ReportGenerator` (Jinja2, no LLM) | `score.json` and `report.md` generated from CLI for real university |
-| 2c | `Chainlit` UI Mode 1 + Mode 2 + `ConversationAgent` (no tools, reads blackboard) | Full pipeline from UI with live progress, follow-up questions answered |
-| 3a | Report quality pass — template, confidence flags, comparison script | Side-by-side `score.json` comparison working |
-| 3b | Edge case hardening | All failure scenarios handled without crash |
+| Stage | What you build | Files created or changed | Ends with |
+|---|---|---|---|
+| 0 | Repo scaffold, env setup, dependencies, `.env` template | `requirements.txt`, `.env`, `pytest.ini`, folder skeleton | `pip install -r requirements.txt` succeeds; `python -c "import pydantic_ai"` passes |
+| 1a | `MessageHub`, `Blackboard`, `Deps`, all message schemas, all output schemas, `SkillLoader`, all 11 `SKILL.md` files | `core/`, `schemas/`, `skills/` | `pytest tests/test_stage_1a.py` — 17 tests pass; skill scan returns 11 keys |
+| 1b | Fetch MCP client, all 5 tool functions (`tavily_search`, `fetch_page`, `ddg_tool`, `adzuna_jobs`, `mcf_jobs`), shared `JobPosting` schema | `mcps/fetch_client.py`, `tools/`, `schemas/job_posting.py` | Real job postings confirmed for UK, AU, SG; all 5 tools pass live tests; 26 tests pass |
+| 1c | `CareerAgent` end-to-end — `BaseAgent` ABC, pydantic-ai `Agent` with telemetry hooks, budget-aware tools, `subscribe()`, `get_instruction()`, `handle()`. Minimal `ResearchHandler` + `main.py` | `agents/base_agent.py`, `agents/career_agent.py`, `services/research_handler.py`, `main.py` | `board.career` populated from real data via `python main.py`; 11 tests pass |
+| 1d | `BackgroundAgent` + `RankingsAgent` + `ProgramAgent` — same Tavily + Fetch tool set, subscribe to `CareerResearchCompletedMessage`, fire `SectionCompletedMessage` | `agents/background_agent.py`, `agents/rankings_agent.py`, `agents/program_agent.py`, updated `research_handler.py`, updated `main.py` | All three board fields populated concurrently via CLI; 13 structural tests pass |
+| 1e | `EmployabilityAgent` + `AccommodationAgent` + `NewsAgent` — Tavily + Fetch, `NewsAgent` sets `confidence: "low"` when Tavily returns sparse results (DDG not wired) | `agents/employability_agent.py`, `agents/accommodation_agent.py`, `agents/news_agent.py` | `board.employability`, `board.accommodation`, `board.news` populated in a single pipeline run |
+| 1f | `ForumAgent` — Tavily + Fetch, highest budget (10), strict scope rules, `include_domains` for TSR/StudentCrowd/WhatUni/Quora | `agents/forum_agent.py`, `skills/forum/SKILL.md` | `board.forum` populated via CLI with findings from ≥2 confirmed forum sources |
+| 2a | `ScoringAgent` — quorum gate, `asyncio.Lock`, no tools, reads full blackboard, fires `ScoringCompletedMessage` | `agents/scoring_agent.py`, `schemas/outputs/scoring_output.py`, `skills/scoring/SKILL.md` | `board.score` populated after all 7 section agents complete; lock race verified; partial blackboard handled |
+| 2b | `AlternativesAgent` (Tavily + Fetch) + `ReportGenerator` (Jinja2, no LLM) — renders `report.md` + `score.json`, fires `ReportReadyMessage` | `agents/alternatives_agent.py`, `report/generator.py`, `report/templates/report.md.j2`, `schemas/outputs/alternatives_output.py` | `score.json` and `report.md` written to `outputs/` from CLI for a real university; all 10 sections render; unavailable sections show notice |
+| 2c | `ConversationAgent` (no tools, reads blackboard) + `ui/app.py` (Chainlit Mode 1 + Mode 2) | `agents/conversation_agent.py`, `ui/app.py`, `skills/conversation/SKILL.md` | Full pipeline runs from Chainlit UI; live progress renders; report appears inline; files downloadable; follow-up questions answered from blackboard |
+| 3a | Report quality pass — template refinement, confidence flag rendering, `score.json` comparison script | `report/templates/report.md.j2`, `scripts/compare_scores.py` | Side-by-side `score.json` comparison between two universities works; report renders cleanly for ≥3 real universities |
+| 3b | Edge case hardening — all `None` blackboard fields, all agents fail, malformed input, oversized results | `tests/test_edge_cases.py` | All failure scenarios exit cleanly with a degraded report rather than a crash |
+
+### Stage Dependency Map
+
+```
+0 → 1a → 1b → 1c → 1d ─┐
+                    1e ──┼→ 1f → 2a → 2b → 2c → 3a → 3b
+                         ┘
+```
+
+Each stage has a hard dependency on all stages above it. Never skip a stage
+to implement a later one — the pattern established in each stage is the
+foundation the next builds on. In particular:
+
+- **1c before 1d–1f**: the BaseAgent hooks pattern, `get_instruction()` discipline,
+  and `handle()` reset contract are all established in 1c. Stages 1d–1f are
+  direct copies of that pattern.
+- **1f before 2a**: the quorum gate count (`expected_sections`) is set from the
+  number of successfully registered research agents. All 7 must be registered
+  before `ScoringAgent` is wired.
+- **2a before 2b**: `AlternativesAgent` reads `board.score.weaknesses`. If
+  `ScoringAgent` hasn't run, there is nothing to read.
+- **2b before 2c**: the Chainlit UI subscribes to `ReportReadyMessage` to
+  render the report. `ReportGenerator` fires that message. Without 2b, the
+  UI has nothing to display.
 
 ---
 
