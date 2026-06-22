@@ -8,3 +8,7 @@
 - CND: git remote add origin <REPO_URL>
 - CMD: git push -u origin main
 - **CREATE A .gitignore FIRST**
+
+## Git remove branch
+- CMD: git push origin -delete <<branch name>>
+- CMD: git branch -d <<branch name>>
