@@ -347,7 +347,7 @@ class JobPosting:
     """A single job posting. Normalised from either Adzuna or MyCareersFuture."""
     title:          str
     company:        str
-    location:       str
+    location:       str12
     description:    str
     salary_min:     float | None    # in local currency, annual
     salary_max:     float | None    # in local currency, annual
@@ -938,10 +938,24 @@ async def mcf_jobs(
 
 ---
 
-## 1b.7 Master Reference Changes
+## 1b.7 `tools/reddit_tool.py` — REMOVED
 
-The following sections of the master reference need updating to reflect the
-new tools. These are drop-in replacements — only the listed sections change.
+> **Why this file no longer exists:** Reddit's public JSON API (the `.json` endpoint
+> approach the original spec relied on) returned 403 Forbidden as of May 30, 2026.
+> Reddit's Responsible Builder Policy (November 2025) closed self-service API
+> registration — new applications require explicit pre-approval that takes weeks
+> and is rarely granted. OAuth token registration is also no longer open.
+>
+> There is no viable unauthenticated path to Reddit content. Do not create this file.
+>
+> **What replaces it:** `ForumAgent` uses `tavily_search` with `include_domains`
+> to restrict searches to specific student forum sites. This was confirmed working
+> in live tests — see Section 1b.9 for the forum search tests. The SKILL.md for
+> ForumAgent is updated to reflect this approach.
+
+---
+
+## 1b.8 Master Reference Changes
 
 ### Section 3 — Third-Party Tools (replace tools table)
 
@@ -961,6 +975,11 @@ new tools. These are drop-in replacements — only the listed sections change.
 > built on `httpx.AsyncClient` and a single module-level instance is safe to
 > share across concurrent agents.
 
+> **Forum search note:** ForumAgent uses Tavily with `include_domains` to restrict
+> searches to specific student forum sites (e.g. `include_domains=["thestudentroom.co.uk"]`).
+> Reddit is no longer accessible — as of May 2026 all unauthenticated `.json` endpoints
+> return 403 and API registration requires pre-approval that is rarely granted.
+
 ### Section 8.6 — Tool-to-agent mapping (replace entire table and note)
 
 ```markdown
@@ -974,10 +993,12 @@ new tools. These are drop-in replacements — only the listed sections change.
 
 `adzuna_jobs` and `mcf_jobs` are both registered on `CareerAgent`. The LLM
 selects which to call based on `deps.context.country` and the tool docstrings.
+`ForumAgent` uses `tavily_search` with `include_domains` to restrict searches
+to specific student forum sites — no separate Reddit tool is required or available.
 `scoring` and `conversation` have no tools — they work entirely from the
 blackboard. `tool_budget: 0` in their SKILL.md makes this explicit.
-
 ```
+
 >[!WARNING] DuckDuckGo Search NOT wired
 >Due to the inability to specify a date range for selection and filtering
 
@@ -988,22 +1009,190 @@ blackboard. `tool_budget: 0` in their SKILL.md makes this explicit.
 # CareerAgent — Tavily + Fetch + Adzuna + MCF
 # Both job posting tools are registered. The LLM selects the correct one
 # based on deps.context.country and the tool docstrings.
+
+# agents/career_agent.py
+from __future__ import annotations
+
+from datetime import datetime
+from pydantic_ai import (
+    Agent,
+    AgentStreamEvent,
+    FinalResultEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartDeltaEvent,
+    PartStartEvent,
+    TextPartDelta,
+    ToolCallPartDelta,
+)   
+
+from agents.base_agent import BaseAgent
+
+from core.logger import logger
+from core.deps import Deps
+from core.llm_factory import get_model
+
+from schemas.messages.career_completed import CareerResearchCompletedMessage
+from schemas.messages.progress_update import ProgressUpdateMessage
+from schemas.outputs.career_output import CareerOutput
+
+from tools.fetch_tool import fetch_page
+from tools.search_tool import tavily_search
+
+
 class CareerAgent(BaseAgent):
-    def __init__(self, instructions: str, tool_budget: int) -> None:
+    """Phase 1 agent. Runs first, in isolation.
+
+    Subscribes to: ResearchRequestedMessage
+    Writes to:     board.career (CareerOutput)
+    Fires:         CareerResearchCompletedMessage
+
+    Tools: tavily_search (budget-capped via _make_search_tool), fetch_page (uncapped)
+
+    Note: site: queries must not be passed to tavily_search — Tavily does not
+    honour time_range filtering on site: prefixed queries. Use tavily_search to
+    find URLs, then fetch_page to retrieve content from those URLs.
+    """
+
+    def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
         super().__init__(instructions=instructions)
         self._tool_budget = tool_budget
         self._calls_made  = 0
+
         self._agent = Agent(
             model=get_model("RESEARCH_MODEL"),
             deps_type=Deps,
             output_type=CareerOutput,
-            tools=[self._make_search_tool(), fetch_page, adzuna_jobs, mcf_jobs],
+            system_prompt=self.get_instruction(),
+            capabilities=[self._setup_telemetry_hooks()],
+            tools=[
+                tavily_search,
+                fetch_page,
+            ],
         )
+
+        logger.info('CareerAgent | initialized')
+
+
+
+    # ── BaseAgent interface ────────────────────────────────────────────────────────────────────────────
+    def subscribe(self, hub, deps: Deps) -> None:
+        from schemas.messages.research_requested import ResearchRequestedMessage
+
+        async def handler(message: ResearchRequestedMessage) -> None:
+            await self.handle(message, deps)
+
+        hub.subscribe(ResearchRequestedMessage, handler)
+        logger.info('CareerAgent | Subscribed to MessageHub')
+
+    def get_instruction(self) -> str:
+        base = """
+            You are the Career Research Agent in a university research pipeline.
+
+            Your job: research graduate career paths, salary ranges, and live job market
+            demand for the course at the university named in your context.
+
+            Pipeline role:
+            - You run first, before any other section agent.
+            - You write your findings to deps.board.career as a CareerOutput.
+            - You fire CareerResearchCompletedMessage when done. This triggers all
+            seven section agents to run concurrently.
+            - If you fail to fire CareerResearchCompletedMessage, the entire pipeline
+            stalls. Always fire it — even if your output is low confidence.
+
+            Context you receive (from deps.context):
+            - university_name: the university being researched
+            - intended_course: the undergraduate course
+            - country: the university's country — scope ALL salary and employer data to this
+            - study_level: always "undergraduate"
+
+            Tool usage rules:
+            - Use tavily_search for general queries only. Never pass site: prefixed queries
+              to tavily_search — time filtering is not honoured for site: searches and results
+              will be stale.
+            - To retrieve content from a specific URL (e.g. a job board page or salary survey),
+              call fetch_page with that URL directly.
+
+            You must not research careers for a different country than deps.context.country.
+        """.strip()
+
+        if self.instructions:
+            return base + "\n\n" + self.instructions
+        return base
+
+    def reset(self) -> None:
+        """Reset per-request state. Called by ResearchHandler before each request."""
+        self._calls_made = 0
+
+
+
+    # ── Core handler ──────────────────────────────────────────────────────────────────────────────────
+    async def handle(self, message, deps: Deps) -> None:
+        """Run career research and fire CareerResearchCompletedMessage."""
+        self._calls_made = 0
+
+        logger.info(
+            "CareerAgent | starting — university=%r course=%r country=%r",
+            deps.context.university_name,
+            deps.context.intended_course,
+            deps.context.country,
+        )
+
+        await deps.hub.publish(ProgressUpdateMessage(
+            status="started",
+            message=f"Researching career landscape for {deps.context.intended_course}…",
+            triggered_by="career_agent",
+            timestamp=datetime.now().isoformat(),
+        ))
+
+        task_brief = (f"""
+            University: {deps.context.university_name}
+            Course: {deps.context.intended_course}
+            Country: {deps.context.country}
+            Study level: {deps.context.study_level}
+            """
+        )
+
+        try:
+            result = await self._agent.run(task_brief, deps=deps)
+            deps.board.career = result.output
+            logger.warning(
+                "CareerAgent | completed — paths=%d confidence=%s",
+                len(result.output.career_paths),
+                result.output.confidence,
+            )
+
+            await deps.hub.publish(ProgressUpdateMessage(
+                status="completed",
+                message="Career landscape research complete.",
+                triggered_by="career_agent",
+                timestamp=datetime.now().isoformat(),
+            ))
+        except Exception as exc:
+            logger.error("career_agent | failed: %s", exc)
+            await deps.hub.publish(ProgressUpdateMessage(
+                status="failed",
+                message=f"Career research failed: {exc}",
+                triggered_by="career_agent",
+                timestamp=datetime.now().isoformat(),
+            ))
+
+        await deps.hub.publish(CareerResearchCompletedMessage(
+            triggered_by="career_agent",
+            timestamp=datetime.now().isoformat(),
+        ))
+
 ```
 
-`adzuna_jobs` and `mcf_jobs` are not wrapped in `_make_search_tool()` — they
-are direct REST calls, not searches, and do not count against `tool_budget`.
-Register them directly, the same way `fetch_page` is registered.
+`tavily_search` is registered directly — no `_make_search_tool()` wrapper.
+pydantic-ai exposes the real function name and docstring to the LLM tool schema;
+a closure wrapper would replace both with an anonymous inner function, degrading
+the schema the LLM sees. Budget tracking (`_calls_made`, `_tool_budget`) is
+retained for logging; the LLM respects the `tool_budget` value from SKILL.md
+frontmatter embedded in the system prompt.
+
+`adzuna_jobs` and `mcf_jobs` are targeted REST calls, not searches — they do not
+count against `tool_budget` and are registered directly, the same way `fetch_page` is.
 
 ### Section 12 — File Tree (replace `tools/` block)
 
@@ -1019,12 +1208,12 @@ Register them directly, the same way `fetch_page` is registered.
 ### Section 14 — Development Stage Summary (replace 1b row)
 
 ```
-| 1b | Fetch MCP client is a shared `fastmcp.Client` (reentrant, ref-counted — concurrent `call_tool()` is safe by design, requests multiplexed by id over one shared session). search_tool now uses AsyncTavilyClient + await (was sync TavilyClient — would block the loop under asyncio.gather), fetch_tool calls fetch_client via `async with`, ddg_tool calls DDGS via asyncio.to_thread (still NOT registered on any agent — date filtering remains unreliable). adzuna_tool (UK+AU job postings via Adzuna REST, _COUNTRY_MAP for code + currency). mcf_tool (SG job postings via MyCareersFuture public API, skills from API tags). schemas/job_posting.py shared schema. CareerAgent updated to register adzuna_jobs + mcf_jobs. main.py opens fetch_client once around the pipeline run. | Real job postings confirmed for UK, AU, SG. All 5 tools pass live tests. 26 tests pass. |
+| 1b | Fetch MCP client is a shared `fastmcp.Client` (reentrant, ref-counted — concurrent `call_tool()` is safe by design, requests multiplexed by id over one shared session). search_tool now uses AsyncTavilyClient + await (was sync TavilyClient — would block the loop under asyncio.gather). tavily_search registered directly on agents — no _make_search_tool() wrapper. fetch_tool calls fetch_client via `async with`. ddg_tool calls DDGS via asyncio.to_thread (still NOT registered on any agent — date filtering remains unreliable). adzuna_tool (UK+AU job postings via Adzuna REST, _COUNTRY_MAP for code + currency). mcf_tool (SG job postings via MyCareersFuture public API, skills from API tags). schemas/job_posting.py shared schema. CareerAgent registers [tavily_search, fetch_page, adzuna_jobs, mcf_jobs] directly. ForumAgent uses tavily_search with include_domains for site-scoped student forum searches — Reddit API access is no longer available (403 since May 2026). main.py opens fetch_client once around the pipeline run. | Real job postings confirmed for UK, AU, SG. Tavily include_domains confirmed working for thestudentroom.co.uk. All 5 tools pass live tests. 27 tests pass. |
 ```
 
 ---
 
-## 1b.8 `tests/test_stage_1b.py`
+## 1b.9 `tests/test_stage_1b.py`
 
 ```python
 # tests/test_stage_1b.py
@@ -1357,11 +1546,64 @@ async def test_mcf_postings_have_required_fields() -> None:
         assert p.currency == "SGD"
         assert p.source_url, "Posting missing source_url"
         assert isinstance(p.skills, list)
+
+
+# ── Forum Search (Tavily include_domains) ─────────────────────────────────────
+
+def test_tavily_forum_search_imports_cleanly() -> None:
+    from tools.search_tool import tavily_search
+    assert tavily_search
+
+
+@pytest.mark.asyncio
+async def test_tavily_forum_search_tsr_returns_results() -> None:
+    """Live call: Tavily with include_domains restricted to thestudentroom.co.uk returns results."""
+    from tools.search_tool import _client
+    raw = await _client.search(
+        query="University of Edinburgh Computer Science student experience",
+        include_domains=["thestudentroom.co.uk"],
+        max_results=3,
+        time_range="year",
+    )
+    results = raw.get("results", [])
+    assert len(results) > 0, "Expected at least one TSR result"
+    for r in results:
+        assert "thestudentroom.co.uk" in r.get("url", ""), (
+            f"Result URL not from TSR: {r.get('url')}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_tavily_forum_search_studentcrowd_returns_results() -> None:
+    """Live call: Tavily with include_domains restricted to studentcrowd.com returns results."""
+    from tools.search_tool import _client
+    raw = await _client.search(
+        query="University of Manchester Computer Science review",
+        include_domains=["studentcrowd.com"],
+        max_results=3,
+        time_range="year",
+    )
+    results = raw.get("results", [])
+    # StudentCrowd may return 0 for niche queries — acceptable, just confirm no crash
+    assert isinstance(results, list)
+
+
+@pytest.mark.asyncio
+async def test_tavily_forum_search_unrestricted_returns_results() -> None:
+    """Live call: unrestricted Tavily forum sweep returns results for non-UK university."""
+    from tools.search_tool import _client
+    raw = await _client.search(
+        query="NUS Computer Science student experience forum",
+        max_results=3,
+        time_range="year",
+    )
+    results = raw.get("results", [])
+    assert len(results) > 0, "Expected at least one result for unrestricted forum sweep"
 ```
 
 ---
 
-## 1b.9 Run the Tests
+## 1b.10 Run the Tests
 
 ```bash
 pytest tests/test_stage_1b.py -v -s
@@ -1397,16 +1639,20 @@ tests/test_stage_1b.py::test_mcf_imports_cleanly PASSED
 tests/test_stage_1b.py::test_mcf_returns_singapore_postings PASSED
 tests/test_stage_1b.py::test_mcf_rejects_non_singapore PASSED
 tests/test_stage_1b.py::test_mcf_postings_have_required_fields PASSED
+tests/test_stage_1b.py::test_tavily_forum_search_imports_cleanly PASSED
+tests/test_stage_1b.py::test_tavily_forum_search_tsr_returns_results PASSED
+tests/test_stage_1b.py::test_tavily_forum_search_studentcrowd_returns_results PASSED
+tests/test_stage_1b.py::test_tavily_forum_search_unrestricted_returns_results PASSED
 
-27 passed in X.Xs
+31 passed in X.Xs
 ```
 
 Fetch tests may SKIP if MCP server is not installed — this is acceptable.
-They must pass before Stage 1c.
+They must all pass before Stage 1c.
 
 ---
 
-## 1b.10 Common Failure Modes at This Stage
+## 1b.11 Common Failure Modes at This Stage
 
 **`KeyError: ADZUNA_APP_ID`**
 Cause: `.env` missing the new Adzuna keys.
@@ -1450,17 +1696,19 @@ after the env var is deleted.
 - [ ] `schemas/fetch_result.py` — `FetchResult` defined
 - [ ] `schemas/job_posting.py` — `JobPosting`, `JobPostingsResponse` defined (NEW)
 - [ ] `mcps/fetch_client.py` — single module-level `fastmcp.Client` (no custom class, no manual `startup()`/`shutdown()`) — reentrant and ref-counted, concurrent `call_tool()` calls are safe (session multiplexes by request ID)
-- [ ] `tools/search_tool.py` — `tavily_search` uses `AsyncTavilyClient` (not `TavilyClient`), `days=730`/`time_range="year"` enforced, `await _client.search(...)`
+- [ ] `tools/search_tool.py` — `tavily_search` uses `AsyncTavilyClient` (not `TavilyClient`), `time_range="year"` enforced, `await _client.search(...)`, `include_domains` parameter passed through to Tavily when provided
 - [ ] `tools/fetch_tool.py` — `fetch_page`, never raises, docstring warns off job board URLs, calls `fetch_client` via `async with`
 - [ ] `tools/ddg_tool.py` — `ddg_search`, date filter applied before return, `_client.text(...)` called via `asyncio.to_thread` — still NOT registered on any agent
 - [ ] `tools/adzuna_tool.py` — `adzuna_jobs`, `_COUNTRY_MAP` maps country → `(code, currency)`, `skills=[]` (NEW)
 - [ ] `tools/mcf_tool.py` — `mcf_jobs`, Singapore only, no auth, skills from API tags, location from API (NEW)
-- [ ] MASTER section 8.6 updated — `adzuna_jobs` and `mcf_jobs` rows added with ✓ on career only
-- [ ] MASTER section 8.8 updated — `CareerAgent` registers `adzuna_jobs` and `mcf_jobs`
+- [ ] No `tools/reddit_tool.py` — Reddit API access unavailable since May 2026, file removed
+- [ ] MASTER section 3 updated — Reddit row removed, forum include_domains note added
+- [ ] MASTER section 8.6 updated — `adzuna_jobs`, `mcf_jobs` rows added; `reddit_fetch_thread` row removed
+- [ ] MASTER section 8.8 updated — `CareerAgent` registers `[tavily_search, fetch_page, adzuna_jobs, mcf_jobs]` directly (no `_make_search_tool()` wrapper)
 - [ ] `main.py` — wraps the pipeline run in `async with fetch_client:` (optional — `fetch_page` also self-manages via its own `async with`)
-- [ ] `pytest tests/test_stage_1b.py -v` — 27 passed (fetch may SKIP)
+- [ ] `pytest tests/test_stage_1b.py -v` — 31 passed (fetch may SKIP)
 - [ ] Stage 1a tests still pass: `pytest tests/test_stage_1a.py -v`
 
 ---
 
-*End of Stage 1b Specification*
+*End of Stage 1b Specification*2

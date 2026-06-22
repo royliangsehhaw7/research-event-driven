@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 
+from mcp.types import TextContent
 from pydantic_ai import RunContext
 
 from core.deps import Deps
@@ -15,8 +15,11 @@ from schemas.fetch_result import FetchResult
 async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
     """Fetch a specific URL via the Fetch MCP server.
 
-    Use for university catalog pages, rankings pages, or any URL found
-    in search results when you need the full page content.
+    Use for university catalog pages, salary survey pages, or any URL
+    found in search results when you need the full page content.
+
+    Do NOT use for job board URLs (Indeed, Reed, LinkedIn) — these return
+    403/500. Use adzuna_jobs or mcf_jobs for job posting data instead.
 
     Does not count against tool_budget — targeted retrieval, not a search.
 
@@ -25,20 +28,23 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
 
     Returns:
         JSON string containing url, content, status, and optional error.
-        Never raises — returns status "error" on failure so the agent
-        can note the failure and continue.
+        Never raises — returns status "error" on failure.
     """
-
     try:
-        raw = await fetch_client.call_tool("fetch", {
-            "url": url,
-            "max_length": 50000,   # characters — enough for a full catalog page
-        })
-        result = FetchResult(url=url, content=str(raw), status="ok", error=None)
-        logger.warning("fetch_tool | fetched %r — %d chars", url, len(result.content))
+        async with fetch_client:
+            raw = await fetch_client.call_tool("fetch", {
+                "url": url,
+                "max_length": 50000,
+            })
+
+        content = "".join(
+            block.text for block in raw.content if isinstance(block, TextContent)
+        )
+        result = FetchResult(url=url, content=content, status="ok", error=None)
+        logger.info("fetch_tool | fetched %r — %d chars", url, len(result.content))
 
     except Exception as exc:
-        logger.error("fetch_tool | fetch failed for %r: %s", url, exc)
+        logger.error("fetch_tool | failed for %r: %s", url, exc)
         result = FetchResult(url=url, content="", status="error", error=str(exc))
 
     return json.dumps({

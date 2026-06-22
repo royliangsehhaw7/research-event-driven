@@ -141,6 +141,15 @@ This file carries all domain knowledge for `CareerAgent`. The Python class
 carries only structural context (what it writes, what it fires). Changing
 how the agent researches careers means editing this file, not touching Python.
 
+This is the single canonical copy of `skills/career/SKILL.md` — the version
+in the Stage 1a architecture overview should be made identical to this one,
+not maintained separately. It previously diverged in two ways: 1a's draft
+included a "Tools" section and a "Tool Usage Strategy" section (the
+retry-once rule, the don't-fetch-job-boards rule) that this file was
+missing, so they're merged in below. 1a's draft also told `fetch_page` not
+to use it "for Reddit URLs" — that's `ForumAgent` territory, not
+`CareerAgent`'s, and has been dropped here as a copy-paste leftover.
+
 ```markdown
 ---
 key: career
@@ -153,6 +162,41 @@ section_name: career
 You research graduate career outcomes for the supplied course at the
 supplied university. Your output scopes all findings to the university's
 country. You never research careers for a different country.
+
+## Tools
+
+You have four tools. Each has a specific role — do not substitute one for another:
+
+- `tavily_search` — web search. Use for career paths, salary ranges, and
+  general labour market research. Every call costs 1 tool budget credit.
+  Budget: 8 total across all `tavily_search` calls this run.
+- `fetch_page` — fetches a specific URL in full. Use after `tavily_search`
+  returns a promising URL you need to read (e.g. a salary survey page, a
+  graduate destinations report). Does NOT count against `tool_budget`.
+  Do NOT use for job board URLs — Indeed, Reed, and LinkedIn block automated
+  fetches.
+- `adzuna_jobs` — live job postings API. Call this when `deps.context.country`
+  is "UK" or "Australia". Do NOT call for Singapore. Does NOT count against
+  `tool_budget`.
+- `mcf_jobs` — live job postings API for Singapore only via MyCareersFuture
+  (Singapore government portal). Call this when `deps.context.country` is
+  "Singapore". Do NOT call for UK or Australia. Does NOT count against
+  `tool_budget`.
+
+**Job posting tool routing — mandatory, no exceptions:**
+
+| `deps.context.country` | Job posting tool to call |
+|---|---|
+| "UK" | `adzuna_jobs` |
+| "Australia" | `adzuna_jobs` |
+| "Singapore" | `mcf_jobs` |
+
+Never use `tavily_search` to find job postings — job boards block Tavily
+fetch access and results will be empty or stale. Always use `adzuna_jobs`
+or `mcf_jobs`.
+
+This table is the single source of truth for job-posting tool routing.
+It is not restated in `agents/career_agent.py` — see 1c.3 for why.
 
 ## What to Research
 
@@ -179,16 +223,11 @@ general salary data. Useful query patterns:
 - "graduate scheme {course} salary {country}"
 
 **Live job posting snapshot:**
-Use the `adzuna_jobs` tool (UK or Australia) or `mcf_jobs` tool (Singapore)
-to retrieve live job postings. Do NOT use `tavily_search` for job postings —
-job boards block Tavily fetch access and results will be empty or stale.
-
-Select the correct tool based on the country in your context:
-- UK or Australia → call `adzuna_jobs` with a query like "{course} graduate {country}"
-- Singapore → call `mcf_jobs` with a query like "{course} graduate"
-
-Extract from the returned postings: company names, role titles, required
-skills, dates posted. These go directly into `job_postings` on your output.
+Call the correct job posting tool per the routing table above, using a query
+matching the course's most common graduate role — e.g. "software engineer
+graduate" for Computer Science. Extract from the returned postings: company
+names, role titles, required skills, dates posted, and salary ranges where
+provided. These go directly into `job_postings` on your output.
 
 **In-demand skills:**
 Extract skill keywords from the job postings returned by `adzuna_jobs` or
@@ -245,6 +284,16 @@ penalise for missing salary data or unconfirmed career paths.
 "Computer Science" maps cleanly to "Software Engineer". "MEng Aeronautical
 Engineering with a Year in Industry" does not. Parse the core discipline
 from the course name and search for that.
+
+## Tool Usage Strategy
+
+**Do not retry a failed query more than once.** If a salary query returns 0
+results, move on to the next career path — do not rephrase and retry the
+same topic.
+
+**Do not fetch job board pages directly.** Indeed, Reed, and LinkedIn block
+automated fetches. Use `adzuna_jobs` or `mcf_jobs` for job posting data —
+never `tavily_search` or `fetch_page` for job postings.
 ```
 
 ---
@@ -259,23 +308,31 @@ carefully before writing any other agent.
 # agents/career_agent.py
 from __future__ import annotations
 
-import logging
 from datetime import datetime
-
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import (
+    Agent,
+    AgentStreamEvent,
+    FinalResultEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartDeltaEvent,
+    PartStartEvent,
+    TextPartDelta,
+    ToolCallPartDelta,
+)   
 
 from agents.base_agent import BaseAgent
+
+from core.logger import logger
 from core.deps import Deps
 from core.llm_factory import get_model
+
 from schemas.messages.career_completed import CareerResearchCompletedMessage
 from schemas.messages.progress_update import ProgressUpdateMessage
 from schemas.outputs.career_output import CareerOutput
+
 from tools.fetch_tool import fetch_page
 from tools.search_tool import tavily_search
-from tools.adzuna_tool import adzuna_jobs
-from tools.mcf_tool import mcf_jobs
-
-logger = logging.getLogger("career_agent")
 
 
 class CareerAgent(BaseAgent):
@@ -285,13 +342,14 @@ class CareerAgent(BaseAgent):
     Writes to:     board.career (CareerOutput)
     Fires:         CareerResearchCompletedMessage
 
-    Tools: tavily_search (uncapped, budget tracked via _calls_made),
-           fetch_page (uncapped — targeted retrieval),
-           adzuna_jobs (UK + AU job postings),
-           mcf_jobs (SG job postings)
+    Tools: tavily_search (budget-capped via _make_search_tool), fetch_page (uncapped)
+
+    Note: site: queries must not be passed to tavily_search — Tavily does not
+    honour time_range filtering on site: prefixed queries. Use tavily_search to
+    find URLs, then fetch_page to retrieve content from those URLs.
     """
 
-    def __init__(self, instructions: str = "", tool_budget: int = 8) -> None:
+    def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
         super().__init__(instructions=instructions)
         self._tool_budget = tool_budget
         self._calls_made  = 0
@@ -301,16 +359,18 @@ class CareerAgent(BaseAgent):
             deps_type=Deps,
             output_type=CareerOutput,
             system_prompt=self.get_instruction(),
+            capabilities=[self._setup_telemetry_hooks()],
             tools=[
                 tavily_search,
                 fetch_page,
-                adzuna_jobs,
-                mcf_jobs,
             ],
         )
 
-    # ── BaseAgent interface ───────────────────────────────────────────────────
+        logger.info('CareerAgent | initialized')
 
+
+
+    # ── BaseAgent interface ────────────────────────────────────────────────────────────────────────────
     def subscribe(self, hub, deps: Deps) -> None:
         from schemas.messages.research_requested import ResearchRequestedMessage
 
@@ -318,6 +378,7 @@ class CareerAgent(BaseAgent):
             await self.handle(message, deps)
 
         hub.subscribe(ResearchRequestedMessage, handler)
+        logger.info('CareerAgent | Subscribed to MessageHub')
 
     def get_instruction(self) -> str:
         base = """
@@ -340,10 +401,12 @@ class CareerAgent(BaseAgent):
             - country: the university's country — scope ALL salary and employer data to this
             - study_level: always "undergraduate"
 
-            Tool selection for job postings:
-            - UK or Australia → use adzuna_jobs
-            - Singapore → use mcf_jobs
-            - Do NOT use tavily_search for job postings — job boards block Tavily.
+            Tool usage rules:
+            - Use tavily_search for general queries only. Never pass site: prefixed queries
+              to tavily_search — time filtering is not honoured for site: searches and results
+              will be stale.
+            - To retrieve content from a specific URL (e.g. a job board page or salary survey),
+              call fetch_page with that URL directly.
 
             You must not research careers for a different country than deps.context.country.
         """.strip()
@@ -356,14 +419,15 @@ class CareerAgent(BaseAgent):
         """Reset per-request state. Called by ResearchHandler before each request."""
         self._calls_made = 0
 
-    # ── Core handler ─────────────────────────────────────────────────────────
 
+
+    # ── Core handler ──────────────────────────────────────────────────────────────────────────────────
     async def handle(self, message, deps: Deps) -> None:
         """Run career research and fire CareerResearchCompletedMessage."""
-        self._calls_made = 0   # reset counter on each run
+        self._calls_made = 0
 
         logger.info(
-            "career_agent | starting — university=%r course=%r country=%r",
+            "CareerAgent | starting — university=%r course=%r country=%r",
             deps.context.university_name,
             deps.context.intended_course,
             deps.context.country,
@@ -376,24 +440,23 @@ class CareerAgent(BaseAgent):
             timestamp=datetime.now().isoformat(),
         ))
 
-        task_brief = (
-            f"University: {deps.context.university_name}\n"
-            f"Course: {deps.context.intended_course}\n"
-            f"Country: {deps.context.country}\n"
-            f"Study level: {deps.context.study_level}\n\n"
-            "Research graduate career paths, salary ranges in local currency, "
-            "and live job market demand. Scope all findings to the country above. "
-            "Use adzuna_jobs (UK/Australia) or mcf_jobs (Singapore) for job postings."
+        task_brief = (f"""
+            University: {deps.context.university_name}
+            Course: {deps.context.intended_course}
+            Country: {deps.context.country}
+            Study level: {deps.context.study_level}
+            """
         )
 
         try:
             result = await self._agent.run(task_brief, deps=deps)
             deps.board.career = result.output
-            logger.info(
-                "career_agent | completed — paths=%d confidence=%s",
+            logger.warning(
+                "CareerAgent | completed — paths=%d confidence=%s",
                 len(result.output.career_paths),
                 result.output.confidence,
             )
+
             await deps.hub.publish(ProgressUpdateMessage(
                 status="completed",
                 message="Career landscape research complete.",
@@ -408,14 +471,39 @@ class CareerAgent(BaseAgent):
                 triggered_by="career_agent",
                 timestamp=datetime.now().isoformat(),
             ))
-            # Still fire the completed message so the pipeline does not stall.
-            # board.career remains None — downstream agents handle this.
 
         await deps.hub.publish(CareerResearchCompletedMessage(
             triggered_by="career_agent",
             timestamp=datetime.now().isoformat(),
         ))
+
 ```
+
+**Why `get_instruction()` is one line of `base` plus the SKILL.md body:**
+Earlier drafts of this method restated pipeline mechanics ("you fire
+CareerResearchCompletedMessage", "you write to deps.board.career"), the
+`deps.context` field names, and the job-posting tool routing rule directly
+in `base`. All three were redundant in a way that actively risked drift:
+
+- The LLM has no tool to fire messages or write to the blackboard —
+  `handle()` does both unconditionally regardless of the LLM's output.
+  Telling the LLM about it doesn't change what it does.
+- `deps.context` values arrive as plain text in `task_brief` every run.
+  Listing the field *names* in the system prompt adds nothing the LLM
+  doesn't already see with real data attached.
+- The job-posting routing rule was stated three times across this codebase
+  (`base`, `task_brief`, and `skills/career/SKILL.md`) before this rework,
+  plus a fourth and fifth time implicitly via the `adzuna_jobs`/`mcf_jobs`
+  tool docstrings in Stage 1b, which pydantic-ai already surfaces to the
+  LLM as part of the tool schema. Five sources of truth for one rule is
+  how `ForumAgent`'s `site:` instruction ended up contradicting its own
+  SKILL.md in Stage 1f — duplicated instructions don't stay in sync.
+
+The fix: `base` carries only agent identity. Every domain rule — what to
+research, which tool to call when, the country-scoping constraint, quality
+bars — lives in `skills/career/SKILL.md` exactly once. `task_brief` carries
+only the per-request data values (university, course, country, study level),
+not restated rules.
 
 **Why `tavily_search` is registered directly, not wrapped in a closure:**
 `tavily_search` from `tools/search_tool.py` is a fully-formed pydantic-ai tool
@@ -447,60 +535,7 @@ always is the correct behaviour.
 
 ---
 
-## 1c.4 `core/llm_factory.py`
-
-`CareerAgent` calls `get_model("RESEARCH_MODEL")`. This function reads from
-environment variables and returns a pydantic-ai model object. Implement it
-now — it is used by every agent.
-
-```python
-# core/llm_factory.py
-from __future__ import annotations
-
-import os
-from dotenv import load_dotenv
-from pydantic_ai.models.openai import OpenAIModel
-from pydantic_ai.providers.openai import OpenAIProvider
-
-load_dotenv()
-
-_KNOWN_VARS = ("RESEARCH_MODEL", "SCORING_MODEL", "CONVERSATION_MODEL")
-
-
-def get_model(env_var: str) -> OpenAIModel:
-    """Return a pydantic-ai model configured for OpenRouter.
-
-    Reads the model string from the named environment variable.
-    Reads OPENROUTER_API_KEY and OPENROUTER_BASE_URL from .env.
-
-    Args:
-        env_var: one of "RESEARCH_MODEL", "SCORING_MODEL", "CONVERSATION_MODEL"
-
-    Raises:
-        EnvironmentError: if any required env var is missing.
-    """
-    model_name = os.getenv(env_var)
-    if not model_name:
-        raise EnvironmentError(
-            f"{env_var} not set. Add it to .env — "
-            f"e.g. {env_var}=openrouter/google/gemini-2.5-pro"
-        )
-
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise EnvironmentError(
-            "OPENROUTER_API_KEY not set. Get a key at https://openrouter.ai"
-        )
-
-    base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-
-    provider = OpenAIProvider(base_url=base_url, api_key=api_key)
-    return OpenAIModel(model_name, provider=provider)
-```
-
----
-
-## 1c.5 Minimal `services/research_handler.py`
+## 1c.4 Minimal `services/research_handler.py`
 
 At Stage 1c, `ResearchHandler` constructs and wires `CareerAgent` only.
 No section agents. No scoring. No report. It exists to confirm the full
@@ -598,7 +633,7 @@ focused on the agent pattern, not on utility functions.
 
 ---
 
-## 1c.6 `main.py` — CLI Entry Point
+## 1c.5 `main.py` — CLI Entry Point
 
 `main.py` opens the shared fetch client around the run, creates the handler,
 runs one request, and prints `board.career` to stdout. This is the
@@ -670,7 +705,7 @@ the tool modules.
 
 ---
 
-## 1c.7 `schemas/messages/research_requested.py`
+## 1c.6 `schemas/messages/research_requested.py`
 
 This message already exists from Stage 1a. Confirm it has `country` on it —
 `CareerAgent`'s closure receives this and passes it to `ResearchContext`.
@@ -804,6 +839,19 @@ def test_get_instruction_includes_skill_body() -> None:
     assert "Career Research Agent" in prompt
 
 
+def test_get_instruction_base_carries_no_domain_rules() -> None:
+    """Domain rules (tool routing, country scoping, ...) must live only in
+    SKILL.md. If this fails, someone re-added a duplicated rule to `base` —
+    see the Stage 1c rework note on why that's the bug we keep hitting."""
+    from agents.career_agent import CareerAgent
+    agent = CareerAgent(instructions="")  # base only, no SKILL.md body
+    prompt = agent.get_instruction()
+    assert "adzuna_jobs" not in prompt
+    assert "mcf_jobs" not in prompt
+    assert "tavily_search" not in prompt
+    assert "country" not in prompt.lower()
+
+
 # ── Hub wiring ────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -930,11 +978,12 @@ tests/test_stage_1c.py::test_career_agent_constructs PASSED
 tests/test_stage_1c.py::test_career_agent_default_tool_budget_is_8 PASSED
 tests/test_stage_1c.py::test_career_agent_reset_clears_calls_made PASSED
 tests/test_stage_1c.py::test_get_instruction_includes_skill_body PASSED
+tests/test_stage_1c.py::test_get_instruction_base_carries_no_domain_rules PASSED
 tests/test_stage_1c.py::test_career_agent_subscribes_to_research_requested PASSED
 tests/test_stage_1c.py::test_career_agent_populates_board_career PASSED
 tests/test_stage_1c.py::test_career_agent_fires_completed_message PASSED
 
-10 passed in X.Xs
+11 passed in X.Xs
 ```
 
 The last two tests make real API calls. They take 10–30 seconds depending on
@@ -1032,20 +1081,25 @@ can happen for niche courses or when Tavily returns sparse results. Inspect the
       `SalaryRange`, `CareerSource` implemented; `JobPosting` imported from
       `schemas/job_posting.py` (not redefined here)
 - [ ] `skills/career/SKILL.md` — frontmatter valid, `tool_budget: 8`,
-      instructions body directs agent to use `adzuna_jobs`/`mcf_jobs` for
-      job postings (not `tavily_search` site: queries)
+      includes the "Tools" section with the job-posting routing table and
+      the "Tool Usage Strategy" section (merged in from the Stage 1a draft —
+      confirm 1a's copy was updated to match, not left to diverge)
 - [ ] `core/llm_factory.py` — `get_model()` reads from env, returns
       pydantic-ai `OpenAIModel` configured for OpenRouter
 - [ ] `agents/career_agent.py` — `CareerAgent` implemented with `_calls_made = 0`,
       `tools=[tavily_search, fetch_page, adzuna_jobs, mcf_jobs]` (no `_make_search_tool`
-      wrapper), `subscribe()`, `get_instruction()`, `handle()`, `reset()`
+      wrapper), `subscribe()`, `get_instruction()`, `handle()`, `reset()`.
+      `get_instruction()`'s `base` is one identity line only — no restated
+      tool routing, no restated context field names, no restated pipeline
+      mechanics. `task_brief` carries data values only, not rules.
 - [ ] `services/research_handler.py` — minimal Stage 1c version — loads career
       skill, constructs `CareerAgent`, wires it, publishes trigger
 - [ ] `main.py` — `load_dotenv()` first, wraps the run in
       `async with fetch_client:`, prints `board.career`
 - [ ] `schemas/messages/research_requested.py` — `country` field confirmed present
 - [ ] `schemas/messages/career_completed.py` — no-payload message confirmed
-- [ ] `pytest tests/test_stage_1c.py -v` — 10 passed (one new test added)
+- [ ] `pytest tests/test_stage_1c.py -v` — 11 passed (includes the new
+      `test_get_instruction_base_carries_no_domain_rules` regression test)
 - [ ] `python main.py` — `board.career` printed with real data, `confidence`
       is `"high"` or `"medium"` for University of Manchester Computer Science
 - [ ] Stage 1b tests still pass: `pytest tests/test_stage_1b.py -v`

@@ -1,9 +1,6 @@
 # agents/career_agent.py
 from __future__ import annotations
 
-
-
-
 from datetime import datetime
 from pydantic_ai import (
     Agent,
@@ -55,6 +52,7 @@ class CareerAgent(BaseAgent):
             deps_type=Deps,
             output_type=CareerOutput,
             system_prompt=self.get_instruction(),
+            capabilities=[self._setup_telemetry_hooks()],
             tools=[
                 tavily_search,
                 fetch_page,
@@ -70,7 +68,7 @@ class CareerAgent(BaseAgent):
         from schemas.messages.research_requested import ResearchRequestedMessage
 
         async def handler(message: ResearchRequestedMessage) -> None:
-            await self.handle_async(message, deps)
+            await self.handle(message, deps)
 
         hub.subscribe(ResearchRequestedMessage, handler)
         logger.info('CareerAgent | Subscribed to MessageHub')
@@ -113,6 +111,7 @@ class CareerAgent(BaseAgent):
     def reset(self) -> None:
         """Reset per-request state. Called by ResearchHandler before each request."""
         self._calls_made = 0
+
 
 
     # ── Core handler ──────────────────────────────────────────────────────────────────────────────────
@@ -172,91 +171,92 @@ class CareerAgent(BaseAgent):
         ))
 
 
+
+
+
     # ── Core handler (async) ───────────────────────────────────────────────────────────────────────────
- 
-        
-    async def handle_async(self, message, deps: Deps) -> None:
-        self._calls_made = 0
+    # async def handle_async(self, message, deps: Deps) -> None:
+    #     self._calls_made = 0
 
-        logger.info(
-            "CareerAgent | starting — university=%r course=%r country=%r",
-            deps.context.university_name,
-            deps.context.intended_course,
-            deps.context.country,
-        )
+    #     logger.info(
+    #         "CareerAgent | starting — university=%r course=%r country=%r",
+    #         deps.context.university_name,
+    #         deps.context.intended_course,
+    #         deps.context.country,
+    #     )
 
-        await deps.hub.publish(ProgressUpdateMessage(
-            status="started",
-            message=f"Researching career landscape for {deps.context.intended_course}…",
-            triggered_by="career_agent",
-            timestamp=datetime.now().isoformat(),
-        ))
+    #     await deps.hub.publish(ProgressUpdateMessage(
+    #         status="started",
+    #         message=f"Researching career landscape for {deps.context.intended_course}…",
+    #         triggered_by="career_agent",
+    #         timestamp=datetime.now().isoformat(),
+    #     ))
 
-        task_brief = f"""
-            University: {deps.context.university_name}
-            Course: {deps.context.intended_course}
-            Country: {deps.context.country}
-            Study level: {deps.context.study_level}
-        """
+    #     task_brief = f"""
+    #         University: {deps.context.university_name}
+    #         Course: {deps.context.intended_course}
+    #         Country: {deps.context.country}
+    #         Study level: {deps.context.study_level}
+    #     """
 
-        try:
-            async with self._agent.run_stream_events(task_brief, deps=deps) as stream:
-                async for event in stream:
-                    if isinstance(event, FinalResultEvent):
-                        deps.board.career = event.result.output
-                    else:
-                        self._log_live_event(event)
+    #     try:
+    #         async with self._agent.run_stream_events(task_brief, deps=deps) as stream:
+    #             async for event in stream:
+    #                 if isinstance(event, FinalResultEvent):
+    #                     deps.board.career = event.result.output
+    #                 else:
+    #                     self._log_live_event(event)
 
-            logger.warning(
-                "CareerAgent | completed — paths=%d confidence=%s",
-                len(deps.board.career.career_paths),
-                deps.board.career.confidence,
-            )
+    #         logger.warning(
+    #             "CareerAgent | completed — paths=%d confidence=%s",
+    #             len(deps.board.career.career_paths),
+    #             deps.board.career.confidence,
+    #         )
 
-            await deps.hub.publish(ProgressUpdateMessage(
-                status="completed",
-                message="Career landscape research complete.",
-                triggered_by="career_agent",
-                timestamp=datetime.now().isoformat(),
-            ))
+    #         await deps.hub.publish(ProgressUpdateMessage(
+    #             status="completed",
+    #             message="Career landscape research complete.",
+    #             triggered_by="career_agent",
+    #             timestamp=datetime.now().isoformat(),
+    #         ))
 
-        except Exception as exc:
-            logger.error("career_agent | failed: %s", exc)
-            await deps.hub.publish(ProgressUpdateMessage(
-                status="failed",
-                message=f"Career research failed: {exc}",
-                triggered_by="career_agent",
-                timestamp=datetime.now().isoformat(),
-            ))
+    #     except Exception as exc:
+    #         logger.error("career_agent | failed: %s", exc)
+    #         await deps.hub.publish(ProgressUpdateMessage(
+    #             status="failed",
+    #             message=f"Career research failed: {exc}",
+    #             triggered_by="career_agent",
+    #             timestamp=datetime.now().isoformat(),
+    #         ))
 
-        await deps.hub.publish(CareerResearchCompletedMessage(
-            triggered_by="career_agent",
-            timestamp=datetime.now().isoformat(),
-        ))
+    #     await deps.hub.publish(CareerResearchCompletedMessage(
+    #         triggered_by="career_agent",
+    #         timestamp=datetime.now().isoformat(),
+    #     ))
 
 
-    def _log_live_event(self, event) -> None:
-        if isinstance(event, FunctionToolCallEvent):
-            logger.info(
-                "CareerAgent | [TOOL CALL] tool=%r args=%s",
-                event.part.tool_name,
-                event.part.args,
-            )
+    # def _log_live_event(self, event) -> None:
+    #     if isinstance(event, FunctionToolCallEvent):
+    #         logger.info(
+    #             "CareerAgent | [TOOL CALL] tool=%r args=%s",
+    #             event.part.tool_name,
+    #             event.part.args,
+    #         )
 
-        elif isinstance(event, FunctionToolResultEvent):
-            preview = str(event.part.content)[:300]
-            logger.info(
-                "CareerAgent | [TOOL RESULT] tool=%r → %r…",
-                event.part.tool_name,
-                preview,
-            )
+    #     elif isinstance(event, FunctionToolResultEvent):
+    #         preview = str(event.part.content)[:300]
+    #         logger.info(
+    #             "CareerAgent | [TOOL RESULT] tool=%r → %r…",
+    #             event.part.tool_name,
+    #             preview,
+    #         )
 
-        elif isinstance(event, PartStartEvent):
-            part_type = type(event.part).__name__
-            if part_type == 'TextPart':
-                logger.info("CareerAgent | [COT] reasoning started")
+    #     elif isinstance(event, PartStartEvent):
+    #         part_type = type(event.part).__name__
+    #         if part_type == 'TextPart':
+    #             logger.info("CareerAgent | [COT] reasoning started")
 
-        elif isinstance(event, PartDeltaEvent):
-            if isinstance(event.delta, TextPartDelta):
-                logger.debug("CareerAgent | [COT CHUNK] %r", event.delta.content_delta)
-            # ThinkingPartDelta skipped — too noisy
+    #     elif isinstance(event, PartDeltaEvent):
+    #         if isinstance(event.delta, TextPartDelta):
+    #             logger.debug("CareerAgent | [COT CHUNK] %r", event.delta.content_delta)
+    #         # ThinkingPartDelta skipped — too noisy

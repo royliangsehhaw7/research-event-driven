@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import logging
+from core.logger import logger
 from abc import ABC, abstractmethod
 
 from pydantic_ai import Agent
+from pydantic_ai.capabilities import Hooks
+from pydantic_ai.messages import ModelResponse, TextPart
 
 from core.message_hub import MessageHub
 from core.deps import Deps
+
 
 
 class BaseAgent(ABC):
@@ -25,14 +28,55 @@ class BaseAgent(ABC):
     def __init__(self, instructions: str = "") -> None:
         self.instructions = instructions
         self._agent: Agent | None = None   # constructed by subclass __init__
-        self._logger = logging.getLogger(self.__class__.__name__)
+
+        # Isolated request session metrics per-agent instance
+        self._current_cot_buffer: list[str] = []
 
     def reset(self) -> None:
         """Called before each request's subscribe loop. No-op by default.
         Subclasses that carry per-request state (e.g. a _fired flag) override this."""
         ...
 
+    def _setup_telemetry_hooks(self) -> Hooks:
+        """Helper factory method called by subclasses during Agent construction.
+        
+        Injects uniform logging behavior across all subclass agents.
+        """
+        hooks = Hooks()
 
+        @hooks.on.after_model_request
+        async def capture_turn_metrics(ctx, response: ModelResponse, **kwargs) -> ModelResponse:
+            # 1. Uniform fleet-wide token tracking (CORRECTED ATTRIBUTES)
+            if response.usage:
+                logger.warning(
+                    "[TOKENS] Input=%d | Output=%d | Total=%d",
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                    response.usage.total_tokens,
+                )
+            
+            # 2. Uniform fleet-wide COT harvesting
+            for part in response.parts:
+                if isinstance(part, TextPart) and part.content:
+                    self._current_cot_buffer.append(part.content)
+                elif type(part).__name__ == 'ThinkingPart' and hasattr(part, 'content'):
+                    thinking_content = getattr(part, 'content', '')
+                    self._current_cot_buffer.append(thinking_content)
+                    
+                    # -> ADD THIS LINE: Log the thinking block immediately for this turn
+                    if thinking_content:
+                        logger.info("\n[THINKING BLOCK]\n%s\n", thinking_content)
+                    
+            return response
+
+        return hooks
+
+    def flush_cot_log(self) -> str:
+        """Consolidates and returns the full COT buffer compiled across all LLM turns."""
+        return "\n".join(self._current_cot_buffer).strip()
+
+
+    
     @abstractmethod
     def subscribe(self, hub: MessageHub, deps: Deps) -> None:
         """Register this agent's handler(s) on the hub via closure.
@@ -46,7 +90,6 @@ class BaseAgent(ABC):
                 hub.subscribe(SomeMessage, handler)
         """
         ...
-
 
     @abstractmethod
     def get_instruction(self) -> str:

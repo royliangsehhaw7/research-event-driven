@@ -240,9 +240,9 @@ class Deps:
 
     Tool clients (Tavily, Fetch MCP) are NOT on Deps.
     Each tool owns its own client:
-      - Tavily: module-level singleton in tools/search_tool.py
-      - Fetch MCP: FetchClient singleton in mcp/fetch_client.py, exposed as
-        the module-level `fetch_client` instance
+      - Tavily: module-level AsyncTavilyClient singleton in tools/search_tool.py
+      - Fetch MCP: module-level fastmcp.Client singleton in mcps/fetch_client.py,
+        exposed as the module-level `fetch_client` instance
 
     tool_budget and calls_made are NOT on Deps — they live on each agent
     instance so concurrent agents manage their own counters independently.
@@ -480,7 +480,7 @@ class SalaryRange(BaseModel):
     country:      str   # must match ResearchContext.country
 
 
-class JobPosting(BaseModel):
+class JobPostingSnapshot(BaseModel):
     company:        str
     role_title:     str
     required_skills: list[str]
@@ -495,10 +495,10 @@ class CareerSource(BaseModel):
 
 
 class CareerOutput(BaseModel):
-    career_paths:    list[CareerPath]    # minimum 3
-    salary_ranges:   list[SalaryRange]  # one per career path
-    job_postings:    list[JobPosting]   # 10–15 minimum
-    in_demand_skills: list[str]         # top 5–8 extracted across postings
+    career_paths:    list[CareerPath]          # minimum 3
+    salary_ranges:   list[SalaryRange]         # one per career path
+    job_postings:    list[JobPostingSnapshot]  # 10–15 minimum, normalised from adzuna/mcf tools
+    in_demand_skills: list[str]               # top 5–8 extracted across postings
     sources:         list[CareerSource]
     confidence:      Literal["high", "medium", "low"]
     notes:           str
@@ -709,7 +709,7 @@ from typing import Literal
 
 class ForumSource(BaseModel):
     url:         str
-    platform:    str    # "thestudentroom", "studentcrowd", "whatuni", "quora", "reddit"
+    platform:    str    # "thestudentroom", "studentcrowd", "whatuni", "quora"
     year:        int
     poster_type: str    # "current_student" | "recent_graduate" | "former_student" | "prospective"
 
@@ -850,47 +850,161 @@ it is synthesis, not a section.
 ### **SKILL Implementations**
 
 #### `skills/career/SKILL.md`
+
+This must stay byte-identical to the version built out in Stage 1c (1c.2).
+Treat 1c.2 as canonical — if you're updating this file, update that one too,
+or better, point one at the other instead of keeping two copies. The two
+versions of this file previously drifted (a "Tools" section and a "Tool
+Usage Strategy" section existed only here; a `fetch_page` warning about
+Reddit URLs — which is `ForumAgent` territory — existed only here as a
+copy-paste leftover; "Tavily enforces days=730" here vs the tool's actual
+`time_range="year"` parameter from Stage 1b). See 1c.2 for the reconciled
+version.
+
 ```markdown
 ---
 key: career
 name: Career Research Agent
-description: Researches career paths, salary ranges, and live job postings for the given course in the university's country.
+description: Researches graduate career paths, salary ranges, and live job market for the course in the university's country.
 tool_budget: 8
 section_name: career
 ---
 
-## Role
-You are the first agent to run. Every other agent depends on the career
-context you establish. Research thoroughly before returning.
+You research graduate career outcomes for the supplied course at the
+supplied university. Your output scopes all findings to the university's
+country. You never research careers for a different country.
 
-## What to research
-- Realistic career paths a graduate of this course typically enters
-- Salary ranges for those careers in the university's country (not global)
-- A snapshot of live job postings matching those careers (10–15 minimum)
-- In-demand skills extracted from the postings
+## Tools
 
-## Query construction
-Always include: [course] + [career/jobs/salary] + [country]
-Never query on [university name] alone — career paths are course-level.
+You have four tools. Each has a specific role — do not substitute one for another:
 
-Examples:
-- "Computer Science graduate careers UK salary 2024"
-- "Computer Science jobs London entry level 2024"
-- "Psychology graduate employment Australia salary range"
+- `tavily_search` — web search. Use for career paths, salary ranges, and
+  general labour market research. Every call costs 1 tool budget credit.
+  Budget: 8 total across all `tavily_search` calls this run.
+- `fetch_page` — fetches a specific URL in full. Use after `tavily_search`
+  returns a promising URL you need to read (e.g. a salary survey page, a
+  graduate destinations report). Does NOT count against `tool_budget`.
+  Do NOT use for job board URLs — Indeed, Reed, and LinkedIn block automated
+  fetches.
+- `adzuna_jobs` — live job postings API. Call this when `deps.context.country`
+  is "UK" or "Australia". Do NOT call for Singapore. Does NOT count against
+  `tool_budget`.
+- `mcf_jobs` — live job postings API for Singapore only via MyCareersFuture
+  (Singapore government portal). Call this when `deps.context.country` is
+  "Singapore". Do NOT call for UK or Australia. Does NOT count against
+  `tool_budget`.
 
-## Date filter
-All results must be within 2 years. Discard anything older.
+**Job posting tool routing — mandatory, no exceptions:**
 
-## What to return
-- At least 3 distinct career paths with titles and typical progression
-- Salary ranges: entry level, mid, senior — country-scoped, in local currency
-- Job posting snapshot: company, role title, required skills, date posted
-- Top 5–8 in-demand skills extracted across postings
-- Sources: URL + date for every data point
+| `deps.context.country` | Job posting tool to call |
+|---|---|
+| "UK" | `adzuna_jobs` |
+| "Australia" | `adzuna_jobs` |
+| "Singapore" | `mcf_jobs` |
 
-## Quality bar
-Salary data without country scoping is not acceptable. Return with
-confidence: low and flag it rather than present global averages as local.
+Never use `tavily_search` to find job postings — job boards block Tavily
+fetch access and results will be empty or stale. Always use `adzuna_jobs`
+or `mcf_jobs`.
+
+This table is the single source of truth for job-posting tool routing.
+It is not restated in `agents/career_agent.py` — see 1c.3 for why.
+
+## What to Research
+
+**Career paths (3–6 paths required):**
+Search for the most common career paths graduates from this specific course
+enter. Prefer sources that name actual graduate destinations over generic
+course descriptions. Use queries such as:
+
+- "{course} graduate careers {country}"
+- "{course} graduate jobs {country} 2024"
+- "{university} {course} graduate destinations"
+- "{course} what jobs can you get {country}"
+
+For each path, find: the job title, what the role involves, named employers
+or employer sectors in the country, and salary range in local currency.
+
+**Salary ranges:**
+Scope all salary figures to the university's country. Use local currency —
+do not convert. Prefer graduate salary data (0–3 years experience) over
+general salary data. Useful query patterns:
+
+- "{course} graduate salary {country} 2024"
+- "entry level {career_path} salary {country}"
+- "graduate scheme {course} salary {country}"
+
+**Live job posting snapshot:**
+Call the correct job posting tool per the routing table above, using a query
+matching the course's most common graduate role — e.g. "software engineer
+graduate" for Computer Science. Extract from the returned postings: company
+names, role titles, required skills, dates posted, and salary ranges where
+provided. These go directly into `job_postings` on your output.
+
+**In-demand skills:**
+Extract skill keywords from the job postings returned by `adzuna_jobs` or
+`mcf_jobs`. The `description` field on each posting contains the full job
+text — read it for skill signals. Also use `skills` tags where populated
+(MCF returns structured skill tags; Adzuna does not). Deduplicate. Include
+both technical skills (languages, tools, frameworks) and soft skills only
+if they appear in multiple independent sources.
+
+## Quality Rules
+
+- Discard any salary data older than 2 years. Tavily enforces time_range="year" —
+  if a result appears, it passed the date filter. Still verify the date
+  if it looks stale.
+- Prefer country-specific sources over global aggregators where available.
+  A UK-specific salary survey is more reliable than a global average for
+  a UK university.
+- If fewer than 3 career paths can be confirmed from search results,
+  set confidence to "low" and explain in notes.
+- Do not invent career paths. If search returns thin results, report what
+  was found and flag it.
+- Named employers are better than sectors. "Google, Amazon, HSBC" is more
+  useful than "technology and finance companies".
+
+## Output Requirements
+
+- `career_paths`: minimum 3. Each must have `title`, `description`, and
+  `typical_companies` populated with named employers, not generic sectors.
+- `salary_ranges`: one entry per career path. All three levels required —
+  entry, mid, senior. Use ISO currency code. Country must match context.
+- `job_postings`: 10–15 minimum. Populated directly from `adzuna_jobs` or
+  `mcf_jobs` tool output — do not fabricate postings from search snippets.
+- `in_demand_skills`: top 5–8 only. Extracted from job postings, deduplicated.
+- `country_scope`: copy the country from your context — do not derive it.
+- `confidence`: "high" if 5+ sources confirm career paths and salary ranges;
+  "medium" if 3–4 sources; "low" if fewer than 3.
+- `sources`: every URL you used for salary and career path research. Include date and type.
+- `notes`: empty string unless you hit edge cases (thin results, ambiguous
+  country, conflicting salary data).
+
+## Edge Cases
+
+**Niche or interdisciplinary courses:**
+If the course name is ambiguous (e.g. "Liberal Arts", "Natural Sciences"),
+search for the specific specialisation streams it leads to. Note the
+ambiguity in `notes`.
+
+**Small country markets:**
+If the university is in a country with a small graduate job market,
+posting volumes will be low. Do not penalise confidence for low volume —
+penalise for missing salary data or unconfirmed career paths.
+
+**Course name does not match standard job titles:**
+"Computer Science" maps cleanly to "Software Engineer". "MEng Aeronautical
+Engineering with a Year in Industry" does not. Parse the core discipline
+from the course name and search for that.
+
+## Tool Usage Strategy
+
+**Do not retry a failed query more than once.** If a salary query returns 0
+results, move on to the next career path — do not rephrase and retry the
+same topic.
+
+**Do not fetch job board pages directly.** Indeed, Reed, and LinkedIn block
+automated fetches. Use `adzuna_jobs` or `mcf_jobs` for job posting data —
+never `tavily_search` or `fetch_page` for job postings.
 ```
 
 #### `skills/background/SKILL.md`
@@ -902,6 +1016,20 @@ description: Researches the university's institutional profile — history, size
 tool_budget: 5
 section_name: background
 ---
+
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use for all background research queries.
+  Every call costs 1 tool budget credit. Budget: 5 total.
+- `fetch_page` — fetches a specific URL in full. Use when tavily_search
+  returns a URL you need to read completely (e.g. an accreditation body
+  page, the university's about page, a department profile).
+  Does NOT count against tool_budget.
+
+**Decision rule:** search first with `tavily_search`, then fetch the
+most relevant URL with `fetch_page` if the snippet is insufficient.
+Never call `fetch_page` on a URL you haven't found via search first.
 
 ## What to research
 - University founding date, size (student population), public or private status
@@ -946,6 +1074,21 @@ tool_budget: 6
 section_name: rankings
 ---
 
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use to find ranking table pages and
+  subject-specific positions. Every call costs 1 tool budget credit.
+  Budget: 6 total.
+- `fetch_page` — fetches a specific URL in full. Use when a ranking table
+  page found by tavily_search needs to be read in full to extract the
+  exact position (snippets often truncate tables).
+  Does NOT count against tool_budget.
+
+**Decision rule:** use `tavily_search` to locate the ranking source,
+then `fetch_page` on the ranking page URL if the snippet does not include
+the specific position for this university.
+
 ## Priority order
 1. Subject-specific ranking for this course (QS by Subject, THE by Subject,
    Guardian Subject Rankings, Complete University Guide)
@@ -985,6 +1128,22 @@ description: Researches the specific undergraduate programs, modules, and delive
 tool_budget: 5
 section_name: program
 ---
+
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use to locate the university's course
+  catalog page and any program structure documents.
+  Every call costs 1 tool budget credit. Budget: 5 total.
+- `fetch_page` — fetches a specific URL in full. The university's official
+  course catalog page is the primary source for module names and structure —
+  always fetch it once you have the URL. Snippets from search results
+  never contain the full module list.
+  Does NOT count against tool_budget.
+
+**Recommended sequence:** 1 tavily_search to find the catalog URL,
+then 1 fetch_page to read the full page. Use remaining tavily_search
+budget for specialisation pathways or sandwich year details if needed.
 
 ## What to research
 - Available undergraduate programs matching the course name
@@ -1028,6 +1187,21 @@ tool_budget: 8
 section_name: employability
 ---
 
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use for all employment statistics, alumni
+  destination searches, and industry partnership queries.
+  Every call costs 1 tool budget credit. Budget: 8 total.
+- `fetch_page` — fetches a specific URL in full. Use when a graduate
+  outcomes report, HESA data page, or employer partnership page found
+  by tavily_search needs to be read fully.
+  Does NOT count against tool_budget.
+
+**Decision rule:** search first, then fetch the single most data-rich
+URL per topic. Do not fetch speculatively — only fetch URLs that
+tavily_search snippets confirm contain the specific data you need.
+
 ## Dependency
 Read board.career before beginning any searches. The career paths and
 in-demand skills already found there define what counts as a relevant
@@ -1069,6 +1243,22 @@ tool_budget: 6
 section_name: accommodation
 ---
 
+## Tools
+You have two tools:
+
+- `tavily_search` — web search. Use for accommodation cost queries, safety
+  statistics, and transport route lookups.
+  Every call costs 1 tool budget credit. Budget: 6 total.
+- `fetch_page` — fetches a specific URL in full. Use when the university's
+  official accommodation page or a local transport authority page needs
+  to be read in full for current pricing or route details.
+  Does NOT count against tool_budget.
+
+**Recommended allocation:** 1 search + 1 fetch for on-campus costs,
+1 search for off-campus rents, 1 search for area safety, 1 search for
+transport. Fetch the university accommodation page if pricing is not
+in the search snippet.
+
 ## What to research
 - On-campus accommodation: cost range per week, what is included
 - Off-campus private accommodation: typical rent range per month in the
@@ -1107,9 +1297,21 @@ tool_budget: 6
 section_name: news
 ---
 
-## Search tool order
-1. Tavily — primary and only search tool. Use `days=730` filter on every query.
-   If results are sparse, set `confidence: "low"` and explain in `notes`.
+## Tools
+You have two tools:
+
+- `tavily_search` — web search with `time_range="year"` enforced on every
+  call. This is the primary and only search tool for this agent.
+  Every call costs 1 tool budget credit. Budget: 6 total.
+  If results are sparse after 3–4 queries, set `confidence: "low"` and
+  explain in `notes` — do not keep searching beyond budget.
+- `fetch_page` — fetches a specific URL in full. Use only when a news
+  article found by tavily_search requires the full text to extract a
+  publication date or confirm it is department-specific.
+  Does NOT count against tool_budget.
+
+**Do NOT use** `fetch_page` speculatively. Fetch only when the snippet
+is insufficient to determine date or relevance.
 
 ## What to research
 - Institutional news: significant events from the past 2 years — strikes,
@@ -1148,36 +1350,62 @@ section_name: forum
 
 ## This agent has the highest tool budget and the strictest scope rules.
 
+## Tools
+You have two tools. Each has a specific role — do not substitute one for another:
+
+- `tavily_search` — web search. Use for all forum source discovery: finding
+  TSR threads, StudentCrowd pages, WhatUni pages, and Quora threads.
+  Use `include_domains` to restrict searches to specific forum sites.
+  Every call costs 1 tool budget credit. Budget: 10 total.
+- `fetch_page` — fetches a specific URL in full. Use for StudentCrowd and
+  WhatUni course pages once tavily_search returns the URL. Gives you the
+  full review text that snippets truncate.
+  Does NOT count against tool_budget.
+
+**Tool routing by source:**
+| Source | Find URL with | Read content with |
+|---|---|---|
+| The Student Room | `tavily_search` with `include_domains=["thestudentroom.co.uk"]` | snippet is usually sufficient; skip fetch |
+| StudentCrowd | `tavily_search` with `include_domains=["studentcrowd.com"]` | `fetch_page` for full review text |
+| WhatUni | `tavily_search` with `include_domains=["whatuni.com"]` | `fetch_page` for full review text |
+| Quora | `tavily_search` with `include_domains=["quora.com"]` | snippet is usually sufficient; skip fetch |
+
 ## Scope rules — enforced on every query and every result
 Every query must include both the university name AND the course name.
 Every result that does not mention the specific course or department is discarded.
 Generic university experience threads are not acceptable output.
 
 ## Sources — search in this order
-1. `site:thestudentroom.co.uk` via Tavily — primary source. Deep UK student forum,
-   course-specific threads, high signal. Use for course experience, teaching quality,
-   and student life feedback.
-2. `site:studentcrowd.com` via Tavily — verified student reviews per course with
-   structured ratings. Fetch the course-specific page via fetch_page for full reviews.
-3. `site:whatuni.com` via Tavily — student ratings and reviews per course.
-   Fetch the course page via fetch_page for full review text.
-4. `site:quora.com` via Tavily — student Q&A threads, useful for international
-   student perspectives and course comparisons.
-5. `site:reddit.com` via Tavily — best-effort snippets only (no full threads).
-   Use as a supporting source, not primary. Weight lower than sources 1–4.
-   For non-UK universities, promote this to source 2 if TSR coverage is sparse.
-6. `site:collegeconfidential.com` via Tavily — use for US and international
-   universities only. Skip for UK-only queries where TSR and StudentCrowd suffice.
+1. `thestudentroom.co.uk` via tavily_search with `include_domains=["thestudentroom.co.uk"]` —
+   primary source for UK universities. Deep student forum, course-specific threads, high signal.
+   Use for course experience, teaching quality, and student life feedback.
+   For non-UK universities, still try this first — TSR covers international study threads too.
+2. `studentcrowd.com` via tavily_search with `include_domains=["studentcrowd.com"]` —
+   verified student reviews per course with structured ratings. Fetch the
+   course-specific page via fetch_page for full reviews.
+3. `whatuni.com` via tavily_search with `include_domains=["whatuni.com"]` —
+   student ratings and reviews per course. Fetch the course page via
+   fetch_page for full review text.
+4. `quora.com` via tavily_search with `include_domains=["quora.com"]` —
+   student Q&A threads, useful for international student perspectives and
+   course comparisons.
+5. Unrestricted tavily_search (no include_domains) — use as final sweep for
+   non-UK universities where the above sources return sparse results. Allows
+   Tavily to surface any other authentic forum or review content available.
 
 ## Query construction
 Always: [university name] + [course name] + [signal type]
 
-Examples:
-- "site:thestudentroom.co.uk University of Manchester Computer Science student experience"
-- "site:studentcrowd.com University of Manchester Computer Science review"
-- "site:whatuni.com University of Manchester Computer Science student review"
-- "site:quora.com University of Manchester Computer Science worth it"
-- "site:reddit.com University of Manchester Computer Science undergraduate"
+Examples (UK university):
+- tavily_search("University of Manchester Computer Science student experience", include_domains=["thestudentroom.co.uk"])
+- tavily_search("University of Manchester Computer Science review", include_domains=["studentcrowd.com"])
+- tavily_search("University of Manchester Computer Science student review", include_domains=["whatuni.com"])
+- tavily_search("University of Manchester Computer Science worth it", include_domains=["quora.com"])
+
+Examples (non-UK university):
+- tavily_search("NUS Computer Science student experience", include_domains=["thestudentroom.co.uk"])
+- tavily_search("NUS Computer Science review", include_domains=["studentcrowd.com"])
+- tavily_search("NUS Computer Science student experience forum")  ← unrestricted sweep
 
 ## Signal weighting
 1. Current student (enrolled now) — highest weight
@@ -1366,15 +1594,15 @@ stalling the others.
 
 | Agent | `tool_budget` | Why |
 |---|---|---|
-| `forum` | 10 | Highest — 5 forum sources × Tavily `site:` queries + fetch_page calls for StudentCrowd and WhatUni course pages |
-| `career` | 8 | Job postings snapshot + salary data requires multiple queries |
-| `employability` | 8 | Named companies require several targeted queries |
-| `alternatives` | 8 | 2–3 universities × multiple queries each |
+| `forum` | 10 | Highest — 4 include_domains tavily_search queries + 1 unrestricted sweep + fetch_page for StudentCrowd/WhatUni pages |
+| `career` | 8 | Salary + career path research via tavily_search; job postings via adzuna_jobs or mcf_jobs (not counted against budget) |
+| `employability` | 8 | Named company evidence requires multiple targeted tavily_search queries |
+| `alternatives` | 8 | 2–3 universities × multiple tavily_search queries each |
 | `rankings` | 6 | Multiple ranking bodies — QS, THE, Guardian, Complete University Guide |
-| `accommodation` | 6 | On-campus + off-campus + safety + transport — four distinct searches |
-| `news` | 6 | Tavily only — news queries plus department-specific searches |
-| `background` | 5 | Institutional facts — fewer queries needed |
-| `program` | 5 | Course catalog fetch + 1–2 search queries |
+| `accommodation` | 6 | On-campus + off-campus + safety + transport — four distinct tavily_search calls |
+| `news` | 6 | tavily_search only — institutional + department-specific news queries |
+| `background` | 5 | Institutional facts — fewer tavily_search queries needed |
+| `program` | 5 | 1–2 tavily_search calls to locate catalog URL, then fetch_page for full content |
 | `scoring` | 0 | No tools — synthesises from blackboard only, never searches |
 | `conversation` | 0 | No tools — answers follow-up questions from blackboard only |
 
@@ -1387,7 +1615,7 @@ that these agents must never call search tools.
 at startup. The enforcement is implemented when agents are built in Stage 1c
 (`CareerAgent`) and Stage 2a (all remaining section agents).
 
-The pattern every agent follows:
+The pattern every agent follows (implemented in Stage 1c and 2a via `_make_search_tool()`):
 
 ```python
 class CareerAgent(BaseAgent):
@@ -1396,20 +1624,27 @@ class CareerAgent(BaseAgent):
         self._tool_budget = tool_budget
         self._calls_made  = 0        # reset per request in handle()
 
-    async def _search(self, deps, query: str, **kwargs):
-        """Gated search call. Skips and warns if budget exhausted."""
-        if self._calls_made >= self._tool_budget:
-            self._logger.warning(
-                "%s | tool budget exhausted (%d calls) — skipping: %r",
-                self.__class__.__name__, self._tool_budget, query,
-            )
-            return None
-        self._calls_made += 1
-        return await deps.tavily.search(query, **kwargs)
+    def _make_search_tool(self):1
+        """Wrap tavily_search with a budget-aware closure over this agent instance."""
+        agent_self = self
+        async def tavily_search(ctx: RunContext[Deps], query: str) -> str:
+            if agent_self._calls_made >= agent_self._tool_budget:
+                agent_self._logger.warning(
+                    "%s | tool budget exhausted (%d calls) — skipping: %r",
+                    agent_self.__class__.__name__, agent_self._tool_budget, query,
+                )
+                return json.dumps({"error": "tool budget exhausted", "query": query})
+            agent_self._calls_made += 1
+            from tools.search_tool import _client as tavily_client   # module-level singleton
+            results = await tavily_client.search(query, max_results=5, time_range="year")
+            return json.dumps(results)
+        return tavily_search
 ```
 
-Every tool call goes through `_make_search_tool()` or an equivalent gated
-wrapper. Direct calls to the Tavily client that bypass the gate are a bug.
+The Tavily client is the module-level `AsyncTavilyClient` singleton in `tools/search_tool.py` —
+it is **not** on `Deps`. The budget closure reaches it via a direct module import inside the
+wrapper function. `fetch_page` and job posting tools (`adzuna_jobs`, `mcf_jobs`) are registered
+directly without budget wrapping — they are targeted retrieval calls, not searches.
 
 `_calls_made` is reset at the start of each `handle()` call — not in
 `__init__()` — so the same agent instance handles multiple requests across
@@ -1525,7 +1760,7 @@ from pathlib import Path
 
 import pytest
 
-from core.message_hub import MessageHub, AgentParam
+from core.message_hub import MessageHub
 from core.blackboard import Blackboard
 from core.deps import Deps, ResearchContext
 
@@ -1548,12 +1783,17 @@ TIMESTAMP = datetime.now().isoformat()
 # ── MessageHub ────────────────────────────────────────────────────────────────
 
 def test_hub_subscribe_and_publish() -> None:
-    """Hub dispatches to registered handler with AgentParam."""
+    """Hub dispatches to registered handler via closure capturing deps."""
     hub = MessageHub()
     received: list = []
 
-    async def handler(param: AgentParam) -> None:
-        received.append(param.message)
+    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
+        university_name="U", intended_course="CS", country="UK"
+    ))
+
+    # Handlers are closures that capture deps at subscription time
+    async def handler(message: SectionCompletedMessage) -> None:
+        received.append(message)
 
     hub.subscribe(SectionCompletedMessage, handler)
     msg = SectionCompletedMessage(
@@ -1561,10 +1801,7 @@ def test_hub_subscribe_and_publish() -> None:
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
-    asyncio.run(hub.publish(msg, deps))
+    asyncio.run(hub.publish(msg))
     assert len(received) == 1
     assert received[0].section_name == "forum"
 
@@ -1574,9 +1811,9 @@ def test_hub_multiple_handlers() -> None:
     hub = MessageHub()
     calls: list[str] = []
 
-    async def h1(param: AgentParam): calls.append("h1")
-    async def h2(param: AgentParam): calls.append("h2")
-    async def h3(param: AgentParam): calls.append("h3")
+    async def h1(message): calls.append("h1")
+    async def h2(message): calls.append("h2")
+    async def h3(message): calls.append("h3")
 
     hub.subscribe(SectionCompletedMessage, h1)
     hub.subscribe(SectionCompletedMessage, h2)
@@ -1587,21 +1824,15 @@ def test_hub_multiple_handlers() -> None:
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
-    asyncio.run(hub.publish(msg, deps))
+    asyncio.run(hub.publish(msg))
     assert sorted(calls) == ["h1", "h2", "h3"]
 
 
 def test_hub_no_handlers_is_noop() -> None:
     """Publishing to a type with no subscribers does nothing."""
     hub = MessageHub()
-    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
     msg = ScoringCompletedMessage(triggered_by="test", timestamp=TIMESTAMP)
-    asyncio.run(hub.publish(msg, deps))  # must not raise
+    asyncio.run(hub.publish(msg))  # must not raise
 
 
 def test_hub_type_isolation() -> None:
@@ -1609,19 +1840,16 @@ def test_hub_type_isolation() -> None:
     hub = MessageHub()
     calls: list[str] = []
 
-    async def handler(param: AgentParam): calls.append("fired")
+    async def handler(message): calls.append("fired")
 
     hub.subscribe(SectionCompletedMessage, handler)
-    deps = Deps(hub=hub, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
     msg = SectionFailedMessage(
         section_name="news",
         reason="timeout",
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    asyncio.run(hub.publish(msg, deps))
+    asyncio.run(hub.publish(msg))
     assert calls == []
 
 
@@ -1631,18 +1859,15 @@ def test_hub_fresh_instance_isolation() -> None:
     hub2 = MessageHub()
     calls: list[str] = []
 
-    async def handler(param: AgentParam): calls.append("fired")
+    async def handler(message): calls.append("fired")
 
     hub1.subscribe(SectionCompletedMessage, handler)
-    deps2 = Deps(hub=hub2, board=Blackboard(), context=ResearchContext(
-        university_name="U", intended_course="CS", country="UK"
-    ))
     msg = SectionCompletedMessage(
         section_name="rankings",
         triggered_by="test",
         timestamp=TIMESTAMP,
     )
-    asyncio.run(hub2.publish(msg, deps2))
+    asyncio.run(hub2.publish(msg))
     assert calls == []   # hub2 has no subscribers
 
 
@@ -1840,9 +2065,11 @@ Cause: the markdown body after the second `---` is empty.
 The body does not need to be complete at this stage, but it must not be blank.
 Add at least a one-line placeholder if the full content is not written yet.
 
-**`test_hub_subscribe_and_publish FAILED — handler received wrong type`**
-Cause: handler signature uses `msg` typed as `BaseMessage` instead of `AgentParam`.
-Fix: all handlers must accept `param: AgentParam` and read `param.message` and `param.deps`.
+**`test_hub_subscribe_and_publish FAILED — handler not called`**
+Cause: handler signature is wrong or `hub.publish(msg, deps)` was called with two args.
+`hub.publish(message)` takes only the message — `deps` is captured by closure at subscription
+time, not passed through the hub. Fix: ensure `hub.subscribe(MsgType, handler)` is called
+before `hub.publish(msg)`, and that the handler accepts a single message argument.
 
 **`AssertionError: forum should have the highest tool_budget`**
 Cause: `forum/SKILL.md` has `tool_budget: 8` instead of `10`.

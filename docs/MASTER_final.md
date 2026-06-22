@@ -157,12 +157,12 @@ structured, dated postings. They replace Tavily for the job posting snapshot
 in CareerAgent only — Tavily remains the primary tool for all other research.
 
 **Why these tools:**
-Tavily handles all general search including `site:thestudentroom.co.uk`,
-`site:studentcrowd.com`, `site:whatuni.com`, `site:quora.com`, and
-`site:reddit.com` queries. ForumAgent uses `site:` queries across multiple
+Tavily handles all general search including `include_domains`-scoped queries
+against `thestudentroom.co.uk`, `studentcrowd.com`, `whatuni.com`, and
+`quora.com`. ForumAgent uses `include_domains` to restrict searches to specific
 confirmed-accessible public student forums — no separate Reddit API client is
-required. DuckDuckGo replaces SerpAPI as a zero-cost news fallback with no
-monthly quota.
+required or available (Reddit API access closed May 2026). DuckDuckGo replaces
+SerpAPI as a zero-cost news fallback with no monthly quota.
 
 ### LLM Provider
 
@@ -608,13 +608,16 @@ manage their own counter independently.
 ```python
 from __future__ import annotations
 
-import logging
+from core.logger import logger
 from abc import ABC, abstractmethod
 
 from pydantic_ai import Agent
+from pydantic_ai.capabilities import Hooks
+from pydantic_ai.messages import ModelResponse, TextPart
 
 from core.message_hub import MessageHub
 from core.deps import Deps
+
 
 
 class BaseAgent(ABC):
@@ -633,13 +636,55 @@ class BaseAgent(ABC):
     def __init__(self, instructions: str = "") -> None:
         self.instructions = instructions
         self._agent: Agent | None = None   # constructed by subclass __init__
-        self._logger = logging.getLogger(self.__class__.__name__)
+
+        # Isolated request session metrics per-agent instance
+        self._current_cot_buffer: list[str] = []
 
     def reset(self) -> None:
         """Called before each request's subscribe loop. No-op by default.
         Subclasses that carry per-request state (e.g. a _fired flag) override this."""
-        pass
+        ...
 
+    def _setup_telemetry_hooks(self) -> Hooks:
+        """Helper factory method called by subclasses during Agent construction.
+        
+        Injects uniform logging behavior across all subclass agents.
+        """
+        hooks = Hooks()
+
+        @hooks.on.after_model_request
+        async def capture_turn_metrics(ctx, response: ModelResponse, **kwargs) -> ModelResponse:
+            # 1. Uniform fleet-wide token tracking (CORRECTED ATTRIBUTES)
+            if response.usage:
+                logger.warning(
+                    "[TOKENS] Input=%d | Output=%d | Total=%d",
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                    response.usage.total_tokens,
+                )
+            
+            # 2. Uniform fleet-wide COT harvesting
+            for part in response.parts:
+                if isinstance(part, TextPart) and part.content:
+                    self._current_cot_buffer.append(part.content)
+                elif type(part).__name__ == 'ThinkingPart' and hasattr(part, 'content'):
+                    thinking_content = getattr(part, 'content', '')
+                    self._current_cot_buffer.append(thinking_content)
+                    
+                    # -> ADD THIS LINE: Log the thinking block immediately for this turn
+                    if thinking_content:
+                        logger.info("\n[THINKING BLOCK]\n%s\n", thinking_content)
+                    
+            return response
+
+        return hooks
+
+    def flush_cot_log(self) -> str:
+        """Consolidates and returns the full COT buffer compiled across all LLM turns."""
+        return "\n".join(self._current_cot_buffer).strip()
+
+
+    
     @abstractmethod
     def subscribe(self, hub: MessageHub, deps: Deps) -> None:
         """Register this agent's handler(s) on the hub via closure.
@@ -673,6 +718,7 @@ class BaseAgent(ABC):
                 return base + "\\n\\n" + self.instructions if self.instructions else base
         """
         ...
+
 ```
 
 **Why closures instead of passing `deps` through the hub:** the hub's `publish(message)`
@@ -761,7 +807,7 @@ from typing import Literal
 
 class ForumSource(BaseModel):
     url: str
-    platform: str   # "reddit", "thestudentroom", etc.
+    platform: str   # "thestudentroom", "studentcrowd", "whatuni", "quora"
     year: int
     poster_type: str   # "current_student", "graduate", "prospective"
 
