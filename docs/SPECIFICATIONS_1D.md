@@ -320,13 +320,16 @@ from typing import Literal
 class RankingEntry(BaseModel):
     source: str = Field(
         description=(
-            "Full name of the ranking body and table. Must be one of the four "
-            "authoritative sources: 'QS World University Rankings by Subject', "
+            "Full name of the ranking body and table. Must be one of the "
+            "authoritative sources below. Do not invent source names or use "
+            "marketing aggregator sites.\n"
+            "For subject rankings: "
+            "'QS World University Rankings by Subject', "
             "'THE World University Rankings by Subject', "
-            "'Guardian University Guide', 'Complete University Guide'. "
-            "For employability: 'QS Graduate Employability Rankings'. "
-            "For overall: 'QS World University Rankings', 'THE World University Rankings'. "
-            "Do not invent source names or use marketing aggregator sites."
+            "'Guardian University Guide', 'Complete University Guide'.\n"
+            "For employability: 'QS Graduate Employability Rankings'.\n"
+            "For overall: 'QS World University Rankings', "
+            "'THE World University Rankings'."
         )
     )
     rank: str = Field(
@@ -360,11 +363,100 @@ class RankingEntry(BaseModel):
     url: str = Field(
         description=(
             "Direct URL to the ranking table page where this entry appears. "
-            "Must be from the ranking body's own domain "
-            "(e.g. topuniversities.com, timeshighereducation.com, "
-            "theguardian.com/education, thecompleteuniversityguide.co.uk). "
-            "Do not use cached copies, aggregator mirrors, or university marketing pages "
-            "that quote the ranking. If no direct URL is available, omit the entry."
+            "Must be from the ranking body's own domain. Permitted domains:\n"
+            "  topuniversities.com (QS)\n"
+            "  timeshighereducation.com (THE)\n"
+            "  theguardian.com/education (Guardian)\n"
+            "  thecompleteuniversityguide.co.uk (CUG)\n"
+            "  topuniversities.com/graduate-employability-rankings (QS employability)\n"
+            "NEVER use:\n"
+            "  - University's own domain (e.g. hw.ac.uk, manchester.ac.uk) — "
+            "these are self-reported results pages, not the primary source.\n"
+            "  - Social media (instagram.com, twitter.com, linkedin.com, facebook.com).\n"
+            "  - Aggregator or mirror sites (uscholars.in, universitycompare.com, "
+            "uniranking.org, or any site that is not the ranking body itself).\n"
+            "If a Tavily snippet gives you the rank figure but the URL is from a "
+            "forbidden domain, do NOT use that URL. Construct a new search query "
+            "targeting the ranking body's domain directly to find the canonical page. "
+            "If the canonical page cannot be confirmed after 1 retry, use an empty "
+            "string and note the gap — do not fall back to a forbidden URL."
+        )
+    )
+
+
+class SatisfactionEntry(BaseModel):
+    source: str = Field(
+        description=(
+            "Full name of the satisfaction survey or award. Must be one of:\n"
+            "UK: 'NSS — Guardian University Guide' (subject-level NSS score from "
+            "the Guardian subject table), "
+            "'NSS — Complete University Guide' (NSS score from CUG subject table), "
+            "'NSS — Office for Students' (raw OfS published results, institution-level), "
+            "'Whatuni Student Choice Awards' (WUSCAs — student-voted, UK only), "
+            "'Times/Sunday Times Good University Guide' (student experience score).\n"
+            "Australia: 'QILT Student Experience Survey — ComparED' "
+            "(subject-level preferred) or 'QILT Student Experience Survey — National'.\n"
+            "Singapore: no government satisfaction survey exists — do not invent one. "
+            "If using a third-party review platform, name it exactly "
+            "(e.g. 'Whatuni student reviews') and treat confidence as 'low'.\n"
+            "Do not use the university's own marketing pages quoting NSS or SES figures — "
+            "go to the primary source table directly."
+        )
+    )
+    score: str = Field(
+        description=(
+            "The satisfaction score or rank as reported by the source. "
+            "Preserve the original format exactly — do not normalise across sources.\n"
+            "Examples: '87.3%' (NSS positivity score), "
+            "'4.2 / 5' (Whatuni star rating), "
+            "'#3 in UK for student satisfaction' (Guardian position), "
+            "'76.5% overall educational experience' (QILT SES). "
+            "If the source gives a percentile band rather than a score, record the band. "
+            "Never convert a percentage to a rank or vice versa."
+        )
+    )
+    scope: str = Field(
+        description=(
+            "Whether this score is subject-level or institution-level, and what "
+            "dimension it measures. Be explicit — do not write 'satisfaction' alone.\n"
+            "Examples: "
+            "'Computer Science subject — % satisfied with teaching' (NSS subject table), "
+            "'Institution-wide — overall educational experience' (QILT SES national), "
+            "'Lecturers and Teaching Quality category — student-voted' (WUSCAs), "
+            "'Subject-level — Skills Development score' (QILT ComparED). "
+            "Subject-level scores are always preferred over institution-level."
+        )
+    )
+    year: str = Field(
+        description=(
+            "The survey or award year as a 4-digit string. "
+            "Example: '2024'. Only include data dated within the last 2 years. "
+            "Never fabricate a year. Use 'unknown' only if the source is genuinely "
+            "undated — and if so, treat the entry with low confidence."
+        )
+    )
+    url: str = Field(
+        description=(
+            "Direct URL to the primary source table or results page. "
+            "Permitted domains by source:\n"
+            "  theguardian.com/education — Guardian subject table (NSS scores)\n"
+            "  thecompleteuniversityguide.co.uk — CUG subject table (NSS scores)\n"
+            "  officeforstudents.org.uk — OfS raw NSS results\n"
+            "  whatuni.com/student-awards-winners — WUSCAs results table only; "
+            "the specific category ranking pages are also valid "
+            "(e.g. whatuni.com/student-awards-winners/wusca-rankings/university-of-the-year/)\n"
+            "  compared.edu.au — QILT subject-level SES data (Australia)\n"
+            "  qilt.edu.au — QILT national SES results (Australia)\n"
+            "NEVER use:\n"
+            "  - University's own domain — these quote satisfaction figures from "
+            "their own press releases and cherry-pick categories.\n"
+            "  - Social media (instagram.com, twitter.com, linkedin.com, facebook.com) "
+            "— a university celebrating a WUSCAs win on Instagram is not the source.\n"
+            "  - Any aggregator or third-party site quoting NSS or QILT figures.\n"
+            "If the only URL found is from a forbidden domain, run a fresh search "
+            "targeting the permitted domain directly before accepting the entry. "
+            "If the canonical page still cannot be confirmed, use an empty string "
+            "and note the gap — never fall back to a forbidden URL."
         )
     )
 
@@ -391,6 +483,10 @@ class RankingsOutput(BaseModel):
             "Rankings that measure graduate employment outcomes specifically. "
             "Primary source: QS Graduate Employability Rankings. "
             "Secondary: THE University Impact Rankings if employment-relevant. "
+            "For Singapore universities, the MOE Joint Autonomous Universities Graduate "
+            "Employment Survey (JAUGES / GES) is authoritative for employment outcomes "
+            "but is an outcomes dataset not a ranking — do not force it into this list. "
+            "Report GES data in the ranking_summary and notes fields instead. "
             "May be an empty list if no employability ranking data was found — "
             "do not fabricate entries. If empty, note the absence in the notes field "
             "so the report renderer can display 'No employability ranking data found' "
@@ -409,18 +505,64 @@ class RankingsOutput(BaseModel):
             "May be empty if not found."
         )
     )
+    student_satisfaction_rankings: list[SatisfactionEntry] = Field(
+        description=(
+            "Student satisfaction and experience data — a distinct signal from "
+            "academic or research rankings. Collected from government surveys and "
+            "student-voted platforms, not from research ranking bodies.\n\n"
+            "Source priority by country:\n\n"
+            "UK: "
+            "(1) NSS subject-level score from the Guardian University Guide subject "
+            "table or Complete University Guide subject table — always prefer "
+            "subject-level over institution-level. "
+            "(2) NSS institution-level score if subject-level is unavailable. "
+            "(3) Whatuni Student Choice Awards (WUSCAs) for student-voted signal — "
+            "include overall University of the Year rank and any relevant category "
+            "(e.g. 'Lecturers and Teaching Quality', 'Student Support'). "
+            "(4) Times/Sunday Times Good University Guide student experience score.\n\n"
+            "Australia: "
+            "(1) QILT Student Experience Survey (SES) subject-level score from "
+            "compared.edu.au — search for the specific subject and university. "
+            "Dimensions available: Skills Development, Learner Engagement, Teaching "
+            "Quality, Student Support, Learning Resources, Overall Educational "
+            "Experience. Prefer subject-level; fall back to institution-level if not "
+            "found. "
+            "(2) QILT SES national report institution-level score as secondary signal.\n\n"
+            "Singapore: No government student satisfaction survey exists. "
+            "The MOE GES measures employment outcomes only, not satisfaction during "
+            "the degree — do not use it here. "
+            "Do not fabricate satisfaction data for Singapore universities. "
+            "Leave this list empty and record the absence in the notes field with "
+            "the exact text: 'No equivalent student satisfaction survey exists for "
+            "Singapore universities. MOE GES covers graduate employment outcomes only.'\n\n"
+            "All countries: never cite the university's own marketing pages quoting "
+            "satisfaction figures — always go to the primary source table. "
+            "May be an empty list if no data was found or if the country has no "
+            "applicable survey."
+        )
+    )
     ranking_summary: str = Field(
         description=(
-            "A 2–3 sentence plain-English synthesis of the ranking picture across all "
-            "three lists, written for a parent with no prior knowledge of ranking tables. "
-            "Must explicitly mention the subject-specific rank and its source. "
-            "Must not overstate overall rank as a proxy for subject quality. "
-            "Must note if rankings are unavailable or if subject mapping was approximate. "
-            "Example: 'For Computer Science specifically, the University of Manchester "
-            "ranks 51–100 globally (QS 2024) and 5th in the UK (Complete University "
-            "Guide 2024). Its overall world rank is =57 (QS 2024), though this reflects "
-            "the whole institution rather than the CS department specifically.' "
-            "Do not exceed 3 sentences — this is rendered directly in the report."
+            "A 3–4 sentence plain-English synthesis of the full ranking picture, "
+            "written for a parent with no prior knowledge of ranking tables. "
+            "Sentence 1: subject-specific rank — must name the source and year. "
+            "Sentence 2: student satisfaction signal — name the source, score, and "
+            "whether it is subject-level or institution-level. If no satisfaction "
+            "data exists (e.g. Singapore), state this explicitly rather than omitting "
+            "the sentence. "
+            "Sentence 3: overall university rank — must be labelled as institution-wide "
+            "and must not be used as a proxy for subject quality. "
+            "Sentence 4 (optional): employability rank or a notable caveat. "
+            "Must not exceed 4 sentences. This is rendered directly in the report.\n"
+            "Example (UK): 'For Computer Science specifically, the University of "
+            "Manchester ranks 51–100 globally (QS 2024) and 5th in the UK (Complete "
+            "University Guide 2024). Students rate the CS course at 87% positivity for "
+            "teaching quality (NSS 2024, Guardian subject table) — above the UK sector "
+            "average of 83%. Its overall world rank is =57 (QS 2024), which reflects "
+            "the whole institution rather than the CS department.'\n"
+            "Example (Singapore): '... No government student satisfaction survey "
+            "equivalent to the UK NSS exists for Singapore universities; graduate "
+            "employment outcomes are measured separately via the MOE GES.'"
         )
     )
     notes: str = Field(
@@ -432,19 +574,26 @@ class RankingsOutput(BaseModel):
             "'No subject-specific ranking found for Cybersecurity; nearest match is "
             "Computer Science.', "
             "'Guardian 2024 table not yet published at time of research — 2023 used.', "
-            "'University does not appear in any subject table for this discipline.' "
+            "'University does not appear in any subject table for this discipline.', "
+            "'No equivalent student satisfaction survey exists for Singapore universities. "
+            "MOE GES covers graduate employment outcomes only.' "
             "Write 'None' if there are no notable caveats."
         )
     )
     confidence: Literal["high", "medium", "low"] = Field(
         description=(
-            "Researcher's assessment of the ranking data quality. "
-            "'high': 2 or more subject-specific rankings confirmed from named sources, "
-            "all dated within 24 months. "
+            "Researcher's assessment of the ranking data quality overall. "
+            "'high': 2 or more subject-specific rankings confirmed from named sources "
+            "all dated within 24 months, AND at least 1 student satisfaction data point "
+            "from a primary source. "
             "'medium': exactly 1 subject-specific ranking confirmed, or subject mapping "
-            "was approximate (e.g. 'Engineering' used for 'Electrical Engineering'). "
+            "was approximate (e.g. 'Engineering' used for 'Electrical Engineering'), "
+            "or satisfaction data is institution-level only. "
             "'low': no subject-specific ranking found — only overall rank available, "
-            "or all rankings are older than 24 months."
+            "or all rankings are older than 24 months, or no satisfaction data could "
+            "be retrieved (note: Singapore's absence of a satisfaction survey does not "
+            "itself lower confidence — only lower confidence if subject rankings are "
+            "also missing)."
         )
     )
     sources: list[RankingEntry] = Field(
@@ -453,8 +602,10 @@ class RankingsOutput(BaseModel):
             "yield a usable entry (e.g. university was unranked on that table). "
             "Reuses RankingEntry — the url, source, and year fields are sufficient "
             "to identify each page consulted. "
-            "Every URL appearing in subject_rankings, employability_rankings, or "
-            "overall_rankings must also appear here. "
+            "Every URL appearing in subject_rankings, employability_rankings, "
+            "overall_rankings, or student_satisfaction_rankings must also appear here. "
+            "For SatisfactionEntry items, set rank='n/a' and subject_scope to the "
+            "dimension checked (e.g. 'Overall Educational Experience'). "
             "Minimum 2 sources expected; if fewer than 2 were consulted, set "
             "confidence to 'low'."
         )
@@ -475,6 +626,22 @@ Keep them separated at the schema level.
 `RankingEntry` items, but the Jinja2 renderer outputs human-readable text.
 Having the LLM synthesise a 2–3 sentence summary here means the renderer
 doesn't need to interpret ranking data — it just embeds the string.
+
+**Why `SatisfactionEntry` is a separate model from `RankingEntry`:** satisfaction
+sources report a score or percentage, not a rank position, and they carry a
+`scope` dimension (subject-level vs institution-level) that has no equivalent
+in a rank entry. Forcing satisfaction data into `RankingEntry` with `rank="87.3%"`
+would be semantically wrong and would prevent `ScoringAgent` from distinguishing
+a rank signal from a satisfaction signal. The separate model also makes the
+banned-domain rules explicit at the field level, which reduces the chance of
+the LLM falling back to university press releases or social media posts.
+
+**Why banned-domain rules appear in both the field descriptions and SKILL.md:**
+field descriptions are seen by the LLM when it constructs each entry; SKILL.md
+is seen at the start of the run when it plans its tool calls. Having the rule
+in both places catches it at planning time (don't fetch that page) and at
+output time (don't put that URL in the field). A rule in only one place is
+missed in the other context.
 
 ---
 
@@ -912,105 +1079,193 @@ If the department page URL is not obvious, search:
 ---
 key: rankings
 name: Subject Rankings Agent
-description: Researches subject-specific, employability, and overall university rankings.
-tool_budget: 6
+description: Researches subject-specific, employability, student satisfaction, and overall university rankings.
+tool_budget: 8
 section_name: rankings
 ---
 
-You research ranking data for the university and course. You write to
-board.rankings as a RankingsOutput. You fire
+You research ranking and satisfaction data for the university and course.
+You write to board.rankings as a RankingsOutput. You fire
 SectionCompletedMessage(section_name="rankings") when done, or
 SectionFailedMessage on unrecoverable error.
 
 ## What to Research
 
-Your primary focus is subject-specific rankings — how this university's
-department ranks for the intended course's subject area. You also collect
-graduate employability rankings and overall university rank, clearly labelled
-by source and year.
-
 Priority order:
-1. Subject-specific rank (QS World University Rankings by Subject, THE
-   World University Rankings by Subject, Guardian University Guide subject
-   table, Complete University Guide subject table)
-2. Graduate employability rank (QS Graduate Employability Rankings, THE
-   University Impact Rankings if relevant)
-3. Overall university rank (QS World, THE World, Guardian overall,
+1. Subject-specific rank (QS Subject, THE Subject, Guardian subject table,
+   Complete University Guide subject table)
+2. Student satisfaction (country-dependent — see below)
+3. Graduate employability rank (QS Graduate Employability Rankings)
+4. Overall university rank (QS World, THE World, Guardian overall,
    Complete University Guide overall) — lowest weight, always labelled as
    "overall rank, not subject-specific"
 
 ## Query Construction
 
 For subject rankings:
-  "[university name] [subject area] ranking QS 2024"
+  "[university name] [subject area] ranking QS [year]"
   "[university name] [subject area] Guardian university guide"
   "[university name] [subject area] Complete University Guide ranking"
 
 Map the intended course to the closest subject area used by each ranking body.
-"Computer Science" maps directly. "Electrical and Electronic Engineering" maps
-to "Engineering" in some tables. Note any mismatch in `notes`.
+Note any mismatch in `notes`.
 
 For employability rankings:
-  "[university name] graduate employability ranking"
-  "[university name] QS graduate employability"
+  "[university name] graduate employability ranking QS"
 
 For overall:
   "[university name] QS world ranking [year]"
   "[university name] THE world ranking [year]"
 
-Use fetch_page on ranking body result pages when a Tavily snippet confirms
-the page lists the target university.
+## Student Satisfaction — Lookup by Country
+
+Determine the university's country from deps.context.country before searching.
+
+### UK universities
+
+Search in this order:
+
+1. Guardian University Guide subject table (subject-level NSS score):
+   "[university name] [subject] Guardian University Guide student satisfaction"
+   fetch_page the subject table on theguardian.com/education — extract the
+   "Satisfied with course" and "Satisfied with teaching" percentage columns
+   for the target university row.
+
+2. Complete University Guide subject table:
+   "[university name] [subject] Complete University Guide student satisfaction"
+   fetch_page thecompleteuniversityguide.co.uk subject table — extract the
+   "Student Satisfaction" column (NSS Q1–24 average).
+
+3. Whatuni Student Choice Awards rankings table:
+   "[university name] Whatuni Student Choice Awards ranking"
+   fetch_page whatuni.com/student-awards-winners/wusca-rankings/university-of-the-year/
+   Look up the university's overall position. Also check the
+   "Lecturers and Teaching Quality" and "Student Support" category tables
+   if a tool call is still available.
+
+CRITICAL: Never report a satisfaction figure sourced from the university's
+own website. Always go to the source table. A subject-level NSS score is
+always more useful than an institution-wide score.
+
+### Australian universities
+
+Search in this order:
+
+1. ComparED subject-level data (primary):
+   "[university name] [subject] student satisfaction compared.edu.au"
+   fetch_page compared.edu.au and search for the institution + subject area.
+   Extract: Teaching Quality %, Skills Development %, Overall Educational
+   Experience %, and any subject-level ranking position.
+
+2. QILT SES national institution-level (secondary, if subject-level not found):
+   "[university name] QILT student experience survey [year]"
+   Extract the Overall Educational Experience % from qilt.edu.au results.
+
+Do not use the university's own press release quoting QILT figures —
+fetch the QILT or ComparED page directly.
+
+### Singapore universities
+
+Singapore has no government student satisfaction survey. The MOE Graduate
+Employment Survey (GES / JAUGES) measures employment outcomes only —
+it is not a satisfaction survey and must not be used here.
+
+Do NOT spend tool budget searching for a Singapore satisfaction survey.
+Leave student_satisfaction_rankings as an empty list.
+Write the following exact text in the notes field:
+"No equivalent student satisfaction survey exists for Singapore universities.
+MOE GES covers graduate employment outcomes only."
+
+GES employment data is useful context — include a brief note in
+ranking_summary and notes if retrieved elsewhere, but it belongs in
+employability context, not satisfaction.
+
+### Other countries
+
+Leave student_satisfaction_rankings empty and note the absence in notes.
+Do not fabricate satisfaction data or use unverified aggregator sites.
 
 ## Signal Quality Rules
 
 - Only include rankings from the four named sources: QS, THE, Guardian,
-  Complete University Guide. Do not include unverified "best universities"
-  lists from marketing sites or newspaper supplements that are not those
-  four sources.
-- Only use rankings dated within the last 2 years. Discard any older entries.
-- If a university is listed as "unranked" or outside the ranked band for a
-  subject, record it as such — do not omit the finding.
-- Distinguish subject rank from overall rank explicitly. A top-10 overall
-  university can rank 80th for a specific subject.
+  Complete University Guide. Do not include unverified lists from marketing
+  sites or newspaper supplements that are not those four sources.
+- Only use rankings and survey data dated within the last 2 years. Discard
+  any entry older than 2 years. If the most recent data found is older than
+  2 years, leave the list empty and note the gap.
+- If a university is listed as "unranked" for a subject, record it as such —
+  do not omit the finding.
+- Distinguish subject rank from overall rank explicitly in every entry and
+  in the summary.
+- Satisfaction scores must come from primary source tables only.
 
-## Output Requirements
+**Banned source domains — apply to every entry in every list:**
 
-- `subject_rankings`: minimum 1 entry from a named source. More is better.
-  Each entry must include `source`, `rank`, `year`, `subject_scope`, `url`.
-- `employability_rankings`: may be empty if not found — do not fabricate.
-- `overall_rankings`: include for context but clearly label as low-weight.
-- `ranking_summary`: 2–3 sentences synthesising the picture across all
-  sources. Must mention the subject rank explicitly. Must not overstate
-  overall rank as a proxy for subject quality.
-- `confidence`: "high" if 2+ subject rankings confirmed; "medium" if 1
-  subject ranking confirmed; "low" if only overall rank available.
+- University's own domain — the university is reporting its own result.
+  Go to the ranking body's page directly.
+- Social media (instagram.com, twitter.com, x.com, linkedin.com,
+  facebook.com, tiktok.com).
+- Aggregator and mirror sites (uscholars.in, universitycompare.com,
+  uniranking.org, and any site that republishes QS, THE, or QILT data
+  without being that body itself).
+
+When Tavily returns a snippet where the rank figure looks correct but the
+URL is from a banned domain, treat the URL as unusable. The rank figure
+may guide your next search but you must find the canonical source before
+creating an entry.
+
+## Tool Budget — 8 calls
+
+Suggested allocation:
+- 2 calls: subject rankings (QS + Guardian/CUG)
+- 2 calls: satisfaction (Guardian subject table + ComparED or WUSCAs)
+- 1 call: employability ranking
+- 1 call: overall rank
+- 2 calls: fetch_page on specific table pages to extract exact figures
+
+Singapore universities: redirect the 2 satisfaction calls to subject
+rankings or employability instead.
+
+## Tool Usage Strategy
+
+Tavily is the primary search tool. Use fetch_page when Tavily returns a
+snippet confirming the table is on a specific permitted URL.
+
+Do not retry a failed query more than once.
+
+**Recovery procedure when Tavily returns a banned-domain URL:**
+
+1. Note the rank figure and source name from the snippet text.
+2. Construct a new search query targeting the ranking body's own domain:
+     "[ranking body name] [university name] [subject or award category] [year]"
+3. If the new query returns a result on a permitted domain, fetch_page that
+   URL to confirm the entry.
+4. If after 1 retry no permitted-domain page is found, omit the entry.
+   Use an empty string for the url field and record the gap in notes.
+   Do not create an entry with a banned-domain URL under any circumstances.
+
+**Specific WUSCAs recovery note:**
+If Tavily returns a university's social media post celebrating a WUSCAs win,
+extract the award category and approximate year from the text, then fetch
+whatuni.com/student-awards-winners/wusca-rankings/university-of-the-year/
+directly to confirm rank position and year before creating the SatisfactionEntry.
 
 ## Edge Cases
 
 **Subject area not separately ranked:**
-Some niche courses (e.g. "Cybersecurity", "Data Science") may not have their
-own subject table — they fall under "Computer Science" or "Engineering".
-Use the closest applicable subject and note the mapping in `notes`.
+Niche courses may fall under a broader subject in ranking tables. Use the
+closest applicable subject and note the mapping in notes.
 
-**University only appears in UK national rankings, not world rankings:**
-UK national tables (Guardian, Complete University Guide) are valid primary
-sources for UK universities. World rankings are more relevant for international
-comparison. List both where available.
+**University only appears in national rankings, not world rankings:**
+UK national tables (Guardian, CUG) and Australian ComparED subject tables
+are valid primary sources. List both where available.
 
 **Ranking position given as a band, not a number:**
-"51–100" is a valid rank string. Do not attempt to convert it to a single
-integer.
+"51–100" is a valid rank string. Do not convert it to a single integer.
 
-## Tool Usage Strategy
-
-Tavily is the primary tool. Most ranking pages are publicly accessible.
-Use fetch_page when Tavily returns a snippet confirming the table is on a
-specific URL — fetch the page to get the exact position.
-
-Do not use `site:` prefixed queries with tavily_search — time filtering
-is not honoured for site: queries and results will be stale.
-
-Do not retry a failed query more than once.
+**NSS score only available at institution level, not subject level:**
+Record it with scope="Institution-wide" and note the gap. Do not present
+an institution-wide score as a subject-level one.
 ```
 
 ---
@@ -1031,101 +1286,102 @@ the university. You write to board.program as a ProgramOutput. You fire
 SectionCompletedMessage(section_name="program") when done, or
 SectionFailedMessage on unrecoverable error.
 
-You receive career context from board.career — specifically
-`in_demand_skills`. Use these skills when building the `skill_mappings`
-field to show which modules develop each in-demand skill.
+You receive career context from board.career — specifically `in_demand_skills`.
+Use these to build the `skill_mappings` field.
 
-## What to Research
+## Source Rule
 
-- All degree titles that match the intended course at this university
-  (e.g. "BSc Computer Science", "BEng Computer Science", "BSc Computer Science
-  with Artificial Intelligence" — all are relevant for a "Computer Science"
-  search)
-- Duration, degree type (BSc, BEng, MEng, BA), and UCAS code for each variant
-- Whether a sandwich year (placement year) or study abroad year is offered
-- Core compulsory modules in Year 1 and Year 2
-- Available elective/optional modules
-- How the curriculum covers the in-demand skills from board.career
+**All data must come from the university's official domain only — no exceptions.**
 
-## Query Construction
+If you cannot find the information on the official domain, leave the field
+empty. Do not use UCAS, aggregators, student forums, or any third-party site
+as a fallback. A low-confidence output with honest gaps is correct behaviour.
+A populated output sourced from third-party sites is a failure.
 
-Start with the university's own course catalog or prospectus page:
-  "[university name] [course] undergraduate course"
-  "[university name] [course] BSc modules"
-  "[university name] [department] course structure"
+## Research Steps
 
-Use fetch_page on the specific course page once found via search — catalog
-pages list modules directly.
+**Step 1 — Confirm the official domain**
 
-For UCAS codes:
-  "[university name] [course] UCAS code"
-  Or find them directly on the course catalog page.
+Search: `"[university name] official website"`
 
-For placement/sandwich year:
-  "[university name] [course] placement year"
-  "[university name] [course] year in industry"
+Identify the university's official domain from the result. All subsequent
+searches and fetches must target only this domain.
 
-## Signal Quality Rules
+**Step 2 — Find the course page**
 
-- Module names must come from the university's own catalog or prospectus —
-  not from student forum descriptions or third-party summaries. Use
-  fetch_page on the official catalog URL.
-- Only include modules that are confirmed as Year 1 or Year 2. Do not infer
-  year from module naming conventions alone.
-- If the module list is not publicly available (some universities hide
-  detailed curricula), record what is available and set `confidence: "low"`.
-- The `skill_mappings` field requires genuine matching — not every in-demand
-  skill will map to a named module. An empty mapping for a skill is
-  acceptable; inventing module names is not.
+Run this search query exactly, substituting the values:
+  [university name] [course] undergraduate
+
+Example pattern (do not copy literally — substitute actual values):
+  If university is "X" and course is "Y": search "X Y undergraduate"
+
+The official course page is almost always the first or second result.
+Check the URL of the top results — the course page will be on the
+official domain and will contain the course name in the path.
+fetch_page that URL immediately.
+
+Do not fetch student profile pages, news pages, fee documents, PDF handbooks,
+or department overview pages — these never contain module lists. If the
+first result on the official domain is any of these, skip it and check
+the next result on the official domain.
+
+If no course page is found in the first search, try once more:
+  [university name] [course] BSc modules
+
+If still no course page found on the official domain after 2 searches,
+set confidence='low' and record in curriculum_notes that the official
+course page was not found.
+
+**Step 3 — Extract program variants and structure**
+
+From the official course page extract:
+- All degree titles matching the intended course (BSc, BEng, MEng, BA variants)
+- Degree type, duration in years, UCAS code (if listed on the page)
+- Whether a sandwich/placement year or study abroad option is offered
+
+**Step 4 — Extract modules**
+
+From the same page, or a linked curriculum/modules page on the same domain,
+extract:
+- Year 1 and Year 2 compulsory modules by name exactly as listed
+- Any optional/elective modules
+
+If the course page links to a separate modules page, fetch_page that URL
+only if it is on the official domain. Do not infer module names from
+snippets — only include modules confirmed from a fetched page.
+
+**Step 5 — Map skills**
+
+For each skill in `in_demand_skills`, identify which confirmed modules
+develop it. An empty mapping is acceptable — do not fabricate module names.
+
+## Handling Failures
+
+**404:** Do not guess alternative URL patterns. Run one new search on the
+official domain with different terms. Move on if it also fails.
+
+**robots.txt block:** Treat as a permanent failure for that path. Do not
+retry. Note it in `curriculum_notes` and move on.
+
+**No module list published:** Some universities publish only program
+overviews. Return the program variants found, leave `core_modules` and
+`electives` empty, set `confidence: "low"`, and note the gap.
+
+**Cannot find official page at all:** Set `confidence: "low"` and note
+the failed search attempts in `curriculum_notes`. Do not populate any
+field from a non-official source.
 
 ## Output Requirements
 
-- `matching_programs`: all degree variants found. At least 1 required.
-  Each must have `title`, `degree_type`, `duration_years`, `sandwich_year`,
-  `study_abroad`, `ucas_code` (empty string if not found).
-- `core_modules`: Year 1 and Year 2 compulsory modules only. Each must have
-  `name`, `year`, `compulsory: True`.
-- `electives`: optional modules found anywhere in the curriculum.
-  `compulsory: False` for all items here.
-- `skill_mappings`: one entry per in-demand skill from board.career.
-  `modules` list may be empty if no curriculum coverage is found — do not
-  fabricate module names.
-- `curriculum_notes`: note any curriculum gaps, accreditation-linked
-  requirements, or anomalies (e.g. a core ethics module required by BCS).
-- `confidence`: "high" if full Year 1 + Year 2 module list confirmed from
-  official source; "medium" if partial module data found; "low" if only
-  program titles confirmed, not modules.
-
-## Edge Cases
-
-**University does not publish a module list publicly:**
-Some universities publish program overviews without module lists. Return the
-programs found, leave `core_modules` and `electives` as empty lists, and
-set `confidence: "low"` with a note explaining the gap.
-
-**Multiple course variants with different module structures:**
-Research the variant that most closely matches `intended_course`. Note the
-others in `curriculum_notes`. Do not attempt to merge module lists from
-different variants.
-
-**Integrated Masters (MEng, MPhys, etc.):**
-Capture these as `duration_years: 4` or `duration_years: 5` variants.
-The additional years often have specialisation modules worth noting in
-`curriculum_notes`.
-
-## Tool Usage Strategy
-
-Prefer fetch_page over tavily_search for module data — catalog pages have the
-structured content; search snippets rarely do. Use tavily_search to find the
-correct catalog URL, then fetch_page to read it.
-
-Do not use `site:` prefixed queries with tavily_search.
-
-Budget: 7 tavily_search calls. fetch_page calls are uncapped — use as many
-as needed to read catalog pages thoroughly.
-
-Do not retry a failed query more than once. If a catalog page returns empty
-content via fetch_page, note it and move on.
+- `matching_programs`: all degree variants found on the official domain — at least 1 required
+- `core_modules`: Year 1 and Year 2 compulsory modules only; `compulsory: True`
+- `electives`: optional modules; `compulsory: False`
+- `skill_mappings`: one entry per in-demand skill; `modules` may be empty
+- `curriculum_notes`: gaps, anomalies, blocked pages, failed searches
+- `sources`: official domain URLs only — never UCAS or third-party
+- `confidence`: `"high"` = full Year 1 + Year 2 module list confirmed from official source;
+  `"medium"` = partial module data from official source;
+  `"low"` = program titles only, or official page not found
 ```
 
 ---
@@ -1324,7 +1580,13 @@ from tools.search_tool import tavily_search
 
 
 class RankingsAgent(BaseAgent):
-    """Researches subject-specific, employability, and overall university rankings.
+    """Researches subject-specific, employability, student satisfaction,
+    and overall university rankings.
+
+    Satisfaction sources are country-dependent:
+      UK:          NSS via Guardian/CUG subject tables; Whatuni Student Choice Awards
+      Australia:   QILT Student Experience Survey via compared.edu.au (subject-level)
+      Singapore:   No equivalent survey — student_satisfaction_rankings left empty
 
     Subscribes to: CareerResearchCompletedMessage
     Writes to:     board.rankings (RankingsOutput)
@@ -1332,7 +1594,7 @@ class RankingsAgent(BaseAgent):
                    SectionFailedMessage(section_name="rankings") on error
     """
 
-    def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
+    def __init__(self, instructions: str = "", tool_budget: int = 8) -> None:
         super().__init__(instructions=instructions)
         self._tool_budget = tool_budget
         self._calls_made  = 0
@@ -1372,9 +1634,10 @@ class RankingsAgent(BaseAgent):
         self._calls_made = 0
 
         logger.info(
-            "RankingsAgent | starting — university=%r course=%r",
+            "RankingsAgent | starting — university=%r course=%r country=%r",
             deps.context.university_name,
             deps.context.intended_course,
+            deps.context.country,
         )
 
         await deps.hub.publish(ProgressUpdateMessage(
@@ -1388,9 +1651,15 @@ class RankingsAgent(BaseAgent):
             f"University: {deps.context.university_name}\n"
             f"Course: {deps.context.intended_course}\n"
             f"Country: {deps.context.country}\n"
-            f"Study level: {deps.context.study_level}"
+            f"Study level: {deps.context.study_level}\n\n"
+            "Research subject-specific rankings, student satisfaction, "
+            "employability rankings, and overall university rank. "
+            "Use the country field to select the correct satisfaction source: "
+            "UK → NSS via Guardian/CUG subject tables + Whatuni Student Choice Awards; "
+            "Australia → QILT SES via compared.edu.au; "
+            "Singapore → no satisfaction survey exists, leave "
+            "student_satisfaction_rankings empty and note the absence."
         )
-
 
         import traceback
         from pydantic import ValidationError
@@ -1400,8 +1669,10 @@ class RankingsAgent(BaseAgent):
             deps.board.rankings = result.output
 
             logger.info(
-                "RankingsAgent | completed — subject_entries=%d confidence=%s",
+                "RankingsAgent | completed — subject_entries=%d "
+                "satisfaction_entries=%d confidence=%s",
                 len(result.output.subject_rankings),
+                len(result.output.student_satisfaction_rankings),
                 result.output.confidence,
             )
 
@@ -1419,31 +1690,28 @@ class RankingsAgent(BaseAgent):
             ))
 
         except ValidationError as exc:
-            # LLM returned output that failed schema validation — log each field error
-            logger.error("RankingAgent | schema validation failed:")
+            logger.error("RankingsAgent | schema validation failed:")
             for err in exc.errors():
                 logger.error("  field=%s  error=%s  input=%s", err["loc"], err["msg"], err.get("input"))
 
             await deps.hub.publish(ProgressUpdateMessage(
                 status="failed",
-                message=f"Ranking research produced invalid output: {exc.error_count()} field errors",
-                triggered_by="ranking_agent",
+                message=f"Rankings research produced invalid output: {exc.error_count()} field errors",
+                triggered_by="rankings_agent",
                 timestamp=datetime.now().isoformat(),
             ))
 
             await deps.hub.publish(SectionFailedMessage(
                 section_name="rankings",
                 reason=f"Schema validation failed: {exc.error_count()} errors — check logs",
-                triggered_by="background_agent",
+                triggered_by="rankings_agent",
                 timestamp=datetime.now().isoformat(),
             ))
 
         except Exception as exc:
-            # Log the full traceback unconditionally — not just for FallbackModel
-            logger.error("RankingAgent | failed: %s", exc)
+            logger.error("RankingsAgent | failed: %s", exc)
             traceback.print_exc()
 
-            # Then also unpack FallbackModel sub-exceptions if present
             if hasattr(exc, 'exceptions'):
                 for i, sub in enumerate(exc.exceptions):
                     logger.error("Sub-exception %d: %s: %s", i, type(sub).__name__, sub)
@@ -1451,15 +1719,15 @@ class RankingsAgent(BaseAgent):
 
             await deps.hub.publish(ProgressUpdateMessage(
                 status="failed",
-                message=f"Ranking research failed: {exc}",
-                triggered_by="ranking_agent",
+                message=f"Rankings research failed: {exc}",
+                triggered_by="rankings_agent",
                 timestamp=datetime.now().isoformat(),
             ))
 
             await deps.hub.publish(SectionFailedMessage(
                 section_name="rankings",
                 reason=str(exc),
-                triggered_by="ranking_agent",
+                triggered_by="rankings_agent",
                 timestamp=datetime.now().isoformat(),
             ))
 ```
@@ -1478,6 +1746,9 @@ are passed directly into the task brief so the LLM can build the
 from __future__ import annotations
 
 from datetime import datetime
+
+import traceback
+from pydantic import ValidationError
 
 from pydantic_ai import Agent
 
@@ -1582,6 +1853,13 @@ class ProgramAgent(BaseAgent):
 
         try:
             result = await self._agent.run(task_brief, deps=deps)
+
+            if result.output is None:
+                raise ValueError(
+                    "Agent returned None output — LLM produced an empty or "
+                    "unparseable structured response"
+                )
+
             deps.board.program = result.output
 
             logger.info(
@@ -1604,15 +1882,14 @@ class ProgramAgent(BaseAgent):
             ))
 
         except ValidationError as exc:
-            # LLM returned output that failed schema validation — log each field error
-            logger.error("ProgramdAgent | schema validation failed:")
+            logger.error("ProgramAgent | schema validation failed:")
             for err in exc.errors():
                 logger.error("  field=%s  error=%s  input=%s", err["loc"], err["msg"], err.get("input"))
 
             await deps.hub.publish(ProgressUpdateMessage(
                 status="failed",
                 message=f"Program research produced invalid output: {exc.error_count()} field errors",
-                triggered_by="background_agent",
+                triggered_by="program_agent",
                 timestamp=datetime.now().isoformat(),
             ))
 
@@ -1624,11 +1901,9 @@ class ProgramAgent(BaseAgent):
             ))
 
         except Exception as exc:
-            # Log the full traceback unconditionally — not just for FallbackModel
             logger.error("ProgramAgent | failed: %s", exc)
             traceback.print_exc()
 
-            # Then also unpack FallbackModel sub-exceptions if present
             if hasattr(exc, 'exceptions'):
                 for i, sub in enumerate(exc.exceptions):
                     logger.error("Sub-exception %d: %s: %s", i, type(sub).__name__, sub)

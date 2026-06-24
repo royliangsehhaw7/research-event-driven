@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from schemas.outputs.career_output import CareerOutput
 from schemas.outputs.background_output import BackgroundOutput
-from schemas.outputs.ranking_output import RankingOutput
+from schemas.outputs.rankings_output import RankingsOutput
 from schemas.outputs.program_output import ProgramOutput
 from schemas.outputs.employability_output import EmployabilityOutput
 from schemas.outputs.accomodation_output import AccommodationOutput
@@ -27,7 +27,7 @@ class Blackboard:
 
     career:        CareerOutput        | None = None
     background:    BackgroundOutput    | None = None
-    rankings:      RankingOutput      | None = None
+    rankings:      RankingsOutput      | None = None
     program:       ProgramOutput       | None = None
     employability: EmployabilityOutput | None = None
     accommodation: AccommodationOutput | None = None
