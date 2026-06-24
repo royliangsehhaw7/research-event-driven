@@ -3,53 +3,33 @@ from __future__ import annotations
 import os
 from dotenv import load_dotenv
 
+from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.openrouter import OpenRouterModel
+from pydantic_ai.providers.openrouter import OpenRouterProvider
+from pydantic_ai.providers.google import GoogleProvider
+
 
 def get_model(env_key: str):
-    """Return a pydantic-ai model instance for the given env var key.
-
-    Uses OpenRouter via the OpenAI-compatible provider.
-    OPENROUTER_BASE_URL and OPENROUTER_API_KEY must be set in .env.
-
-    Args:
-        env_key: environment variable name, e.g. "RESEARCH_MODEL"
-
-    Returns:
-        A pydantic-ai OpenAIModel configured for OpenRouter.
-
-    Raises:
-        EnvironmentError: if the env var or API key is not set.
-    """
     load_dotenv()
 
-    model_string = os.getenv(env_key)
-    if not model_string:
-        raise EnvironmentError(
-            f"Environment variable {env_key!r} is not set. "
-            "Check your .env file."
-        )
+    primary_name = os.getenv(env_key)
+    gemini_name = os.getenv("GEMINI_MODEL")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    gemini_key = os.getenv("GEMINI_API_KEY")
 
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    base_url = os.getenv("OPENROUTER_BASE_URL")
+    print(f"DEBUG primary model: {primary_name!r}")
+    print(f"DEBUG gemini model:  {gemini_name!r}")
+    print(f"DEBUG openrouter key present: {bool(openrouter_key)}")
+    print(f"DEBUG gemini key present:     {bool(gemini_key)}")
 
-    if not api_key:
-        raise EnvironmentError(
-            "OPENROUTER_API_KEY is not set. Check your .env file."
-        )
-
-    # pydantic-ai OpenAI-compatible provider
-    from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import OpenAIProvider
-    from pydantic_ai.settings import ModelSettings
-
-    provider = OpenAIProvider(
-        base_url=base_url,
-        api_key=api_key
+    primary_model = OpenRouterModel(
+        model_name=os.getenv(env_key),
+        provider=OpenRouterProvider(api_key=os.getenv("OPENROUTER_API_KEY")),
     )
-    settings = ModelSettings(
-        temperature=0.25
+    secondary_model = GoogleModel(
+        model_name = os.getenv("GEMINI_MODEL"),
+        provider=GoogleProvider(api_key=os.getenv("GEMINI_API_KEY"))
     )
 
-    return OpenAIChatModel(
-        model_name=model_string, 
-        settings=settings,
-        provider=provider)
+    return FallbackModel(primary_model, secondary_model)

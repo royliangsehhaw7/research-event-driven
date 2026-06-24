@@ -1,21 +1,12 @@
 # agents/career_agent.py
 from __future__ import annotations
 
+import traceback
 from datetime import datetime
-from pydantic_ai import (
-    Agent,
-    AgentStreamEvent,
-    FinalResultEvent,
-    FunctionToolCallEvent,
-    FunctionToolResultEvent,
-    PartDeltaEvent,
-    PartStartEvent,
-    TextPartDelta,
-    ToolCallPartDelta,
-)   
+from pydantic import ValidationError
+from pydantic_ai import Agent
 
 from agents.base_agent import BaseAgent
-
 from core.logger import logger
 from core.deps import Deps
 from core.llm_factory import get_model
@@ -26,6 +17,8 @@ from schemas.outputs.career_output import CareerOutput
 
 from tools.fetch_tool import fetch_page
 from tools.search_tool import tavily_search
+from tools.adzuna_tool import adzuna_jobs
+from tools.mcf_tool import mcf_jobs
 
 
 class CareerAgent(BaseAgent):
@@ -33,16 +26,17 @@ class CareerAgent(BaseAgent):
 
     Subscribes to: ResearchRequestedMessage
     Writes to:     board.career (CareerOutput)
-    Fires:         CareerResearchCompletedMessage
+    Fires:         CareerResearchCompletedMessage (unconditionally — even on failure)
 
-    Tools: tavily_search (budget-capped via _make_search_tool), fetch_page (uncapped)
+    Tools: tavily_search (budget-capped), fetch_page (uncapped),
+           adzuna_jobs (UK/AU), mcf_jobs (Singapore)
 
     Note: site: queries must not be passed to tavily_search — Tavily does not
     honour time_range filtering on site: prefixed queries. Use tavily_search to
     find URLs, then fetch_page to retrieve content from those URLs.
     """
 
-    def __init__(self, instructions: str = "", tool_budget: int = 6) -> None:
+    def __init__(self, instructions: str = "", tool_budget: int = 8) -> None:
         super().__init__(instructions=instructions)
         self._tool_budget = tool_budget
         self._calls_made  = 0
@@ -56,14 +50,16 @@ class CareerAgent(BaseAgent):
             tools=[
                 tavily_search,
                 fetch_page,
+                adzuna_jobs,
+                mcf_jobs,
             ],
         )
 
-        logger.info('CareerAgent | initialized')
+        logger.info("CareerAgent | initialized")
 
 
+    # ── BaseAgent interface ───────────────────────────────────────────────────
 
-    # ── BaseAgent interface ────────────────────────────────────────────────────────────────────────────
     def subscribe(self, hub, deps: Deps) -> None:
         from schemas.messages.research_requested import ResearchRequestedMessage
 
@@ -71,39 +67,10 @@ class CareerAgent(BaseAgent):
             await self.handle(message, deps)
 
         hub.subscribe(ResearchRequestedMessage, handler)
-        logger.info('CareerAgent | Subscribed to MessageHub')
+        logger.info("CareerAgent | subscribed to MessageHub")
 
     def get_instruction(self) -> str:
-        base = """
-            You are the Career Research Agent in a university research pipeline.
-
-            Your job: research graduate career paths, salary ranges, and live job market
-            demand for the course at the university named in your context.
-
-            Pipeline role:
-            - You run first, before any other section agent.
-            - You write your findings to deps.board.career as a CareerOutput.
-            - You fire CareerResearchCompletedMessage when done. This triggers all
-            seven section agents to run concurrently.
-            - If you fail to fire CareerResearchCompletedMessage, the entire pipeline
-            stalls. Always fire it — even if your output is low confidence.
-
-            Context you receive (from deps.context):
-            - university_name: the university being researched
-            - intended_course: the undergraduate course
-            - country: the university's country — scope ALL salary and employer data to this
-            - study_level: always "undergraduate"
-
-            Tool usage rules:
-            - Use tavily_search for general queries only. Never pass site: prefixed queries
-              to tavily_search — time filtering is not honoured for site: searches and results
-              will be stale.
-            - To retrieve content from a specific URL (e.g. a job board page or salary survey),
-              call fetch_page with that URL directly.
-
-            You must not research careers for a different country than deps.context.country.
-        """.strip()
-
+        base = "You are the Career Research Agent in a university research pipeline."
         if self.instructions:
             return base + "\n\n" + self.instructions
         return base
@@ -113,10 +80,16 @@ class CareerAgent(BaseAgent):
         self._calls_made = 0
 
 
+    # ── Core handler ──────────────────────────────────────────────────────────
 
-    # ── Core handler ──────────────────────────────────────────────────────────────────────────────────
     async def handle(self, message, deps: Deps) -> None:
-        """Run career research and fire CareerResearchCompletedMessage."""
+        """Run career research and fire CareerResearchCompletedMessage.
+
+        CareerResearchCompletedMessage is fired unconditionally in the finally
+        block — even if the LLM call fails. If it is not fired, the entire
+        downstream pipeline stalls because no section agent will receive its
+        trigger message.
+        """
         self._calls_made = 0
 
         logger.info(
@@ -133,18 +106,18 @@ class CareerAgent(BaseAgent):
             timestamp=datetime.now().isoformat(),
         ))
 
-        task_brief = (f"""
-            University: {deps.context.university_name}
-            Course: {deps.context.intended_course}
-            Country: {deps.context.country}
-            Study level: {deps.context.study_level}
-            """
+        task_brief = (
+            f"University: {deps.context.university_name}\n"
+            f"Course: {deps.context.intended_course}\n"
+            f"Country: {deps.context.country}\n"
+            f"Study level: {deps.context.study_level}"
         )
 
         try:
             result = await self._agent.run(task_brief, deps=deps)
             deps.board.career = result.output
-            logger.warning(
+
+            logger.info(
                 "CareerAgent | completed — paths=%d confidence=%s",
                 len(result.output.career_paths),
                 result.output.confidence,
@@ -156,8 +129,38 @@ class CareerAgent(BaseAgent):
                 triggered_by="career_agent",
                 timestamp=datetime.now().isoformat(),
             ))
+
+        except ValidationError as exc:
+            # LLM returned output that failed schema validation.
+            # Log each field violation so the failing field is identifiable
+            # without inspecting the raw LLM response.
+            logger.error("CareerAgent | schema validation failed:")
+            for err in exc.errors():
+                logger.error(
+                    "  field=%s  error=%s  input=%s",
+                    err["loc"], err["msg"], err.get("input"),
+                )
+
+            await deps.hub.publish(ProgressUpdateMessage(
+                status="failed",
+                message=f"Career research produced invalid output: {exc.error_count()} field errors",
+                triggered_by="career_agent",
+                timestamp=datetime.now().isoformat(),
+            ))
+
         except Exception as exc:
-            logger.error("career_agent | failed: %s", exc)
+            # Catches: FallbackModel exhaustion, ModelHTTPError (429/404),
+            # UnexpectedModelBehavior (thinking-model output retries exceeded),
+            # tool errors, and any other unexpected failures.
+            logger.error("CareerAgent | failed: %s", exc)
+            traceback.print_exc()
+
+            # FallbackModel wraps both sub-exceptions — unpack for visibility
+            if hasattr(exc, "exceptions"):
+                for i, sub in enumerate(exc.exceptions):
+                    logger.error("Sub-exception %d: %s: %s", i, type(sub).__name__, sub)
+                    traceback.print_exception(type(sub), sub, sub.__traceback__)
+
             await deps.hub.publish(ProgressUpdateMessage(
                 status="failed",
                 message=f"Career research failed: {exc}",
@@ -165,98 +168,10 @@ class CareerAgent(BaseAgent):
                 timestamp=datetime.now().isoformat(),
             ))
 
-        await deps.hub.publish(CareerResearchCompletedMessage(
-            triggered_by="career_agent",
-            timestamp=datetime.now().isoformat(),
-        ))
-
-
-
-
-
-    # ── Core handler (async) ───────────────────────────────────────────────────────────────────────────
-    # async def handle_async(self, message, deps: Deps) -> None:
-    #     self._calls_made = 0
-
-    #     logger.info(
-    #         "CareerAgent | starting — university=%r course=%r country=%r",
-    #         deps.context.university_name,
-    #         deps.context.intended_course,
-    #         deps.context.country,
-    #     )
-
-    #     await deps.hub.publish(ProgressUpdateMessage(
-    #         status="started",
-    #         message=f"Researching career landscape for {deps.context.intended_course}…",
-    #         triggered_by="career_agent",
-    #         timestamp=datetime.now().isoformat(),
-    #     ))
-
-    #     task_brief = f"""
-    #         University: {deps.context.university_name}
-    #         Course: {deps.context.intended_course}
-    #         Country: {deps.context.country}
-    #         Study level: {deps.context.study_level}
-    #     """
-
-    #     try:
-    #         async with self._agent.run_stream_events(task_brief, deps=deps) as stream:
-    #             async for event in stream:
-    #                 if isinstance(event, FinalResultEvent):
-    #                     deps.board.career = event.result.output
-    #                 else:
-    #                     self._log_live_event(event)
-
-    #         logger.warning(
-    #             "CareerAgent | completed — paths=%d confidence=%s",
-    #             len(deps.board.career.career_paths),
-    #             deps.board.career.confidence,
-    #         )
-
-    #         await deps.hub.publish(ProgressUpdateMessage(
-    #             status="completed",
-    #             message="Career landscape research complete.",
-    #             triggered_by="career_agent",
-    #             timestamp=datetime.now().isoformat(),
-    #         ))
-
-    #     except Exception as exc:
-    #         logger.error("career_agent | failed: %s", exc)
-    #         await deps.hub.publish(ProgressUpdateMessage(
-    #             status="failed",
-    #             message=f"Career research failed: {exc}",
-    #             triggered_by="career_agent",
-    #             timestamp=datetime.now().isoformat(),
-    #         ))
-
-    #     await deps.hub.publish(CareerResearchCompletedMessage(
-    #         triggered_by="career_agent",
-    #         timestamp=datetime.now().isoformat(),
-    #     ))
-
-
-    # def _log_live_event(self, event) -> None:
-    #     if isinstance(event, FunctionToolCallEvent):
-    #         logger.info(
-    #             "CareerAgent | [TOOL CALL] tool=%r args=%s",
-    #             event.part.tool_name,
-    #             event.part.args,
-    #         )
-
-    #     elif isinstance(event, FunctionToolResultEvent):
-    #         preview = str(event.part.content)[:300]
-    #         logger.info(
-    #             "CareerAgent | [TOOL RESULT] tool=%r → %r…",
-    #             event.part.tool_name,
-    #             preview,
-    #         )
-
-    #     elif isinstance(event, PartStartEvent):
-    #         part_type = type(event.part).__name__
-    #         if part_type == 'TextPart':
-    #             logger.info("CareerAgent | [COT] reasoning started")
-
-    #     elif isinstance(event, PartDeltaEvent):
-    #         if isinstance(event.delta, TextPartDelta):
-    #             logger.debug("CareerAgent | [COT CHUNK] %r", event.delta.content_delta)
-    #         # ThinkingPartDelta skipped — too noisy
+        finally:
+            # Fire unconditionally. board.career will be None if an exception
+            # was raised above. Section agents handle None career gracefully.
+            await deps.hub.publish(CareerResearchCompletedMessage(
+                triggered_by="career_agent",
+                timestamp=datetime.now().isoformat(),
+            ))

@@ -44,6 +44,11 @@ class BaseAgent(ABC):
         """
         hooks = Hooks()
 
+        # @hooks.on.before_model_request
+        # async def log_request(ctx, request, **kwargs):
+        #     logger.info("[REQUEST] %s", request)
+        #     return request        
+
         @hooks.on.after_model_request
         async def capture_turn_metrics(ctx, response: ModelResponse, **kwargs) -> ModelResponse:
             # 1. Uniform fleet-wide token tracking (CORRECTED ATTRIBUTES)

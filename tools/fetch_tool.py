@@ -40,6 +40,7 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
         content = "".join(
             block.text for block in raw.content if isinstance(block, TextContent)
         )
+        
         result = FetchResult(url=url, content=content, status="ok", error=None)
         logger.info("fetch_tool | fetched %r — %d chars", url, len(result.content))
 

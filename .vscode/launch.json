@@ -7,7 +7,7 @@
             "request": "launch",
             "module": "pytest",
             "args": [
-                "tests/1c/test_career_agent_returns_results.py",
+                "tests/1d/test_background_agent_returns_results.py",
                 "--asyncio-mode=auto",
                 "-s",
                 "-v"
