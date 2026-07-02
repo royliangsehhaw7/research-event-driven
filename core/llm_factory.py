@@ -10,6 +10,30 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.providers.google import GoogleProvider
 
 
+# # -- tests with nim models
+# def get_model(env_key: str):
+#     load_dotenv()
+
+#     primary_name = os.getenv(env_key)
+#     nvidia_key = os.getenv("NVIDIA_API_KEY")
+
+#     print(f"DEBUG nvidia model: {primary_name!r}")
+#     print(f"DEBUG nvidia key present: {bool(nvidia_key)}")
+
+#     # Initialize the explicit NVIDIA-targeted native client
+#     nvidia_client = AsyncOpenAI(
+#         api_key=nvidia_key,
+#         base_url="https://integrate.api.nvidia.com/v1"
+#     )
+
+#     # Wrap it inside the single OpenAIModel expected by your agents
+#     return OpenAIChatModel(
+#         model_name="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+#         provider=OpenAIProvider(openai_client=nvidia_client),
+#     )
+
+
+
 def get_model(env_key: str):
     load_dotenv()
 
